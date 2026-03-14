@@ -1,0 +1,36 @@
+log_level: INFO
+
+qlib:
+  region: us
+  dataset: Alpha158
+  train_start: "2010-01-01"
+  train_end: "2022-12-31"
+  test_start: "2023-01-01"
+  test_end: "2024-12-31"
+
+agents:
+  llm_provider: anthropic
+  llm_model: claude-sonnet-4-20250514
+  temperature: 0.2
+  debate_rounds: 2
+
+crypto:
+  exchange: binance
+  top_n_universe: 20
+  quote_currency: USDT
+
+models:
+  default_model: LightGBM
+  topk: 30
+  walk_forward_months: 3
+  embargo_days: 5
+  transaction_cost_bps: 10.0
+
+risk:
+  max_position_weight: 10.0
+  max_drawdown_halt: 15.0
+  max_daily_turnover: 25.0
+
+monitoring:
+  schedule_time: "16:00"
+  schedule_timezone: US/Eastern
