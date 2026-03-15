@@ -274,7 +274,7 @@ class TestGetCompanyNews:
         from src.utils.config import reset_config
 
         reset_config()
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             with patch("feedparser.parse", return_value=self._make_feed(5)):
                 result = get_company_news.invoke({"ticker": "AAPL"})
@@ -290,7 +290,7 @@ class TestGetCompanyNews:
             {"datetime": 1705276800, "headline": "Apple launches new product", "summary": "New iPhone announced"},
         ]
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="test-key")
             mock_client = MagicMock()
             mock_client.company_news.return_value = mock_news
@@ -303,7 +303,7 @@ class TestGetCompanyNews:
     def test_finnhub_fallback_to_rss_on_error(self):
         from src.data.news_data import get_company_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="bad-key")
             with patch("finnhub.Client", side_effect=Exception("auth error")):
                 with patch("feedparser.parse", return_value=self._make_feed(3)):
@@ -314,7 +314,7 @@ class TestGetCompanyNews:
     def test_result_under_2500_chars(self):
         from src.data.news_data import get_company_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             with patch("feedparser.parse", return_value=self._make_feed(5)):
                 result = get_company_news.invoke({"ticker": "AAPL"})
@@ -324,7 +324,7 @@ class TestGetCompanyNews:
     def test_empty_feed_returns_no_news(self):
         from src.data.news_data import get_company_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             empty_feed = MagicMock()
             empty_feed.entries = []
@@ -336,7 +336,7 @@ class TestGetCompanyNews:
     def test_exception_returns_tool_error(self):
         from src.data.news_data import get_company_news
 
-        with patch("src.utils.config.get_config", side_effect=Exception("config error")):
+        with patch("src.data.news_data.get_config", side_effect=Exception("config error")):
             result = get_company_news.invoke({"ticker": "AAPL"})
 
         assert "TOOL_ERROR" in result
@@ -344,7 +344,7 @@ class TestGetCompanyNews:
     def test_sentiment_hints(self):
         from src.data.news_data import get_company_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             feed = MagicMock()
             entry = MagicMock()
@@ -379,7 +379,7 @@ class TestGetMarketNews:
     def test_rss_fallback_success(self):
         from src.data.news_data import get_market_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             with patch("feedparser.parse", return_value=self._make_feed(8)):
                 result = get_market_news.invoke({"category": "general"})
@@ -394,7 +394,7 @@ class TestGetMarketNews:
             {"datetime": 1705276800, "headline": "S&P 500 hits new high", "summary": "Bull market continues"},
         ]
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="test-key")
             mock_client = MagicMock()
             mock_client.general_news.return_value = mock_news
@@ -407,7 +407,7 @@ class TestGetMarketNews:
     def test_default_category(self):
         from src.data.news_data import get_market_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             with patch("feedparser.parse", return_value=self._make_feed(5)):
                 result = get_market_news.invoke({})
@@ -417,7 +417,7 @@ class TestGetMarketNews:
     def test_result_under_2500_chars(self):
         from src.data.news_data import get_market_news
 
-        with patch("src.utils.config.get_config") as mock_cfg:
+        with patch("src.data.news_data.get_config") as mock_cfg:
             mock_cfg.return_value = MagicMock(finnhub_api_key="")
             with patch("feedparser.parse", return_value=self._make_feed(10)):
                 result = get_market_news.invoke({"category": "general"})
@@ -427,7 +427,7 @@ class TestGetMarketNews:
     def test_exception_returns_tool_error(self):
         from src.data.news_data import get_market_news
 
-        with patch("src.utils.config.get_config", side_effect=Exception("fail")):
+        with patch("src.data.news_data.get_config", side_effect=Exception("fail")):
             result = get_market_news.invoke({"category": "general"})
 
         assert "TOOL_ERROR" in result
