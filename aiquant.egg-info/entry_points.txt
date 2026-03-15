@@ -1,0 +1,2 @@
+[console_scripts]
+aiquant = src.utils.cli:app

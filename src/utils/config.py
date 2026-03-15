@@ -2,35 +2,47 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class QlibConfig(BaseSettings):
+class QlibConfig(BaseModel):
     provider_uri: str = str(PROJECT_ROOT / "data" / "qlib_data")
     region: str = "us"
     dataset: str = "Alpha158"
     train_start: str = "2010-01-01"
     train_end: str = "2022-12-31"
+    valid_start: str = "2022-01-01"
+    valid_end: str = "2022-12-31"
     test_start: str = "2023-01-01"
     test_end: str = "2024-12-31"
+    universe: str = "us_all"
+    model_name: str = "LightGBM"
+    model_params: dict[str, int | float | str] = Field(default_factory=lambda: {
+        "n_estimators": 500, "learning_rate": 0.05, "max_depth": 8, "num_leaves": 63
+    })
+    strategy_topk: int = 30
+    strategy_n_drop: int = 5
+    account: float = 100_000_000.0
+    cost_fixed: float = 0.0
+    cost_rate: float = 0.0002
 
 
-class AgentConfig(BaseSettings):
+class AgentConfig(BaseModel):
     llm_provider: str = "anthropic"
     llm_model: str = "claude-sonnet-4-20250514"
+    deep_think_model: str = "claude-opus-4-20250514"
+    quick_think_model: str = "claude-haiku-4-5-20251001"
     temperature: float = 0.2
     max_tokens: int = 4096
-    debate_rounds: int = 2
+    max_debate_rounds: int = 2
     debate_confidence_threshold: float = 20.0
     debate_trigger_spread: float = 40.0
     fundamental_weight: float = 0.35
@@ -38,6 +50,15 @@ class AgentConfig(BaseSettings):
     technical_weight: float = 0.20
     sentiment_weight: float = 0.10
     risk_weight: float = 0.10
+    # Per-agent enable flags
+    fundamental_enabled: bool = True
+    sentiment_enabled: bool = True
+    technical_enabled: bool = True
+    risk_manager_enabled: bool = True
+    strategist_enabled: bool = True
+    # Cost controls
+    max_cost_per_analysis: float = 0.50
+    cache_ttl_seconds: int = 3600
     tools_enabled: list[str] = Field(default_factory=lambda: [
         "get_stock_price", "get_stock_history", "get_financials",
         "get_company_news", "get_market_news", "get_analyst_ratings",
@@ -49,7 +70,7 @@ class AgentConfig(BaseSettings):
     ])
 
 
-class CryptoConfig(BaseSettings):
+class CryptoConfig(BaseModel):
     exchange: str = "binance"
     top_n_universe: int = 20
     quote_currency: str = "USDT"
@@ -58,13 +79,18 @@ class CryptoConfig(BaseSettings):
     total_crypto_max_pct: float = 25.0
 
 
-class LeanConfig(BaseSettings):
+class LeanConfig(BaseModel):
     enabled: bool = False
     project_path: str = ""
     deploy_on_signal: bool = False
+    initial_cash: float = 100_000.0
+    broker: str = "paper"
+    commission: float = 0.001
+    slippage: float = 0.001
+    rebalance_frequency: str = "daily"
 
 
-class MonitoringConfig(BaseSettings):
+class MonitoringConfig(BaseModel):
     telegram_token: str = ""
     telegram_chat_id: str = ""
     schedule_time: str = "16:00"
@@ -73,7 +99,7 @@ class MonitoringConfig(BaseSettings):
     drawdown_alert_pct: float = 10.0
 
 
-class ModelConfig(BaseSettings):
+class ModelConfig(BaseModel):
     default_model: str = "LightGBM"
     topk: int = 30
     walk_forward_months: int = 3
@@ -82,7 +108,7 @@ class ModelConfig(BaseSettings):
     retrain_frequency: str = "monthly"
 
 
-class RiskConfig(BaseSettings):
+class RiskConfig(BaseModel):
     max_position_weight: float = 10.0
     max_drawdown_halt: float = 15.0
     max_daily_turnover: float = 25.0

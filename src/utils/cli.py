@@ -174,11 +174,6 @@ def optimize(
     tickers: Optional[str] = typer.Option(None, "--tickers", "-t", help="Comma-separated tickers"),
 ):
     """Run portfolio optimization."""
-    from src.execution.portfolio_optimizer import PortfolioOptimizer
-    from src.utils.config import get_config
-
-    config = get_config()
-    optimizer = PortfolioOptimizer(config)
     console.print(f"[cyan]Optimizing with method: {method}[/cyan]")
 
     if tickers:
@@ -222,3 +217,82 @@ def _print_analysis_result(result) -> None:
         f"Catalysts: {', '.join(result.catalysts) or 'None'}"
     )
     console.print(Panel(panel_content, title=f"Analysis: {result.ticker}"))
+
+
+# ---------------------------------------------------------------------------
+# RD-Agent sub-app
+# ---------------------------------------------------------------------------
+
+rdagent_app = typer.Typer(name="rd-agent", help="RD-Agent factor and model discovery")
+app.add_typer(rdagent_app)
+
+
+@rdagent_app.command("mine-factors")
+def rdagent_mine_factors(
+    iterations: int = typer.Option(50, "--iterations", "-n", help="Number of factor iterations"),
+    min_ic: float = typer.Option(0.02, "--min-ic", help="Minimum IC threshold to accept a factor"),
+) -> None:
+    """Discover new alpha factors using RD-Agent."""
+    from src.utils.config_loader import get_full_config
+
+    cfg = get_full_config()
+    rd = cfg.rd_agent
+    console.print("[cyan]RD-Agent: mine-factors[/cyan]")
+    console.print(f"  enabled           : {rd.enabled}")
+    console.print(f"  factor_library_dir: {rd.factor_library_dir}")
+    console.print(f"  iterations        : {iterations}")
+    console.print(f"  min_ic            : {min_ic}")
+    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
+
+
+@rdagent_app.command("optimize-model")
+def rdagent_optimize_model(
+    iterations: int = typer.Option(20, "--iterations", "-n", help="Number of model iterations"),
+    budget: int = typer.Option(10, "--budget", "-b", help="Compute budget"),
+) -> None:
+    """Optimize ML model configuration using RD-Agent."""
+    from src.utils.config_loader import get_full_config
+
+    cfg = get_full_config()
+    rd = cfg.rd_agent
+    console.print("[cyan]RD-Agent: optimize-model[/cyan]")
+    console.print(f"  enabled                 : {rd.enabled}")
+    console.print(f"  best_model_config_path  : {rd.best_model_config_path}")
+    console.print(f"  iterations              : {iterations}")
+    console.print(f"  budget                  : {budget}")
+    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
+
+
+@rdagent_app.command("library-status")
+def rdagent_library_status() -> None:
+    """Show factor library contents and statistics."""
+    from pathlib import Path
+
+    from src.utils.config_loader import get_full_config
+
+    cfg = get_full_config()
+    lib_dir = Path(cfg.rd_agent.factor_library_dir)
+    console.print("[cyan]RD-Agent: library-status[/cyan]")
+    console.print(f"  factor_library_dir: {lib_dir}")
+    console.print(f"  exists            : {lib_dir.exists()}")
+    if lib_dir.exists():
+        entries = list(lib_dir.iterdir())
+        console.print(f"  entries           : {len(entries)}")
+    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
+
+
+@rdagent_app.command("validate-library")
+def rdagent_validate_library(
+    min_ic: float = typer.Option(0.02, "--min-ic", help="Minimum IC threshold for validation"),
+    min_icir: float = typer.Option(0.3, "--min-icir", help="Minimum ICIR threshold for validation"),
+) -> None:
+    """Validate factor library entries against IC threshold."""
+    from src.utils.config_loader import get_full_config
+
+    cfg = get_full_config()
+    rd = cfg.rd_agent
+    console.print("[cyan]RD-Agent: validate-library[/cyan]")
+    console.print(f"  factor_library_dir: {rd.factor_library_dir}")
+    console.print(f"  min_ic            : {min_ic}")
+    console.print(f"  min_icir          : {min_icir}")
+    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")

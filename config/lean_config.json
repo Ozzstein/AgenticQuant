@@ -1,0 +1,22 @@
+{
+  "lean": {
+    "enabled": false,
+    "initial_cash": 100000,
+    "broker": "paper",
+    "commission": 0.001,
+    "slippage": 0.001,
+    "rebalance_frequency": "daily"
+  },
+  "risk": {
+    "max_position_weight": 10.0,
+    "max_crypto_position_weight": 5.0,
+    "max_sector_concentration": 30.0,
+    "total_crypto_min_pct": 5.0,
+    "total_crypto_max_pct": 25.0,
+    "min_cash_pct": 5.0,
+    "max_drawdown_halt": 15.0,
+    "max_daily_turnover": 25.0,
+    "min_liquidity_adv": 1000000,
+    "max_market_impact_pct": 1.0
+  }
+}

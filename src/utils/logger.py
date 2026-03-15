@@ -7,11 +7,10 @@ from pathlib import Path
 
 from loguru import logger
 
-
 _configured = False
 
 
-def setup_logger(log_level: str = "INFO", log_dir: str | None = None) -> None:
+def setup_logger(log_level: str = "INFO", log_dir: str | None = None, json_logs: bool = False) -> None:
     """Configure loguru with console + file rotation."""
     global _configured
     if _configured:
@@ -37,11 +36,19 @@ def setup_logger(log_level: str = "INFO", log_dir: str | None = None) -> None:
             compression="zip",
             format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {name}:{function}:{line} - {message}",
         )
+        if json_logs:
+            logger.add(
+                str(log_path / "aiquant_{time:YYYY-MM-DD}.json"),
+                level="DEBUG",
+                rotation="10 MB",
+                retention="7 days",
+                serialize=True,  # JSON output
+            )
 
     _configured = True
 
 
-def get_logger(name: str = "aiquant") -> logger.__class__:
+def get_logger(name: str = "aiquant"):
     """Get a contextualized logger."""
     return logger.bind(name=name)
 

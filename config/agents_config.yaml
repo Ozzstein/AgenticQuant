@@ -1,0 +1,20 @@
+# LangGraph agent configuration
+agents:
+  llm_provider: anthropic
+  llm_model: claude-sonnet-4-20250514
+  temperature: 0.2
+  max_tokens: 4096
+  max_debate_rounds: 2
+  debate_confidence_threshold: 20.0
+  debate_trigger_spread: 40.0
+  fundamental_weight: 0.35
+  quant_weight: 0.25
+  technical_weight: 0.20
+  sentiment_weight: 0.10
+  risk_weight: 0.10
+
+langgraph:
+  checkpointer: memory
+  max_recursion: 50
+  parallel_analysts: true
+  earnings_lookforward_days: 5

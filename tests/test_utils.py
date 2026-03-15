@@ -74,11 +74,11 @@ class TestConfig:
     def test_nested_config(self):
         config = AppConfig()
         assert config.qlib.dataset == "Alpha158"
-        assert config.agents.debate_rounds == 2
+        assert config.agents.max_debate_rounds == 2
         assert config.models.topk == 30
         assert config.monitoring.schedule_time == "16:00"
 
-    def test_config_singleton(self, mock_config):
+    def test_config_singleton(self):
         reset_config()
         c1 = get_config()
         c2 = get_config()
