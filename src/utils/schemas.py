@@ -243,3 +243,29 @@ class ModelSpec(BaseModel):
     name: str
     params: dict[str, float | int | str | bool] = Field(default_factory=dict)
     feature_set: list[str] = Field(default_factory=list)
+
+
+# --- Validation Suite Models ---
+
+
+class CheckVerdict(str, Enum):
+    PASS = "PASS"
+    WARNING = "WARNING"
+    FAIL = "FAIL"
+
+
+class CheckResult(BaseModel):
+    """Single validation check result."""
+
+    name: str
+    verdict: CheckVerdict
+    explanation: str
+
+
+class ValidationReport(BaseModel):
+    """Enhanced validation report with RELIABLE/NOT RELIABLE verdict."""
+
+    checks: list[CheckResult]
+    overall: str  # "RELIABLE" or "NOT RELIABLE"
+    summary: str
+    benchmark: BenchmarkComparison | None = None
