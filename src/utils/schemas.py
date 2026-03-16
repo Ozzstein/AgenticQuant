@@ -210,6 +210,18 @@ class BenchmarkComparison(BaseModel):
     excess_sharpe_vs_spy: float = 0.0
 
 
+class WalkForwardResult(BaseModel):
+    """Enhanced walk-forward result with feature drift and rolling IC."""
+
+    folds: list[WalkForwardFold]
+    stitched_returns: list[float]
+    stitched_timestamps: list[str]
+    aggregate_metrics: BacktestMetrics
+    feature_importance_drift: list[float]  # rank corr between consecutive fold importances
+    rolling_ic: list[float]  # per-fold IC (predictions vs realized returns)
+    model_name: str
+
+
 # --- Factor Models ---
 
 
