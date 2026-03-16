@@ -1,0 +1,43 @@
+# Worktrees
+.worktrees/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.env
+
+# Data / outputs
+outputs/
+logs/
+*.log
+
+# IDEs
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Distribution
+*.tar.gz
+*.zip
