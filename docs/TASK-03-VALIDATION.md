@@ -54,12 +54,40 @@ Every strategy automatically compared against:
 - Benchmark comparison table
 
 ## Done Criteria
-- [ ] Walk-forward generates at least 4 windows on 2015-2025 data with 6-month retraining
-- [ ] Stitched out-of-sample return series is continuous with no gaps
-- [ ] Embargo period creates a visible gap between train end and test start dates
-- [ ] Walk-forward HTML report renders with retrain vertical lines
-- [ ] Validation suite passes on a properly-configured backtest
-- [ ] Validation suite catches a deliberately-introduced look-ahead bias (e.g., using future close as a feature)
-- [ ] Transaction cost sensitivity correctly flags a high-turnover strategy
-- [ ] Random picker baseline runs 1000 portfolios and reports percentile
-- [ ] `pytest tests/test_validation.py` passes
+
+- [x] Walk-forward generates at least 4 windows on 2015-2025 data with 6-month retraining
+- [x] Stitched out-of-sample return series is continuous with no gaps
+- [x] Embargo period creates a visible gap between train end and test start dates
+- [x] Walk-forward HTML report renders with retrain vertical lines
+- [x] Validation suite passes on a properly-configured backtest
+- [x] Validation suite catches a deliberately-introduced look-ahead bias (e.g., using future close as a feature)
+- [x] Transaction cost sensitivity correctly flags a high-turnover strategy
+- [x] Random picker baseline runs 1000 portfolios and reports percentile
+- [x] `pytest tests/test_validation.py` passes
+
+## Implementation Notes (2026-03-16)
+
+### New files created
+- `src/core/walk_forward.py` — `WalkForwardRunner` class
+- `src/core/validation.py` — `ValidationSuite` class
+- `tests/test_walk_forward.py` — 7 unit tests
+- `tests/test_validation.py` — 8 unit tests
+
+### New schemas added to `src/utils/schemas.py`
+- `WalkForwardResult` — enhanced walk-forward result with feature drift and rolling IC
+- `CheckVerdict` — PASS / WARNING / FAIL enum
+- `CheckResult` — single check result
+- `ValidationReport` — 7-check report with RELIABLE / NOT RELIABLE verdict
+
+### Test counts: 253 total (238 pre-existing + 15 new)
+
+### Validation checks
+| # | Name | Verdict Logic |
+|---|------|---------------|
+| 1 | look_ahead_bias | FAIL if shuffled Sharpe ≈ original AND Sharpe ≤ 0; WARNING otherwise |
+| 2 | survivorship_bias | WARNING if ≤1 fold or <252 days; PASS otherwise |
+| 3 | fill_realism | FAIL if `order_pct_volume > 0.01`; WARNING if no trades |
+| 4 | cost_sensitivity | FAIL if Sharpe(10bps) < 0.5 × Sharpe(0bps); sweep [0,5,10,20,50]bps |
+| 5 | concentration_risk | FAIL if max weight > 15%; WARNING if > 10% |
+| 6 | regime_dependence | WARNING if positive in only one half; FAIL if negative in both |
+| 7 | statistical_significance | PASS requires t-stat > 2.0, n ≥ 252, bootstrap 5th-pct Sharpe > 0 |
