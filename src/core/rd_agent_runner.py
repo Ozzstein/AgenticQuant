@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import random
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
@@ -117,6 +119,7 @@ class RDAgentRunner:
     def __init__(self, config: FullAppConfig | None = None) -> None:
         self.config = config or get_full_config()
         self._rd_agent_available = False
+        self._file_lock = threading.Lock()
         try:
             import rdagent  # noqa: F401, PLC0415
 
@@ -332,7 +335,8 @@ class RDAgentRunner:
             "co_optimize: {} iterations, budget={:.2f}, traces={}", iterations, budget, traces
         )
 
-        kb = self._load_kb()
+        with self._file_lock:
+            kb = self._load_kb()
         tested_set: set[str] = set(kb.get("tested_factors", []))
         failed_set: set[str] = set(kb.get("failed_factors", []))
 
@@ -383,11 +387,13 @@ class RDAgentRunner:
         kb["tested_factors"] = sorted(tested_set)
         kb["failed_factors"] = sorted(failed_set)
         kb["last_run_date"] = str(date.today())
-        self._save_kb(kb)
+        with self._file_lock:
+            self._save_kb(kb)
 
         # Persist accepted factors
         if accepted:
-            self.save_factor_library(accepted)
+            with self._file_lock:
+                self.save_factor_library(accepted)
 
         result = {
             "factors_proposed": proposals_count,
@@ -417,7 +423,8 @@ class RDAgentRunner:
         logger.info("mine_factors: {} iterations, min_ic={}", iterations, effective_min_ic)
 
         accepted: list[FactorDefinition] = []
-        kb = self._load_kb()
+        with self._file_lock:
+            kb = self._load_kb()
         tested_set: set[str] = set(kb.get("tested_factors", []))
         failed_set: set[str] = set(kb.get("failed_factors", []))
 
@@ -451,10 +458,12 @@ class RDAgentRunner:
         kb["tested_factors"] = sorted(tested_set)
         kb["failed_factors"] = sorted(failed_set)
         kb["last_run_date"] = str(date.today())
-        self._save_kb(kb)
+        with self._file_lock:
+            self._save_kb(kb)
 
         if accepted:
-            self.save_factor_library(accepted)
+            with self._file_lock:
+                self.save_factor_library(accepted)
 
         logger.info("mine_factors: {} factors accepted.", len(accepted))
         return accepted
@@ -479,7 +488,8 @@ class RDAgentRunner:
         effective_iters = max(1, int(iterations * budget))
         logger.info("optimize_model: {} iterations (budget={:.2f})", effective_iters, budget)
 
-        kb = self._load_kb()
+        with self._file_lock:
+            kb = self._load_kb()
         tested_configs: list[dict[str, Any]] = kb.get("tested_configs", [])
         tested_set: set[str] = {json.dumps(c, sort_keys=True) for c in tested_configs}
 
@@ -513,7 +523,8 @@ class RDAgentRunner:
         # Persist
         kb["tested_configs"] = tested_configs
         kb["last_run_date"] = str(date.today())
-        self._save_kb(kb)
+        with self._file_lock:
+            self._save_kb(kb)
 
         if best_config:
             self.save_model_config(best_config)
@@ -606,7 +617,7 @@ class RDAgentRunner:
         min_ic = self.config.rd_agent.min_ic
 
         # --- Remote sources: stub ---
-        if source.startswith("http") or source.lower().startswith("arxiv"):
+        if source.startswith("http") or source.lower().startswith("arxiv") or re.match(r"^\d{4}\.\d+", source):
             logger.warning(
                 "PDF/arXiv parsing not available without keys. "
                 "Cannot fetch remote source: '{}'",
