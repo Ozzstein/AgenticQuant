@@ -103,13 +103,13 @@ Document these in the README as the checklist before going live:
 - Complete README.md and docs
 
 ## Done Criteria
-- [ ] `docker-compose up` starts all three services without errors
-- [ ] Scheduler runs a simulated daily cycle and logs all steps
-- [ ] Telegram bot sends a test message to configured chat
-- [ ] Dashboard loads on localhost:8501 and shows portfolio page
-- [ ] Audit log JSON file written after a pipeline run, contains all expected fields
-- [ ] API cost tracking reports estimated spend per run
-- [ ] README.md covers all sections listed above
-- [ ] DOCUMENTATION.md has all 14 sections
-- [ ] DEPLOYMENT.md has step-by-step VPS instructions
-- [ ] `pytest tests/` passes with > 80% coverage on src/execution/ and src/core/
+- [x] `docker-compose up` starts all three services without errors
+- [x] Scheduler runs a simulated daily cycle and logs all steps
+- [x] Telegram bot sends a test message to configured chat
+- [x] Dashboard loads on localhost:8501 and shows portfolio page
+- [x] Audit log JSON file written after a pipeline run, contains all expected fields
+- [x] API cost tracking reports estimated spend per run
+- [x] README.md covers all sections listed above
+- [x] DOCUMENTATION.md has all 14 sections
+- [x] DEPLOYMENT.md has step-by-step VPS instructions
+- [x] `pytest tests/` passes with > 80% coverage on src/execution/ and src/core/

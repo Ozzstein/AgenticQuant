@@ -101,15 +101,15 @@ Interface to load FinGPT from HuggingFace for local sentiment scoring. Provide a
 - Individual agent reports accessible via result.agent_reports
 
 ## Done Criteria
-- [ ] `get_stock_price("AAPL")` returns valid data as concise text
-- [ ] `get_company_news("NVDA")` returns recent headlines
-- [ ] `get_technical_indicators("MSFT")` returns interpreted indicator text
-- [ ] Macro regime detector returns one of risk_on/neutral/risk_off/crisis
-- [ ] Each agent runs independently and returns a structured report
-- [ ] LangGraph workflow executes the full node sequence for a single ticker
-- [ ] Three analyst agents run in parallel (verify with timing — should be ~1 LLM call time, not 3x)
-- [ ] Debate loop executes 2 rounds and agent reports show revisions
-- [ ] Risk manager veto flag blocks a decision when risk limits breached
-- [ ] Final output is a valid AnalysisResult with all fields populated
+- [x] `get_stock_price("AAPL")` returns valid data as concise text
+- [x] `get_company_news("NVDA")` returns recent headlines
+- [x] `get_technical_indicators("MSFT")` returns interpreted indicator text
+- [x] Macro regime detector returns one of risk_on/neutral/risk_off/crisis
+- [x] Each agent runs independently and returns a structured report
+- [x] LangGraph workflow executes the full node sequence for a single ticker
+- [x] Three analyst agents run in parallel (verify with timing — should be ~1 LLM call time, not 3x)
+- [x] Debate loop executes 2 rounds and agent reports show revisions
+- [x] Risk manager veto flag blocks a decision when risk limits breached
+- [x] Final output is a valid AnalysisResult with all fields populated
 - [ ] Crypto ticker "BTC/USDT" routes to crypto-appropriate tools and analysis
 - [ ] `pytest tests/test_agents.py` passes (use mocked LLM responses for unit tests)

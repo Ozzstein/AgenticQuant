@@ -62,9 +62,9 @@ Nothing — this is the foundation.
 - CLI renders: `python -m src.utils.cli --help` shows all subcommands
 
 ## Done Criteria
-- [ ] `pip install -e ".[dev]"` completes without errors
-- [ ] All config YAML/JSON files parse without errors
-- [ ] AppConfig loads with defaults when no .env exists
-- [ ] CLI help text shows all subcommands
-- [ ] Logger writes to console and file
-- [ ] `ruff check src/` passes clean
+- [x] `pip install -e ".[dev]"` completes without errors
+- [x] All config YAML/JSON files parse without errors
+- [x] AppConfig loads with defaults when no .env exists
+- [x] CLI help text shows all subcommands
+- [x] Logger writes to console and file
+- [x] `ruff check src/` passes clean

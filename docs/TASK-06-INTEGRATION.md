@@ -10,15 +10,27 @@ Tasks 02, 03, 04, 05 (all layers must be functional)
 
 ### 1. RD-Agent Runner (`src/core/rd_agent_runner.py`)
 
-RD-Agent is a PERIODIC component — runs weekly or monthly, NOT daily. It has two jobs:
+RD-Agent is a PERIODIC component — runs weekly or monthly, NOT daily. It has six modes of operation:
 
-**Factor discovery**: use LLM (via RD-Agent library) to propose factor hypotheses, implement them as Qlib expressions or pandas code, evaluate them (IC, ICIR, turnover, correlation with existing library factors). Factors passing thresholds (min_ic, min_icir, correlation < 0.7 with existing) are saved to `data/factor_library/` as JSON files containing: name, expression/code, description, ic, icir, turnover, discovered_date, passes_validation flag.
+**Factor evolution**: use LLM (via RD-Agent library) to propose factor hypotheses, implement them as Qlib expressions or pandas code, evaluate them (IC, ICIR, turnover, correlation with existing library factors). Factors passing thresholds (min_ic, min_icir, correlation < 0.7 with existing) are saved to `data/factor_library/` as JSON files containing: name, expression/code, description, ic, icir, turnover, discovered_date, passes_validation flag.
 
-**Model optimization**: propose and evaluate model hyperparameter configurations. Best config saved to `config/best_model_config.yaml`.
+**Model evolution**: propose and evaluate model hyperparameter configurations and architecture changes. Best config saved to `config/best_model_config.yaml`.
 
-**Report extraction**: read 10-K/10-Q PDFs, extract quantitative signals, evaluate as factors, save passing ones to library.
+**Joint factor-model co-optimization**: This is RD-Agent's most powerful mode. Instead of running factor evolution and model optimization separately, this mode alternates between them in a single loop. Each iteration, a multi-armed bandit scheduler decides whether improving factors or improving the model will yield more alpha, then executes that direction. The result of one feeds into the next — better factors make the model work better, a better model surfaces which factors actually matter. This produces significantly better results than running each separately. Implement as a single `co_optimize()` method that runs the full RD-Agent(Q) joint loop from the paper. This should be the primary recommended way to run RD-Agent.
 
-**Library management**: load all factors from library, return summary (count, avg IC, last discovery date), validate library with a dedicated backtest.
+**Knowledge base persistence**: RD-Agent must remember what it learned across runs. Store in `data/rd_knowledge_base/`:
+- Which factor patterns worked and which failed (so it doesn't re-propose known failures)
+- Which model architectures and hyperparameters were tested and their results
+- Which data features are noisy or redundant
+- Successful strategies and why they worked (natural language summaries from the LLM)
+
+Each weekly/monthly run loads the knowledge base before starting and saves updated knowledge after completing. Run 10 should be smarter than run 1 because it builds on accumulated knowledge. RD-Agent's built-in knowledge management system (the Co-STEER component) handles this — wire it to persist to disk between sessions rather than only living in memory during a single run.
+
+**Multi-trace parallel exploration**: Support running multiple independent research threads (traces) simultaneously. Each trace tries a different research direction (e.g., trace 1 explores momentum factors, trace 2 explores volatility factors, trace 3 explores cross-asset factors). After all traces complete, merge the best discoveries from each into the factor library. This costs N× the API budget (where N = number of traces) but finds better factors faster because it explores diverse directions rather than going deep on one path. Cross-trace collaboration: traces can share intermediate findings so they don't waste time on directions another trace already ruled out. Configurable: number of traces (default 3), whether traces share knowledge during runs, merge strategy (keep top K factors by ICIR across all traces).
+
+**Research paper implementation**: Read quantitative finance research papers (PDFs or arXiv links) and automatically implement the strategies, factors, or models described in them. Steps: (1) extract key methods, formulas, and algorithms from the paper, (2) implement them as Qlib-compatible code, (3) backtest the implementation, (4) if the results are promising, save the factors/model to the library. This uses RD-Agent's general research assistant capability applied specifically to quant finance papers. Useful for systematically testing ideas from new publications without manually coding each one.
+
+**Library management**: load all factors from library, return summary (count, avg IC, last discovery date, knowledge base stats), validate library with a dedicated backtest.
 
 ### 2. Pipeline Integration Points
 
@@ -40,7 +52,16 @@ The daily pipeline must wire these connections:
 
 **`scripts/run_pipeline.py`**: Typer CLI. Commands: `pipeline` with modes: backtest (historical), paper (one iteration with live data), paper-loop (continuous on schedule).
 
-**`scripts/run_rd_agent.py`**: Typer CLI. Commands: `mine-factors` (run factor evolution), `optimize-model` (run hyperparam optimization), `extract-from-reports` (process financial reports), `library-status` (show library contents), `validate-library` (run 3-way backtest: Alpha158 only vs library only vs combined).
+**`scripts/run_rd_agent.py`**: Typer CLI. Commands:
+- `co-optimize` — run joint factor-model co-optimization (RECOMMENDED primary mode). Uses multi-armed bandit to alternate between factor and model improvement. Loads knowledge base at start, saves at end. This is the single most valuable command.
+- `mine-factors` — run factor evolution only (useful when you want to hold model fixed)
+- `optimize-model` — run model hyperparam optimization only
+- `co-optimize --traces 3` — run joint optimization with 3 parallel traces. Each trace explores a different research direction. Results merged at the end. Costs 3× the API budget but finds better factors.
+- `extract-from-reports --report-dir ./reports/10k/` — extract factors from 10-K/10-Q financial reports
+- `implement-paper --source arxiv:2505.15155` or `--source ./papers/some_paper.pdf` — read a quant finance paper, implement its strategy/factors, backtest, and save passing results to library
+- `library-status` — show factor library contents, knowledge base stats, last run date, cumulative discoveries
+- `validate-library` — run 3-way backtest: Alpha158 only vs library only vs combined
+- `reset-knowledge` — clear the knowledge base (start fresh, use with caution)
 
 ### 4. Full Pipeline Flow (`scripts/run_pipeline.py`)
 
@@ -79,14 +100,19 @@ Create 4 Jupyter notebooks (as .py percent-format scripts):
 - 4 runnable notebooks
 
 ## Done Criteria
-- [ ] `python scripts/run_backtest.py run --model LightGBM --topk 30` completes and prints metrics
-- [ ] `python scripts/run_backtest.py run --with-rd-factors` includes factor library (or warns if empty)
-- [ ] `python scripts/run_agents.py analyze NVDA` returns a valid AnalysisResult
-- [ ] `python scripts/run_agents.py analyze NVDA --with-qlib` includes Qlib context in agent prompt
-- [ ] `python scripts/run_pipeline.py --mode backtest` runs full pipeline and produces portfolio results
-- [ ] `python scripts/run_rd_agent.py library-status` reports factor count (0 if empty)
-- [ ] `python scripts/run_rd_agent.py validate-library` runs 3-way backtest comparison
-- [ ] Factor library JSON files load correctly and merge into dataset
-- [ ] Pipeline is idempotent: running twice with same data produces same trades
-- [ ] All 4 notebooks execute without errors
-- [ ] `pytest tests/test_integration.py` passes
+- [x] `python scripts/run_backtest.py run --model LightGBM --topk 30` completes and prints metrics
+- [x] `python scripts/run_backtest.py run --with-rd-factors` includes factor library (or warns if empty)
+- [x] `python scripts/run_agents.py analyze NVDA` returns a valid AnalysisResult
+- [x] `python scripts/run_agents.py analyze NVDA --with-qlib` includes Qlib context in agent prompt
+- [x] `python scripts/run_pipeline.py --mode backtest` runs full pipeline and produces portfolio results
+- [x] `python scripts/run_rd_agent.py co-optimize --iterations 5 --budget 5.0` runs joint factor-model loop and produces at least 1 factor or model improvement
+- [x] `python scripts/run_rd_agent.py co-optimize --traces 3 --iterations 5` runs 3 parallel traces and merges results
+- [x] `python scripts/run_rd_agent.py library-status` reports factor count, knowledge base size, last run date
+- [x] `python scripts/run_rd_agent.py validate-library` runs 3-way backtest comparison
+- [x] `python scripts/run_rd_agent.py implement-paper --source ./papers/test_paper.pdf` extracts and backtests at least one factor or model from a paper
+- [x] Knowledge base persists between runs: run co-optimize twice, second run loads knowledge from first run (verify via logs showing "loaded N prior experiments")
+- [x] Knowledge base prevents re-proposing known failures: if a factor failed in run 1, it should not be re-proposed identically in run 2
+- [x] Factor library JSON files load correctly and merge into dataset
+- [x] Pipeline is idempotent: running twice with same data produces same trades
+- [x] All 4 notebooks execute without errors
+- [x] `pytest tests/test_integration.py` passes

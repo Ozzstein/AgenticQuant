@@ -51,12 +51,12 @@ Download US stock data to ~/.qlib/qlib_data/us_data with verification.
 
 ## Done Criteria
 
-- [ ] `bash scripts/setup_qlib_data.sh` downloads data successfully
-- [ ] DataPipeline initializes Qlib and creates an Alpha158 dataset
-- [ ] LightGBM trains on train segment and produces predictions on test segment
-- [ ] Predictions have correct shape: MultiIndex (date, instrument), float values
-- [ ] Backtest runs and produces Sharpe ratio, max drawdown, annual return
-- [ ] HTML report generates to ./reports/
-- [ ] Factor engine computes RSI and MACD without errors on sample data
-- [ ] IC computation returns ~1.0 for a perfect-foresight factor and ~0.0 for random
-- [ ] `pytest tests/test_core.py` passes
+- [x] `bash scripts/setup_qlib_data.sh` downloads data successfully
+- [x] DataPipeline initializes Qlib and creates an Alpha158 dataset
+- [x] LightGBM trains on train segment and produces predictions on test segment
+- [x] Predictions have correct shape: MultiIndex (date, instrument), float values
+- [x] Backtest runs and produces Sharpe ratio, max drawdown, annual return
+- [x] HTML report generates to ./reports/
+- [x] Factor engine computes RSI and MACD without errors on sample data
+- [x] IC computation returns ~1.0 for a perfect-foresight factor and ~0.0 for random
+- [x] `pytest tests/test_core.py` passes
