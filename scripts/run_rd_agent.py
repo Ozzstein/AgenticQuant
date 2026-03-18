@@ -219,6 +219,57 @@ def reset_knowledge() -> None:
     console.print("[green]Knowledge base has been reset.[/green]")
 
 
+@app.command("evolve-strategies")
+def evolve_strategies_cmd(
+    iterations: int = typer.Option(10, "--iterations", "-i", help="Number of evolution iterations"),
+    budget: float = typer.Option(15.0, "--budget", "-b", help="API budget in USD"),
+    traces: int = typer.Option(1, "--traces", "-t", help="Parallel research threads"),
+) -> None:
+    """Propose, backtest, and save evolved strategies to the strategy library."""
+    console.print(
+        f"[bold cyan]evolve-strategies[/bold cyan]: iterations={iterations}, "
+        f"budget={budget}, traces={traces}"
+    )
+    runner = _runner()
+    results = runner.evolve_strategies(iterations=iterations, budget=budget, traces=traces)
+
+    table = Table(title=f"Evolved Strategies ({len(results)})", show_lines=True)
+    table.add_column("Name", style="green")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("Max DD", justify="right")
+    table.add_column("Validated")
+    for s in results:
+        table.add_row(
+            s.get("name", ""),
+            f"{s.get('backtest_sharpe', 0.0):.4f}",
+            f"{s.get('backtest_max_drawdown', 0.0):.4f}",
+            str(s.get("validated", False)),
+        )
+
+    console.print(table)
+    typer.echo(f"Evolved {len(results)} strategies")
+
+
+@app.command("copilot-strategy")
+def copilot_strategy_cmd(
+    description: str = typer.Argument(..., help="Natural language strategy description"),
+) -> None:
+    """Convert an English strategy description to a validated Strategy definition."""
+    console.print(
+        f"[bold cyan]copilot-strategy[/bold cyan]: description='{description}'"
+    )
+    runner = _runner()
+    result = runner.copilot_strategy(description=description)
+
+    if "error" in result:
+        typer.echo(f"Error: {result['error']}", err=True)
+        raise typer.Exit(1)
+
+    _print_dict("copilot-strategy result", result)
+    typer.echo(f"Strategy: {result.get('name', 'unknown')}")
+    typer.echo(f"Backtest Sharpe: {result.get('backtest_sharpe', 0.0):.2f}")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

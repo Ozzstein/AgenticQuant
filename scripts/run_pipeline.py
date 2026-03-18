@@ -35,31 +35,36 @@ _TOP_N = 5
 # ---------------------------------------------------------------------------
 
 
-def _run_pipeline_once(mode: str) -> dict:
+def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
     """Execute one full pipeline iteration.
 
     Steps:
     1. Load config
-    2. Fetch OHLCV data via yfinance fallback
-    3. Compute simple features (returns, mom5, mom20) per ticker
-    4. Score tickers by mean 20-day momentum
-    5. Select top-5 by alpha score
-    6. Analyze each top ticker via multi-agent graph
-    7. Map decisions → signals
-    8. Translate signals → orders
-    9. Run pre-trade risk checks
-    10. Execute passing orders through PaperTrader
-    11. Take a portfolio snapshot
-    12. Print portfolio summary table
+    2. Strategy selection (regime-based, performance-weighted, or manual)
+    3. Fetch OHLCV data via yfinance fallback
+    4. Compute simple features (returns, mom5, mom20) per ticker
+    5. Score tickers by mean 20-day momentum
+    6. Select top-N by alpha score (using active strategy's rank_threshold)
+    7. Analyze each top ticker via multi-agent graph
+    8. Map decisions → signals
+    9. Translate signals → orders
+    10. Run pre-trade risk checks
+    11. Execute passing orders through PaperTrader
+    12. Take a portfolio snapshot
+    13. Print portfolio summary table
 
     Args:
         mode: One of "backtest", "paper", or "paper-loop".
+        strategy: Strategy selection mode — "auto" for regime-based, "blend" for
+            performance-weighted, or an explicit strategy name for manual override.
 
     Returns:
-        Summary dict with tickers_analyzed, orders_placed, nav.
+        Summary dict with tickers_analyzed, orders_placed, nav, active_strategy.
     """
     from src.agents.graph import analyze_ticker
     from src.core.data_pipeline import DataPipeline
+    from src.core.strategy_selector import StrategySelector
+    from src.core.strategy_tracker import StrategyTracker
     from src.execution.paper_trader import PaperTrader
     from src.execution.risk_controls import check_order
     from src.execution.signal_translator import signals_to_orders
@@ -73,6 +78,58 @@ def _run_pipeline_once(mode: str) -> dict:
 
     audit = AuditLogger()
     audit.start_run()
+
+    # Default: use module-level constants unless strategy overrides them.
+    active_top_n = _TOP_N
+    active_strategy_name = strategy
+
+    # ------------------------------------------------------------------
+    # Step 0: Strategy selection (graceful degradation on failure)
+    # ------------------------------------------------------------------
+    try:
+        selector = StrategySelector()
+        tracker = StrategyTracker()
+        performances = tracker.get_performances()
+
+        # Infer macro regime from config default (neutral) — a full regime
+        # detector may set this in the future.
+        regime = getattr(config, "default_regime", "neutral")
+
+        if strategy == "blend":
+            allocation = selector.select(regime, performances=performances, method="performance_weighted")
+        elif strategy == "auto":
+            allocation = selector.select(regime, performances=performances, method="regime_based")
+        else:
+            allocation = selector.select_manual(strategy)
+
+        active_strategy_name = allocation.active_strategy
+        logger.info(
+            "[pipeline] Active strategy: {} (method={})",
+            active_strategy_name,
+            allocation.selection_method,
+        )
+        audit.log_step(
+            "strategy_selection",
+            "ok",
+            {
+                "active_strategy": active_strategy_name,
+                "method": str(allocation.selection_method),
+                "allocations": allocation.allocations,
+            },
+        )
+
+        # Override top_n from strategy entry rules when available.
+        active_strat = next(
+            (s for s in selector.strategies if s.name == active_strategy_name), None
+        )
+        if active_strat is not None:
+            rank_threshold = active_strat.entry_rules.get("rank_threshold", _TOP_N)
+            active_top_n = int(rank_threshold) if isinstance(rank_threshold, (int, float)) else _TOP_N
+    except Exception as exc:
+        logger.warning("[pipeline] Strategy selection failed ({}); using defaults.", exc)
+        audit.log_step("strategy_selection", "error", {"error": str(exc)})
+        active_strategy_name = "default"
+        active_top_n = _TOP_N
 
     try:
         # ------------------------------------------------------------------
@@ -117,8 +174,8 @@ def _run_pipeline_once(mode: str) -> dict:
         # ------------------------------------------------------------------
         # Step 3: Select top tickers
         # ------------------------------------------------------------------
-        top_tickers = sorted(alpha_scores, key=lambda t: alpha_scores[t], reverse=True)[:_TOP_N]
-        logger.info("[pipeline] Top {} tickers by alpha score: {}", _TOP_N, top_tickers)
+        top_tickers = sorted(alpha_scores, key=lambda t: alpha_scores[t], reverse=True)[:active_top_n]
+        logger.info("[pipeline] Top {} tickers by alpha score: {}", active_top_n, top_tickers)
 
         for ticker in _UNIVERSE:
             audit.log_prediction(ticker, alpha_scores.get(ticker, 0.0))
@@ -235,6 +292,14 @@ def _run_pipeline_once(mode: str) -> dict:
         audit.log_step("order_execution", "ok", {"orders_placed": orders_placed})
 
         # ------------------------------------------------------------------
+        # Step 9b: P&L attribution to active strategy (placeholder — daily_pnl = 0.0)
+        # ------------------------------------------------------------------
+        try:
+            tracker.attribute_pnl(active_strategy_name, 0.0)
+        except Exception as exc:
+            logger.warning("[pipeline] P&L attribution failed: {}", exc)
+
+        # ------------------------------------------------------------------
         # Step 10: Snapshot
         # ------------------------------------------------------------------
         paper_trader.snapshot(market_prices)
@@ -248,7 +313,7 @@ def _run_pipeline_once(mode: str) -> dict:
         # Step 11: Print portfolio summary table
         # ------------------------------------------------------------------
         table = Table(
-            title=f"Pipeline Summary — Mode: {mode}",
+            title=f"Pipeline Summary — Mode: {mode} | Strategy: {active_strategy_name}",
             show_header=True,
             header_style="bold cyan",
         )
@@ -281,16 +346,18 @@ def _run_pipeline_once(mode: str) -> dict:
 
         console.print(table)
         logger.info(
-            "[pipeline] Complete — tickers={}, orders={}, nav={:.2f}",
+            "[pipeline] Complete — tickers={}, orders={}, nav={:.2f}, strategy={}",
             len(results),
             orders_placed,
             final_portfolio.nav,
+            active_strategy_name,
         )
 
         return {
             "tickers_analyzed": len(results),
             "orders_placed": orders_placed,
             "nav": final_portfolio.nav,
+            "active_strategy": active_strategy_name,
         }
 
     finally:
@@ -312,6 +379,15 @@ def run(
         "backtest",
         help="Pipeline mode: backtest | paper | paper-loop",
     ),
+    strategy: str = typer.Option(
+        "auto",
+        "--strategy",
+        "-s",
+        help=(
+            "Strategy selection: 'auto' for regime-based, 'blend' for "
+            "performance-weighted blend, or an explicit strategy name for manual override."
+        ),
+    ),
 ) -> None:
     """Run the end-to-end daily trading pipeline.
 
@@ -321,17 +397,25 @@ def run(
     - paper:    Run once with latest data, print portfolio state.
     - paper-loop: Loop 3 times with 1-second sleep between iterations (demo).
 
+    Strategy selection:
+
+    - auto:  Regime-based selection (default).
+    - blend: Performance-weighted blend across strategies.
+    - <name>: Force a specific strategy by name (e.g. momentum_topk).
+
     Example::
 
         python scripts/run_pipeline.py run --mode paper
         python scripts/run_pipeline.py run --mode paper-loop
+        python scripts/run_pipeline.py run --mode paper --strategy momentum_topk
+        python scripts/run_pipeline.py run --mode paper --strategy blend
     """
     valid_modes = {"backtest", "paper", "paper-loop"}
     if mode not in valid_modes:
         console.print(f"[red]Invalid mode: {mode}. Choose from: {valid_modes}[/red]")
         raise typer.Exit(code=1)
 
-    logger.info("[pipeline] Starting pipeline in mode={}", mode)
+    logger.info("[pipeline] Starting pipeline in mode={} strategy={}", mode, strategy)
 
     if mode == "paper-loop":
         num_iterations = 3
@@ -339,12 +423,13 @@ def run(
             console.print(f"\n[bold cyan]--- Iteration {i}/{num_iterations} ---[/bold cyan]")
             logger.info("[pipeline] paper-loop iteration {}/{}", i, num_iterations)
             try:
-                summary = _run_pipeline_once(mode)
+                summary = _run_pipeline_once(mode, strategy=strategy)
                 console.print(
                     f"[green]Iteration {i} complete — "
                     f"tickers={summary['tickers_analyzed']}, "
                     f"orders={summary['orders_placed']}, "
-                    f"nav=${summary['nav']:,.2f}[/green]"
+                    f"nav=${summary['nav']:,.2f}, "
+                    f"strategy={summary.get('active_strategy', 'unknown')}[/green]"
                 )
             except Exception as exc:
                 logger.error("[pipeline] Iteration {} failed: {}", i, exc)
@@ -356,10 +441,12 @@ def run(
     else:
         # backtest or paper — run once
         try:
-            summary = _run_pipeline_once(mode)
+            summary = _run_pipeline_once(mode, strategy=strategy)
+            active = summary.get("active_strategy", "unknown")
             if mode == "backtest":
                 console.print(
                     f"\n[bold green]Backtest complete.[/bold green]\n"
+                    f"  Active strategy  : {active}\n"
                     f"  Tickers analyzed : {summary['tickers_analyzed']}\n"
                     f"  Orders placed    : {summary['orders_placed']}\n"
                     f"  Final NAV        : ${summary['nav']:,.2f}"
@@ -367,6 +454,7 @@ def run(
             else:
                 console.print(
                     f"\n[bold green]Paper run complete.[/bold green]\n"
+                    f"  Active strategy  : {active}\n"
                     f"  Tickers analyzed : {summary['tickers_analyzed']}\n"
                     f"  Orders placed    : {summary['orders_placed']}\n"
                     f"  Final NAV        : ${summary['nav']:,.2f}"

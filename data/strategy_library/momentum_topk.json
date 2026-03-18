@@ -1,0 +1,17 @@
+{
+  "name": "momentum_topk",
+  "description": "Multi-horizon momentum factor strategy selecting top 30 ranked stocks, weekly rebalance, works in all regimes",
+  "factor_set": ["Alpha158", "momentum_20d", "momentum_60d", "momentum_120d"],
+  "model": "LightGBM",
+  "universe": "SP500",
+  "entry_rules": {"rank_threshold": 30, "min_momentum_score": 0.6},
+  "exit_rules": {"rank_threshold": 60, "holding_period_days": 5},
+  "sizing_method": "inverse_volatility",
+  "rebalance_frequency": "weekly",
+  "regime_applicability": ["risk_on", "neutral", "risk_off", "crisis"],
+  "risk_overrides": {"max_position": 0.08},
+  "backtest_sharpe": 0.85,
+  "backtest_max_drawdown": -0.18,
+  "validated": true,
+  "source": "builtin"
+}

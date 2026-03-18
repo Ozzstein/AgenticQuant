@@ -122,6 +122,18 @@ class RiskConfig(BaseModel):
     min_cash_pct: float = 5.0
 
 
+class StrategyConfig(BaseModel):
+    """Strategy selection and lifecycle configuration."""
+
+    selection_method: str = "regime_based"  # regime_based | performance_weighted | bandit | manual
+    forced_strategy: str = ""  # for manual override
+    blend_enabled: bool = False
+    min_backtest_sharpe: float = 0.5
+    drift_threshold: float = 0.50  # alert if live Sharpe < 50% of backtest Sharpe
+    drift_window_days: int = 60
+    default_strategy: str = "momentum_topk"
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -144,6 +156,7 @@ class AppConfig(BaseSettings):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     models: ModelConfig = Field(default_factory=ModelConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
 
     @field_validator("log_level")
     @classmethod

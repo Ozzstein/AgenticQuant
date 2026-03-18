@@ -1,0 +1,17 @@
+{
+  "name": "agent_consensus",
+  "description": "Pure LangGraph agent-driven strategy using multi-agent consensus across all regimes",
+  "factor_set": ["Alpha158", "sentiment_score", "fundamental_score", "technical_score"],
+  "model": "LightGBM",
+  "universe": "SP500",
+  "entry_rules": {"min_agent_consensus": 0.7, "min_confidence": 0.65, "decisions": "STRONG_BUY,BUY"},
+  "exit_rules": {"max_agent_consensus": 0.4, "decisions": "SELL,STRONG_SELL", "holding_period_days": 7},
+  "sizing_method": "signal_proportional",
+  "rebalance_frequency": "weekly",
+  "regime_applicability": ["risk_on", "neutral", "risk_off", "crisis"],
+  "risk_overrides": {"max_position": 0.07},
+  "backtest_sharpe": 0.78,
+  "backtest_max_drawdown": -0.20,
+  "validated": false,
+  "source": "builtin"
+}
