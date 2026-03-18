@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,14 +71,22 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
-    """Persist the scheduler state dict to disk.
+    """Persist the scheduler state dict to disk with atomic writes.
+
+    Writes to a temporary file then atomically renames to the target path
+    to prevent corruption on interrupt.
 
     Args:
         state: State dict mapping date strings to step-result dicts.
     """
     _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _STATE_FILE.write_text(json.dumps(state, indent=2))
+        with tempfile.NamedTemporaryFile(
+            mode='w', dir=_STATE_FILE.parent, delete=False, suffix='.tmp'
+        ) as tmp:
+            json.dump(state, tmp, indent=2)
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(_STATE_FILE)
     except Exception as exc:
         logger.warning("scheduler: could not write state file: {}", exc)
 
@@ -119,16 +128,27 @@ def _mark_step(state: dict, date_key: str, step: str, status: str) -> None:
 def _acquire_lock() -> bool:
     """Create the lock file, returning False if it already exists.
 
+    If the lock file is stale (older than 2 hours), it is removed and
+    lock acquisition is retried.
+
     Returns:
         True when the lock was successfully acquired.
     """
     _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     if _LOCK_FILE.exists():
-        logger.error(
-            "scheduler: lock file exists at {} — another instance is running. Exiting.",
-            _LOCK_FILE,
-        )
-        return False
+        lock_age_secs = time.time() - _LOCK_FILE.stat().st_mtime
+        if lock_age_secs < 7200:  # 2 hours
+            logger.error(
+                "scheduler: lock file exists (age={}s) — another instance running",
+                lock_age_secs,
+            )
+            return False
+        else:
+            logger.warning(
+                "scheduler: stale lock (age={}s) — removing and retrying",
+                lock_age_secs,
+            )
+            _LOCK_FILE.unlink(missing_ok=True)
     _LOCK_FILE.touch()
     return True
 
@@ -293,7 +313,12 @@ def _step_execute_rebalance() -> None:
     from src.utils.config import get_config
 
     cfg = get_config()
-    trader = PaperTrader(cfg)
+    trader = PaperTrader(
+        initial_cash=cfg.execution.initial_cash,
+        slippage_bps=cfg.execution.slippage_bps,
+        commission_per_share=cfg.execution.commission_per_share,
+        min_commission=cfg.execution.min_commission,
+    )
     metrics = trader.get_metrics()
     logger.info("scheduler: execute_rebalance — paper trader metrics: {}", metrics)
     logger.info("scheduler: execute_rebalance — complete.")
@@ -461,15 +486,8 @@ def main(
 
     if loop:
         logger.info("scheduler: starting loop mode (polling every 60 s).")
-        last_run_date: str | None = None
         while True:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            if today != last_run_date:
-                run_pipeline(dry_run=dry_run, simulate_day=False)
-                last_run_date = today
-            else:
-                # Check if any new steps became due since last poll
-                run_pipeline(dry_run=dry_run, simulate_day=False)
+            run_pipeline(dry_run=dry_run, simulate_day=False)
             time.sleep(60)
     else:
         run_pipeline(dry_run=dry_run, simulate_day=simulate_day)
