@@ -340,6 +340,30 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# `setup` command
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def setup() -> None:
+    """Create output directories and initialize portfolio state."""
+    from src.utils.config import get_config
+
+    config = get_config()
+    dirs = [
+        Path(config.output_dir),
+        Path(config.output_dir) / "factor_library",
+        Path(config.log_dir),
+        Path("outputs/batch_analysis"),
+        Path("data/rd_knowledge_base"),
+    ]
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        logger.info("Created directory: {}", d)
+    console.print("[green]Setup complete. Directories created.[/green]")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

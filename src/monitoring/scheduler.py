@@ -45,10 +45,33 @@ class PipelineScheduler:
         self._lock_file.touch()
         try:
             logger.info("PipelineScheduler: running pipeline once...")
-            # Simple stub: log and return success
+            # Import and run the core pipeline steps
+            from src.core.data_pipeline import DataPipeline
+            from src.agents.graph import analyze_ticker
+            from src.utils.schemas import Signal, SignalDirection
+
+            config = self.config
+            _UNIVERSE = ["SPY", "AAPL", "MSFT"]  # small universe for scheduler runs
+
+            pipeline = DataPipeline(config)
+            df = pipeline.yfinance_fallback(
+                tickers=_UNIVERSE,
+                start=config.qlib.test_start,
+                end=config.qlib.test_end,
+            )
+
+            tickers_analyzed = 0
+            if not df.empty:
+                for ticker in _UNIVERSE:
+                    try:
+                        analyze_ticker(ticker)  # graceful stubs if no API key
+                        tickers_analyzed += 1
+                    except Exception as exc:
+                        logger.warning("scheduler run_once: {} failed: {}", ticker, exc)
+
             result = {
                 "status": "completed",
-                "tickers_analyzed": 0,
+                "tickers_analyzed": tickers_analyzed,
                 "orders_placed": 0,
                 "timestamp": datetime.now().isoformat(),
             }
