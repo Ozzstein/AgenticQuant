@@ -97,6 +97,11 @@ class MonitoringConfig(BaseModel):
     schedule_timezone: str = "US/Eastern"
     health_alert_threshold: int = 60
     drawdown_alert_pct: float = 10.0
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_to: str | None = None
 
 
 class ModelConfig(BaseModel):

@@ -99,3 +99,35 @@ class TelegramNotifier:
         """
         msg = f"⚠️ ALERT: {alert_text}"
         return self.send_message(msg)
+
+    def send_drawdown_warning(self, drawdown_pct: float, nav: float) -> None:
+        """Send drawdown warning. Fires at -5%, -10%, -15% thresholds.
+
+        Args:
+            drawdown_pct: Current drawdown as a negative percentage (e.g. -10.5).
+            nav: Current net asset value of the portfolio.
+        """
+        msg = f"🔴 DRAWDOWN WARNING: {drawdown_pct:.2f}% drawdown — NAV ${nav:,.2f}"
+        self.send_message(msg)
+
+    def send_agent_disagreement(self, ticker: str, reports: dict) -> None:
+        """Send alert when max spread between agent decisions exceeds 60 points.
+
+        Args:
+            ticker: The ticker symbol being analysed.
+            reports: Mapping of agent name → report/decision string.
+        """
+        summary_lines = [f"  {agent}: {report}" for agent, report in reports.items()]
+        summary = "\n".join(summary_lines)
+        msg = f"🤖 AGENT DISAGREEMENT on {ticker}:\n{summary}"
+        self.send_message(msg)
+
+    def send_system_health(self, step: str, error: str) -> None:
+        """Send pipeline step failure notification.
+
+        Args:
+            step: Name of the pipeline step that failed.
+            error: Error message or description of the failure.
+        """
+        msg = f"🚨 PIPELINE FAILURE — step '{step}': {error}"
+        self.send_message(msg)
