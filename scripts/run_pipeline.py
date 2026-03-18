@@ -63,6 +63,7 @@ def _run_pipeline_once(mode: str) -> dict:
     from src.execution.paper_trader import PaperTrader
     from src.execution.risk_controls import check_order
     from src.execution.signal_translator import signals_to_orders
+    from src.utils.audit import AuditLogger
     from src.utils.config import get_config
     from src.utils.schemas import Decision, Signal, SignalDirection
 
@@ -70,197 +71,231 @@ def _run_pipeline_once(mode: str) -> dict:
     start = config.qlib.test_start
     end = config.qlib.test_end
 
-    # ------------------------------------------------------------------
-    # Step 1: Fetch data
-    # ------------------------------------------------------------------
-    logger.info("[pipeline] Fetching OHLCV data: {} → {}", start, end)
-    pipeline = DataPipeline(config)
+    audit = AuditLogger()
+    audit.start_run()
+
     try:
-        df = pipeline.yfinance_fallback(tickers=_UNIVERSE, start=start, end=end)
-    except Exception as exc:
-        logger.error("[pipeline] Data fetch failed: {}", exc)
-        df = __import__("pandas").DataFrame()
-
-    if df.empty:
-        logger.warning("[pipeline] No data returned — using empty DataFrame.")
-
-    # ------------------------------------------------------------------
-    # Step 2: Compute simple features and alpha scores
-    # ------------------------------------------------------------------
-    alpha_scores: dict[str, float] = {}
-
-    if not df.empty and "ticker" in df.columns:
-        import pandas as pd
-
-        for ticker in _UNIVERSE:
-            ticker_df = df[df["ticker"] == ticker].sort_index()
-            if ticker_df.empty or "close" not in ticker_df.columns:
-                alpha_scores[ticker] = 0.0
-                continue
-            close = ticker_df["close"]
-            mom20 = close.pct_change(20)
-            score = float(mom20.mean()) if not mom20.isna().all() else 0.0
-            alpha_scores[ticker] = score
-    else:
-        for ticker in _UNIVERSE:
-            alpha_scores[ticker] = 0.0
-
-    # ------------------------------------------------------------------
-    # Step 3: Select top tickers
-    # ------------------------------------------------------------------
-    top_tickers = sorted(alpha_scores, key=lambda t: alpha_scores[t], reverse=True)[:_TOP_N]
-    logger.info("[pipeline] Top {} tickers by alpha score: {}", _TOP_N, top_tickers)
-
-    # ------------------------------------------------------------------
-    # Step 4: Multi-agent analysis
-    # ------------------------------------------------------------------
-    results = {}
-    for ticker in top_tickers:
-        score = alpha_scores[ticker]
-        qlib_context = f"Alpha score: {score:.4f}"
-        logger.info("[pipeline] Analyzing {} (alpha={:.4f})", ticker, score)
+        # ------------------------------------------------------------------
+        # Step 1: Fetch data
+        # ------------------------------------------------------------------
+        logger.info("[pipeline] Fetching OHLCV data: {} → {}", start, end)
+        pipeline = DataPipeline(config)
         try:
-            result = analyze_ticker(ticker, qlib_context=qlib_context)
-            results[ticker] = result
+            df = pipeline.yfinance_fallback(tickers=_UNIVERSE, start=start, end=end)
+            audit.log_step("equity_data", "ok", {"tickers": len(_UNIVERSE), "rows": len(df)})
         except Exception as exc:
-            logger.error("[pipeline] analyze_ticker failed for {}: {}", ticker, exc)
+            logger.error("[pipeline] Data fetch failed: {}", exc)
+            df = __import__("pandas").DataFrame()
+            audit.log_step("equity_data", "error", {"error": str(exc)})
 
-    # ------------------------------------------------------------------
-    # Step 5: Map decisions → signals
-    # ------------------------------------------------------------------
-    signals: list[Signal] = []
-    for ticker, result in results.items():
-        decision_val = result.decision.value if hasattr(result.decision, "value") else str(result.decision)
-        if decision_val in ("STRONG_BUY", "BUY"):
-            direction = SignalDirection.LONG
+        if df.empty:
+            logger.warning("[pipeline] No data returned — using empty DataFrame.")
+
+        # ------------------------------------------------------------------
+        # Step 2: Compute simple features and alpha scores
+        # ------------------------------------------------------------------
+        alpha_scores: dict[str, float] = {}
+
+        if not df.empty and "ticker" in df.columns:
+            import pandas as pd
+
+            for ticker in _UNIVERSE:
+                ticker_df = df[df["ticker"] == ticker].sort_index()
+                if ticker_df.empty or "close" not in ticker_df.columns:
+                    alpha_scores[ticker] = 0.0
+                    continue
+                close = ticker_df["close"]
+                mom20 = close.pct_change(20)
+                score = float(mom20.mean()) if not mom20.isna().all() else 0.0
+                alpha_scores[ticker] = score
         else:
-            direction = SignalDirection.FLAT
-        strength = min(result.confidence / 100.0, 1.0)
-        signals.append(
-            Signal(
-                ticker=ticker,
-                direction=direction,
-                strength=strength,
-                source="pipeline",
+            for ticker in _UNIVERSE:
+                alpha_scores[ticker] = 0.0
+
+        audit.log_step("feature_engineering", "ok", {"scored_tickers": len(alpha_scores)})
+
+        # ------------------------------------------------------------------
+        # Step 3: Select top tickers
+        # ------------------------------------------------------------------
+        top_tickers = sorted(alpha_scores, key=lambda t: alpha_scores[t], reverse=True)[:_TOP_N]
+        logger.info("[pipeline] Top {} tickers by alpha score: {}", _TOP_N, top_tickers)
+
+        for ticker in _UNIVERSE:
+            audit.log_prediction(ticker, alpha_scores.get(ticker, 0.0))
+
+        audit.log_step("ticker_selection", "ok", {"top_tickers": top_tickers})
+
+        # ------------------------------------------------------------------
+        # Step 4: Multi-agent analysis
+        # ------------------------------------------------------------------
+        results = {}
+        for ticker in top_tickers:
+            score = alpha_scores[ticker]
+            qlib_context = f"Alpha score: {score:.4f}"
+            logger.info("[pipeline] Analyzing {} (alpha={:.4f})", ticker, score)
+            try:
+                result = analyze_ticker(ticker, qlib_context=qlib_context)
+                results[ticker] = result
+                audit.log_analysis(ticker, result)
+            except Exception as exc:
+                logger.error("[pipeline] analyze_ticker failed for {}: {}", ticker, exc)
+                audit.log_step(f"analysis_{ticker}", "error", {"error": str(exc)})
+
+        audit.log_step("agent_analysis", "ok", {"analyzed": len(results)})
+
+        # ------------------------------------------------------------------
+        # Step 5: Map decisions → signals
+        # ------------------------------------------------------------------
+        signals: list[Signal] = []
+        for ticker, result in results.items():
+            decision_val = result.decision.value if hasattr(result.decision, "value") else str(result.decision)
+            if decision_val in ("STRONG_BUY", "BUY"):
+                direction = SignalDirection.LONG
+            else:
+                direction = SignalDirection.FLAT
+            strength = min(result.confidence / 100.0, 1.0)
+            signals.append(
+                Signal(
+                    ticker=ticker,
+                    direction=direction,
+                    strength=strength,
+                    source="pipeline",
+                )
             )
+
+        # ------------------------------------------------------------------
+        # Step 6: Get current prices
+        # ------------------------------------------------------------------
+        market_prices: dict[str, float] = {}
+        if not df.empty and "ticker" in df.columns and "close" in df.columns:
+            for ticker in top_tickers:
+                ticker_rows = df[df["ticker"] == ticker]
+                if not ticker_rows.empty:
+                    market_prices[ticker] = float(ticker_rows["close"].iloc[-1])
+
+        # Fallback prices for any missing tickers
+        for ticker in top_tickers:
+            if ticker not in market_prices:
+                market_prices[ticker] = 100.0
+
+        # ------------------------------------------------------------------
+        # Step 7: Build portfolio and trader
+        # ------------------------------------------------------------------
+        initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
+        paper_trader = PaperTrader(
+            initial_cash=initial_cash,
+            slippage_bps=5,
+            commission_per_share=0.005,
         )
 
-    # ------------------------------------------------------------------
-    # Step 6: Get current prices
-    # ------------------------------------------------------------------
-    market_prices: dict[str, float] = {}
-    if not df.empty and "ticker" in df.columns and "close" in df.columns:
-        for ticker in top_tickers:
-            ticker_rows = df[df["ticker"] == ticker]
-            if not ticker_rows.empty:
-                market_prices[ticker] = float(ticker_rows["close"].iloc[-1])
+        # Convert to Portfolio for signal_translator / risk_controls
+        portfolio = paper_trader.portfolio
 
-    # Fallback prices for any missing tickers
-    for ticker in top_tickers:
-        if ticker not in market_prices:
-            market_prices[ticker] = 100.0
+        # Capture portfolio state before trading
+        audit.log_portfolio_state("before", portfolio)
 
-    # ------------------------------------------------------------------
-    # Step 7: Build portfolio and trader
-    # ------------------------------------------------------------------
-    initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
-    paper_trader = PaperTrader(
-        initial_cash=initial_cash,
-        slippage_bps=5,
-        commission_per_share=0.005,
-    )
+        # ------------------------------------------------------------------
+        # Step 8: Translate signals → orders
+        # ------------------------------------------------------------------
+        orders = signals_to_orders(signals, portfolio, market_prices)
+        logger.info("[pipeline] Generated {} orders from {} signals", len(orders), len(signals))
+        audit.log_step("signal_translation", "ok", {"signals": len(signals), "orders": len(orders)})
 
-    # Convert to Portfolio for signal_translator / risk_controls
-    portfolio = paper_trader.portfolio
-
-    # ------------------------------------------------------------------
-    # Step 8: Translate signals → orders
-    # ------------------------------------------------------------------
-    orders = signals_to_orders(signals, portfolio, market_prices)
-    logger.info("[pipeline] Generated {} orders from {} signals", len(orders), len(signals))
-
-    # ------------------------------------------------------------------
-    # Step 9: Pre-trade risk checks + execution
-    # ------------------------------------------------------------------
-    orders_placed = 0
-    for order in orders:
-        risk_result = check_order(order, portfolio, market_prices, config.risk)
-        if not risk_result.passed:
-            logger.warning(
-                "[pipeline] Order {} {} FAILED risk check: {}",
-                order.side,
-                order.ticker,
-                risk_result.failed_checks,
-            )
-            continue
-        try:
-            filled = paper_trader.execute_order(order, market_prices)
-            if filled is not None:
-                orders_placed += 1
-                logger.info(
-                    "[pipeline] Order executed: {} {} qty={} fill={:.2f}",
+        # ------------------------------------------------------------------
+        # Step 9: Pre-trade risk checks + execution
+        # ------------------------------------------------------------------
+        orders_placed = 0
+        for order in orders:
+            risk_result = check_order(order, portfolio, market_prices, config.risk)
+            audit.log_risk_decision(order, risk_result)
+            if not risk_result.passed:
+                logger.warning(
+                    "[pipeline] Order {} {} FAILED risk check: {}",
                     order.side,
                     order.ticker,
-                    order.quantity,
-                    filled.fill_price or 0.0,
+                    risk_result.failed_checks,
                 )
-        except Exception as exc:
-            logger.error("[pipeline] Order execution failed for {}: {}", order.ticker, exc)
+                continue
+            try:
+                filled = paper_trader.execute_order(order, market_prices)
+                if filled is not None:
+                    orders_placed += 1
+                    fill_price = filled.fill_price or market_prices.get(order.ticker, 0.0)
+                    audit.log_trade(order, fill_price, 0.0)
+                    logger.info(
+                        "[pipeline] Order executed: {} {} qty={} fill={:.2f}",
+                        order.side,
+                        order.ticker,
+                        order.quantity,
+                        fill_price,
+                    )
+            except Exception as exc:
+                logger.error("[pipeline] Order execution failed for {}: {}", order.ticker, exc)
 
-    # ------------------------------------------------------------------
-    # Step 10: Snapshot
-    # ------------------------------------------------------------------
-    paper_trader.snapshot(market_prices)
-    final_portfolio = paper_trader.portfolio
+        audit.log_step("order_execution", "ok", {"orders_placed": orders_placed})
 
-    # ------------------------------------------------------------------
-    # Step 11: Print portfolio summary table
-    # ------------------------------------------------------------------
-    table = Table(
-        title=f"Pipeline Summary — Mode: {mode}",
-        show_header=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Ticker", style="bold")
-    table.add_column("Quantity", justify="right")
-    table.add_column("Price", justify="right")
-    table.add_column("Weight %", justify="right")
+        # ------------------------------------------------------------------
+        # Step 10: Snapshot
+        # ------------------------------------------------------------------
+        paper_trader.snapshot(market_prices)
+        final_portfolio = paper_trader.portfolio
 
-    for ticker, pos in final_portfolio.positions.items():
-        price = market_prices.get(ticker, pos.current_price)
+        # Capture portfolio state after trading
+        audit.log_portfolio_state("after", final_portfolio)
+        audit.log_step("portfolio_snapshot", "ok", {"nav": final_portfolio.nav})
+
+        # ------------------------------------------------------------------
+        # Step 11: Print portfolio summary table
+        # ------------------------------------------------------------------
+        table = Table(
+            title=f"Pipeline Summary — Mode: {mode}",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Ticker", style="bold")
+        table.add_column("Quantity", justify="right")
+        table.add_column("Price", justify="right")
+        table.add_column("Weight %", justify="right")
+
+        for ticker, pos in final_portfolio.positions.items():
+            price = market_prices.get(ticker, pos.current_price)
+            table.add_row(
+                ticker,
+                f"{pos.quantity:.0f}",
+                f"${price:.2f}",
+                f"{pos.weight_pct:.1f}%",
+            )
+
         table.add_row(
-            ticker,
-            f"{pos.quantity:.0f}",
-            f"${price:.2f}",
-            f"{pos.weight_pct:.1f}%",
+            "[bold]CASH[/bold]",
+            "",
+            "",
+            f"${final_portfolio.cash:,.2f}",
+        )
+        table.add_row(
+            "[bold]NAV[/bold]",
+            "",
+            "",
+            f"${final_portfolio.nav:,.2f}",
         )
 
-    table.add_row(
-        "[bold]CASH[/bold]",
-        "",
-        "",
-        f"${final_portfolio.cash:,.2f}",
-    )
-    table.add_row(
-        "[bold]NAV[/bold]",
-        "",
-        "",
-        f"${final_portfolio.nav:,.2f}",
-    )
+        console.print(table)
+        logger.info(
+            "[pipeline] Complete — tickers={}, orders={}, nav={:.2f}",
+            len(results),
+            orders_placed,
+            final_portfolio.nav,
+        )
 
-    console.print(table)
-    logger.info(
-        "[pipeline] Complete — tickers={}, orders={}, nav={:.2f}",
-        len(results),
-        orders_placed,
-        final_portfolio.nav,
-    )
+        return {
+            "tickers_analyzed": len(results),
+            "orders_placed": orders_placed,
+            "nav": final_portfolio.nav,
+        }
 
-    return {
-        "tickers_analyzed": len(results),
-        "orders_placed": orders_placed,
-        "nav": final_portfolio.nav,
-    }
+    finally:
+        audit_path = audit.finalize_run()
+        logger.info("[pipeline] Audit trail written to {}", audit_path)
 
 
 # ---------------------------------------------------------------------------
