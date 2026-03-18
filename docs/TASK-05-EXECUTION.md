@@ -90,17 +90,17 @@ Single `get_ohlcv(ticker)` that auto-detects: "/" in ticker → crypto pipeline,
 - Crypto OHLCV DataFrames from crypto pipeline
 
 ## Done Criteria
-- [ ] Paper trader: buy 100 shares AAPL at $200, cash decreases by ~$20K + costs
-- [ ] Paper trader: buy at $100 then buy at $120 → avg cost ≈ $110
-- [ ] Paper trader: sell more shares than owned → rejected (returns None)
-- [ ] Paper trader: cash + positions = total_value at all times (conservation)
-- [ ] Paper trader: performance metrics compute without error after 10+ trades
-- [ ] Risk controls: $50K order in $100K portfolio → blocked (exceeds 10%)
-- [ ] Risk controls: $3K order in $100K portfolio → passes
-- [ ] Risk controls: drawdown > 15% → blocks all buys
-- [ ] Signal bridge: signals convert to correct buy/sell orders
-- [ ] Signal bridge: running twice with same signals produces zero new orders (idempotent)
-- [ ] Portfolio optimizer: risk parity returns weights that sum to ≤ 1.0, all within constraints
-- [ ] Crypto pipeline: fetches BTC/USDT daily OHLCV from Binance
-- [ ] Unified data: get_ohlcv("AAPL") and get_ohlcv("BTC/USDT") both return valid DataFrames
-- [ ] `pytest tests/test_execution.py` passes
+- [x] Paper trader: buy 100 shares AAPL at $200, cash decreases by ~$20K + costs
+- [x] Paper trader: buy at $100 then buy at $120 → avg cost ≈ $110
+- [x] Paper trader: sell more shares than owned → rejected (returns None)
+- [x] Paper trader: cash + positions = total_value at all times (conservation)
+- [x] Paper trader: performance metrics compute without error after 10+ trades
+- [x] Risk controls: $50K order in $100K portfolio → blocked (exceeds 10%)
+- [x] Risk controls: $3K order in $100K portfolio → passes
+- [x] Risk controls: drawdown > 15% → blocks all buys
+- [x] Signal bridge: signals convert to correct buy/sell orders
+- [x] Signal bridge: running twice with same signals produces zero new orders (idempotent)
+- [x] Portfolio optimizer: risk parity returns weights that sum to ≤ 1.0, all within constraints
+- [x] Crypto pipeline: fetches BTC/USDT daily OHLCV from Binance
+- [x] Unified data: get_ohlcv("AAPL") and get_ohlcv("BTC/USDT") both return valid DataFrames
+- [x] `pytest tests/test_execution.py` passes
