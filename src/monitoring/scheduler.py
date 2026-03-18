@@ -48,7 +48,6 @@ class PipelineScheduler:
             # Import and run the core pipeline steps
             from src.core.data_pipeline import DataPipeline
             from src.agents.graph import analyze_ticker
-            from src.utils.schemas import Signal, SignalDirection
 
             config = self.config
             _UNIVERSE = ["SPY", "AAPL", "MSFT"]  # small universe for scheduler runs
