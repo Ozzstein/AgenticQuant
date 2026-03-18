@@ -1,0 +1,17 @@
+{
+  "name": "mean_reversion",
+  "description": "Short-term mean-reversion on price z-scores, daily rebalance for neutral and risk-off regimes",
+  "factor_set": ["zscore_5d", "zscore_10d", "rsi_14", "bollinger_position"],
+  "model": "LightGBM",
+  "universe": "large_cap",
+  "entry_rules": {"rank_threshold": 20, "min_zscore": -2.0, "max_zscore": -0.5},
+  "exit_rules": {"rank_threshold": 40, "holding_period_days": 3, "take_profit_pct": 0.02},
+  "sizing_method": "signal_proportional",
+  "rebalance_frequency": "daily",
+  "regime_applicability": ["neutral", "risk_off"],
+  "risk_overrides": {"max_position": 0.05, "max_sector": 0.20},
+  "backtest_sharpe": 0.64,
+  "backtest_max_drawdown": -0.12,
+  "validated": true,
+  "source": "builtin"
+}

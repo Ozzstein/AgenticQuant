@@ -34,3 +34,7 @@ risk:
 monitoring:
   schedule_time: "16:00"
   schedule_timezone: US/Eastern
+
+strategy:
+  selection_method: regime_based
+  default_strategy: momentum_topk

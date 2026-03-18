@@ -1,0 +1,33 @@
+{
+  "name": "copilot_momentum_strategy_with_volatility_filter",
+  "description": "momentum strategy with volatility filter",
+  "factor_set": [
+    "Alpha158",
+    "momentum_20d"
+  ],
+  "model": "LightGBM",
+  "universe": "SP500",
+  "entry_rules": {
+    "rank_threshold": 0.2,
+    "atr_filter": true,
+    "max_atr_pct": 0.05
+  },
+  "exit_rules": {
+    "stop_loss_pct": 0.08,
+    "holding_period_days": 20,
+    "rank_drop_threshold": 0.5
+  },
+  "sizing_method": "equal_weight",
+  "rebalance_frequency": "weekly",
+  "regime_applicability": [
+    "risk_on",
+    "neutral",
+    "risk_off",
+    "crisis"
+  ],
+  "risk_overrides": {},
+  "backtest_sharpe": 1.4632,
+  "backtest_max_drawdown": -0.16,
+  "validated": true,
+  "source": "rd_agent_copilot_sim"
+}

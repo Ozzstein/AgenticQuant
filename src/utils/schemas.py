@@ -245,6 +245,85 @@ class ModelSpec(BaseModel):
     feature_set: list[str] = Field(default_factory=list)
 
 
+# --- Strategy Models ---
+
+
+class MacroRegime(str, Enum):
+    RISK_ON = "risk_on"
+    NEUTRAL = "neutral"
+    RISK_OFF = "risk_off"
+    CRISIS = "crisis"
+
+
+class SizingMethod(str, Enum):
+    EQUAL_WEIGHT = "equal_weight"
+    INVERSE_VOLATILITY = "inverse_volatility"
+    KELLY = "kelly"
+    RISK_PARITY = "risk_parity"
+    SIGNAL_PROPORTIONAL = "signal_proportional"
+
+
+class RebalanceFrequency(str, Enum):
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
+class SelectionMethod(str, Enum):
+    REGIME_BASED = "regime_based"
+    PERFORMANCE_WEIGHTED = "performance_weighted"
+    BANDIT = "bandit"
+    MANUAL = "manual"
+
+
+class Strategy(BaseModel):
+    """Complete strategy definition stored in data/strategy_library/."""
+
+    name: str
+    description: str = ""
+    factor_set: list[str] = Field(default_factory=lambda: ["Alpha158"])
+    model: str = "LightGBM"
+    universe: str = "SP500"
+    entry_rules: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    exit_rules: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    sizing_method: SizingMethod = SizingMethod.EQUAL_WEIGHT
+    rebalance_frequency: RebalanceFrequency = RebalanceFrequency.WEEKLY
+    regime_applicability: list[MacroRegime] = Field(default_factory=lambda: list(MacroRegime))
+    risk_overrides: dict[str, float] = Field(default_factory=dict)
+    backtest_sharpe: float = 0.0
+    backtest_max_drawdown: float = 0.0
+    validated: bool = False
+    source: str = "builtin"
+
+
+class StrategyAllocation(BaseModel):
+    """Output of the strategy selector — maps strategy names to capital %."""
+
+    allocations: dict[str, float] = Field(default_factory=dict)
+    active_strategy: str = ""
+    selection_method: SelectionMethod = SelectionMethod.REGIME_BASED
+    regime: MacroRegime = MacroRegime.NEUTRAL
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class StrategyPerformance(BaseModel):
+    """Per-strategy live performance tracking."""
+
+    strategy_name: str
+    rolling_sharpe_30d: float = 0.0
+    rolling_sharpe_60d: float = 0.0
+    rolling_sharpe_90d: float = 0.0
+    backtest_sharpe: float = 0.0
+    max_drawdown: float = 0.0
+    current_drawdown: float = 0.0
+    win_rate: float = 0.0
+    total_pnl: float = 0.0
+    daily_pnl: list[float] = Field(default_factory=list)
+    turnover: float = 0.0
+    drift_detected: bool = False
+    last_updated: datetime = Field(default_factory=datetime.now)
+
+
 # --- Validation Suite Models ---
 
 

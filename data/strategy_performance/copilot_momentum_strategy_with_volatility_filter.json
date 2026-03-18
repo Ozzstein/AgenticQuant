@@ -1,0 +1,17 @@
+{
+  "strategy_name": "copilot_momentum_strategy_with_volatility_filter",
+  "rolling_sharpe_30d": 0.0,
+  "rolling_sharpe_60d": 0.0,
+  "rolling_sharpe_90d": 0.0,
+  "backtest_sharpe": 0.0,
+  "max_drawdown": 0.0,
+  "current_drawdown": 0.0,
+  "win_rate": 0.0,
+  "total_pnl": 0.0,
+  "daily_pnl": [
+    0.0
+  ],
+  "turnover": 0.0,
+  "drift_detected": false,
+  "last_updated": "2026-03-19T00:26:18.241970"
+}

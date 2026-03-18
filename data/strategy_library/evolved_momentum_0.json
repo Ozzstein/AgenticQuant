@@ -1,0 +1,32 @@
+{
+  "name": "evolved_momentum_0",
+  "description": "Evolved momentum strategy (iteration 0)",
+  "factor_set": [
+    "Alpha158",
+    "momentum_20d",
+    "momentum_60d"
+  ],
+  "model": "LightGBM",
+  "universe": "SP500",
+  "entry_rules": {
+    "rank_threshold": 0.2,
+    "min_adv_usd": 1000000
+  },
+  "exit_rules": {
+    "stop_loss_pct": 0.08,
+    "holding_period_days": 20
+  },
+  "sizing_method": "equal_weight",
+  "rebalance_frequency": "weekly",
+  "regime_applicability": [
+    "risk_on",
+    "neutral",
+    "risk_off",
+    "crisis"
+  ],
+  "risk_overrides": {},
+  "backtest_sharpe": 0.6876,
+  "backtest_max_drawdown": -0.0906,
+  "validated": true,
+  "source": "rd_agent_evolve_sim"
+}

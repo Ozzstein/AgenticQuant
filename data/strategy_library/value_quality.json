@@ -1,0 +1,17 @@
+{
+  "name": "value_quality",
+  "description": "Value and quality factor strategy for risk-on and neutral regimes, monthly rebalance",
+  "factor_set": ["Alpha158", "pe_ratio", "pb_ratio", "roe", "roic", "fcf_yield"],
+  "model": "CatBoost",
+  "universe": "SP500",
+  "entry_rules": {"rank_threshold": 30, "min_quality_score": 0.65, "max_pe": 25.0},
+  "exit_rules": {"rank_threshold": 60, "holding_period_days": 21},
+  "sizing_method": "equal_weight",
+  "rebalance_frequency": "monthly",
+  "regime_applicability": ["risk_on", "neutral"],
+  "risk_overrides": {"max_position": 0.06},
+  "backtest_sharpe": 0.72,
+  "backtest_max_drawdown": -0.22,
+  "validated": true,
+  "source": "builtin"
+}

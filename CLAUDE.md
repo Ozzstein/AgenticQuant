@@ -19,22 +19,24 @@ PERIODIC (weekly/monthly):
 
 DAILY PIPELINE:
   Market Data (equity + crypto)
-    → Qlib Features (Alpha158 + RD-Agent factor library)
-      → ML Model (RD-Agent-optimized config if available)
-        → Predictions (ranked alpha scores)
-          → Top-N candidates selected
-            → LangGraph Agent Pipeline:
-                Market Context
-                → Macro Regime Detector (risk_on/neutral/risk_off/crisis)
-                → Parallel Analysts (fundamental, sentiment, technical)
-                → Risk Manager (veto power)
-                → Debate Loop (configurable rounds)
-                → Portfolio Strategist
-                → AnalysisResult (Pydantic)
-              → Portfolio Optimizer (risk parity / BL / HRP)
-                → Pre-Trade Risk Controls
-                  → Order Execution (paper / Alpaca / CCXT)
-                    → Reporting (Telegram + Dashboard)
+    → LangGraph Agent Pipeline:
+        Market Context
+        → Macro Regime Detector (risk_on/neutral/risk_off/crisis)
+          → Strategy Selector (regime-based/performance-weighted/bandit)
+            → Qlib Features (using selected strategy's factor set)
+              → ML Model (using selected strategy's model)
+                → Predictions (ranked alpha scores)
+                  → Top-N candidates (using selected strategy's entry rules)
+                    → Parallel Analysts (fundamental, sentiment, technical)
+                    → Risk Manager (veto power)
+                    → Debate Loop (configurable rounds)
+                    → Portfolio Strategist
+                    → AnalysisResult (Pydantic)
+                  → Portfolio Optimizer (using selected strategy's sizing method)
+                    → Pre-Trade Risk Controls
+                      → Order Execution (paper / Alpaca / CCXT)
+                        → Strategy Performance Tracker (per-strategy P&L attribution)
+                          → Reporting (Telegram + Dashboard)
 ```
 
 ## Key Schema

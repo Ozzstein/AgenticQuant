@@ -1,0 +1,17 @@
+{
+  "name": "defensive",
+  "description": "Low-beta large-cap defensive strategy for risk-off and crisis regimes with reduced exposure",
+  "factor_set": ["beta_60d", "dividend_yield", "low_volatility", "quality_score"],
+  "model": "LightGBM",
+  "universe": "large_cap",
+  "entry_rules": {"max_beta": 0.7, "min_dividend_yield": 0.02, "rank_threshold": 20},
+  "exit_rules": {"max_beta": 1.0, "holding_period_days": 14},
+  "sizing_method": "inverse_volatility",
+  "rebalance_frequency": "weekly",
+  "regime_applicability": ["risk_off", "crisis"],
+  "risk_overrides": {"max_position": 0.08, "max_equity": 0.60, "min_cash": 0.15},
+  "backtest_sharpe": 0.58,
+  "backtest_max_drawdown": -0.10,
+  "validated": true,
+  "source": "builtin"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "crypto_trend",
+  "description": "SMA crossover trend-following on crypto top 30, daily rebalance for risk-on and neutral regimes",
+  "factor_set": ["sma_cross_20_50", "sma_cross_50_200", "funding_rate", "oi_change"],
+  "model": "LightGBM",
+  "universe": "crypto_top30",
+  "entry_rules": {"sma_cross_signal": true, "min_funding_rate": -0.01, "min_oi_change": 0.0},
+  "exit_rules": {"sma_cross_reversal": true, "holding_period_days": 7, "stop_loss_pct": 0.05},
+  "sizing_method": "risk_parity",
+  "rebalance_frequency": "daily",
+  "regime_applicability": ["risk_on", "neutral"],
+  "risk_overrides": {"max_position": 0.05, "max_crypto_total": 0.25},
+  "backtest_sharpe": 0.93,
+  "backtest_max_drawdown": -0.35,
+  "validated": true,
+  "source": "builtin"
+}
