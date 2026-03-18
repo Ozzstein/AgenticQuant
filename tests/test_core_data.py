@@ -203,22 +203,34 @@ class TestYfinanceFallback:
 
 class TestCustomFactors:
     def test_create_dataset_with_custom_factors_none(self, mock_config):
-        """Accepts None without raising."""
+        """Accepts None without raising; returns base features DataFrame when Qlib unavailable."""
         from src.core.data_pipeline import DataPipeline
 
         pipeline = DataPipeline(config=mock_config)
-        # Should not raise even when Qlib is not available
-        result = pipeline.create_dataset_with_custom_factors(custom_factors=None)
-        assert result is None  # get_dataset returns None without Qlib
+        base = pd.DataFrame(
+            {"open": [100.0], "close": [101.0]},
+            index=pd.to_datetime(["2023-01-02"]),
+        )
+        # Patch yfinance_fallback to avoid real network calls
+        with patch.object(pipeline, "yfinance_fallback", return_value=base):
+            result = pipeline.create_dataset_with_custom_factors(custom_factors=None)
+        # Qlib not available → returns base features DataFrame
+        assert isinstance(result, pd.DataFrame)
 
     def test_create_dataset_with_custom_factors_df(self, mock_config):
-        """Accepts a DataFrame without raising."""
+        """Accepts a DataFrame without raising; merges with base features when Qlib unavailable."""
         from src.core.data_pipeline import DataPipeline
 
         pipeline = DataPipeline(config=mock_config)
-        factors_df = pd.DataFrame({"factor_a": [1.0, 2.0], "factor_b": [0.5, 0.6]})
-        result = pipeline.create_dataset_with_custom_factors(custom_factors=factors_df)
-        assert result is None  # Qlib not available in tests
+        base = pd.DataFrame(
+            {"open": [100.0], "close": [101.0]},
+            index=pd.to_datetime(["2023-01-02"]),
+        )
+        factors_df = pd.DataFrame({"factor_a": [1.0], "factor_b": [0.5]})
+        with patch.object(pipeline, "yfinance_fallback", return_value=base):
+            result = pipeline.create_dataset_with_custom_factors(custom_factors=factors_df)
+        # Qlib not available → returns merged DataFrame
+        assert isinstance(result, pd.DataFrame)
 
 
 class TestMergeCryptoData:
