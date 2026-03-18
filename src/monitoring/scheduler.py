@@ -46,8 +46,8 @@ class PipelineScheduler:
         try:
             logger.info("PipelineScheduler: running pipeline once...")
             # Import and run the core pipeline steps
-            from src.core.data_pipeline import DataPipeline
             from src.agents.graph import analyze_ticker
+            from src.core.data_pipeline import DataPipeline
 
             config = self.config
             _UNIVERSE = ["SPY", "AAPL", "MSFT"]  # small universe for scheduler runs

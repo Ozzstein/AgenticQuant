@@ -253,7 +253,6 @@ def _step_generate_predictions() -> None:
 
     cfg = get_config()
     from src.core.data_pipeline import DataPipeline
-    from src.core.model_zoo import ModelWrapper
 
     pipeline = DataPipeline(cfg)
     df = pipeline.yfinance_fallback(
@@ -262,7 +261,6 @@ def _step_generate_predictions() -> None:
         end=cfg.qlib.test_end,
     )
     if not df.empty:
-        model = ModelWrapper(model_type=cfg.models.default_model)
         logger.info(
             "scheduler: generate_predictions — model={} rows={}",
             cfg.models.default_model,
@@ -289,7 +287,7 @@ def _step_optimize_portfolio() -> None:
     """Optimise portfolio weights using the configured optimisation method."""
     from src.execution.portfolio_optimizer import PortfolioOptimizer
 
-    optimizer = PortfolioOptimizer(method="risk_parity")
+    PortfolioOptimizer(method="risk_parity")
     logger.info("scheduler: optimize_portfolio — optimizer created (method=risk_parity).")
     # Full optimisation requires live signal data; stub here logs completion.
     logger.info("scheduler: optimize_portfolio — complete.")
@@ -301,7 +299,7 @@ def _step_run_risk_controls() -> None:
     from src.utils.config import get_config
 
     cfg = get_config()
-    controls = RiskControls(cfg)
+    RiskControls(cfg)
     logger.info("scheduler: run_risk_controls — checks instantiated.")
     # Actual check calls require live portfolio; log completion.
     logger.info("scheduler: run_risk_controls — complete.")
