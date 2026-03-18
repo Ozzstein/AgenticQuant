@@ -202,6 +202,7 @@ def _render_analysis(analysis: dict) -> None:
     decision = str(analysis.get("decision", "HOLD")).upper()
     confidence_raw = analysis.get("confidence", 0)
     try:
+        # Confidence is stored as 0-100 per AnalysisResult schema; normalize to 0-1 for st.progress
         confidence = float(confidence_raw) / 100.0
     except (TypeError, ValueError):
         confidence = 0.0
@@ -543,10 +544,10 @@ def main() -> None:
             page_system()
 
 
-if __name__ == "__main__" or True:
+if __name__ == "__main__":
     # Streamlit executes the module top-level; call main() conditionally.
-    # The `or True` is intentional: Streamlit re-runs the whole file, so we
-    # must call main() at module level, but only inside a Streamlit context.
+    # The Streamlit context check inside (_sr.get_script_run_ctx() is not None)
+    # ensures main() is only called inside a Streamlit context.
     try:
         import streamlit.runtime.scriptrunner as _sr  # noqa: PLC0415
 
