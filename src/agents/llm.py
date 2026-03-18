@@ -52,6 +52,8 @@ class _CostTrackingCallback(BaseCallbackHandler):
             from src.utils.cost_tracker import CostTracker
 
             usage = (response.llm_output or {}).get("usage", {})
+            if not usage:
+                _log.debug("CostTracker: response for {} has no usage metadata", self.model_name)
             # Anthropic surfaces token counts under different keys depending on version
             prompt_tokens = int(
                 usage.get("input_tokens")

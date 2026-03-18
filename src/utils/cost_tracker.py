@@ -15,6 +15,14 @@ _log = get_logger("utils.cost_tracker")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def reset_instance() -> None:
+    """Reset the CostTracker singleton (tests only).
+
+    Clears the singleton instance to allow fresh initialization in test suites.
+    """
+    CostTracker._instance = None
+
+
 class CostTracker:
     """Singleton that records LLM API token usage and computes USD cost.
 
@@ -63,7 +71,7 @@ class CostTracker:
         """
         pricing = self.PRICING.get(model)
         if pricing is None:
-            _log.warning("CostTracker: unknown model '{}' — cost recorded as $0.00", model)
+            _log.debug("CostTracker: unknown model '{}' — cost recorded as $0.00", model)
             cost = 0.0
         else:
             cost = (prompt_tokens / 1_000_000) * pricing["input"] + (
@@ -127,10 +135,12 @@ class CostTracker:
         all_calls = prior_calls + self._session_calls
         payload = self._build_summary_payload(target_date, all_calls)
 
-        with filepath.open("w") as fh:
-            json.dump(payload, fh, indent=2)
-
-        _log.info("CostTracker: saved {} call(s) to {}", len(all_calls), filepath)
+        try:
+            with filepath.open("w") as fh:
+                json.dump(payload, fh, indent=2)
+            _log.info("CostTracker: saved {} call(s) to {}", len(all_calls), filepath)
+        except (OSError, IOError) as exc:
+            _log.warning("CostTracker: failed to save daily costs to {}: {}", filepath, exc)
 
     def load_daily(self, date_str: str) -> dict[str, Any]:
         """Load the daily cost record for the given date.
@@ -144,8 +154,12 @@ class CostTracker:
         filepath = _PROJECT_ROOT / "data" / "costs" / f"{date_str}.json"
         if not filepath.exists():
             return {}
-        with filepath.open() as fh:
-            return json.load(fh)
+        try:
+            with filepath.open() as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            _log.warning("CostTracker: failed to load daily costs from {}: {}", filepath, exc)
+            return {}
 
     def get_daily_summary(self, date_str: str | None = None) -> dict[str, Any]:
         """Return a cost summary for a given date or the current session.
