@@ -152,7 +152,7 @@ class AlertManager:
         self._send_smtp("QuantAgentLab — Drawdown Warning", body)
         self._mark_sent(alert_type)
 
-    def send_agent_disagreement(self, ticker: str, reports: dict) -> None:
+    def send_agent_disagreement(self, ticker: str, reports: dict[str, str]) -> None:
         """Send alert when max spread between agent decisions exceeds 60 points.
 
         Args:
