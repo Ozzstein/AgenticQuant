@@ -24,9 +24,6 @@ services:
 
   scheduler:
     image: aiquant:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: aiquant-scheduler
     environment:
       - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
@@ -43,9 +40,6 @@ services:
 
   dashboard:
     image: aiquant:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: aiquant-dashboard
     environment:
       - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}

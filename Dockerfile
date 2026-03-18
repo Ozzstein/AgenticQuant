@@ -25,11 +25,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user and set up /app directory
+RUN useradd --create-home --shell /bin/bash appuser && \
+    mkdir -p /app && \
+    chown appuser:appuser /app
+
 WORKDIR /app
 
 # Copy Python dependencies from builder stage
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Switch to non-root user
+USER appuser
 
 # Copy application code
 COPY src/ src/
