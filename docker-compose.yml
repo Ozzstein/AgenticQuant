@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  app:
+    image: aiquant:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiquant-app
+    environment:
+      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
+      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
+      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
+      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
+    env_file: .env
+    volumes:
+      - qlib_data:/app/data/qlib_data
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+    depends_on:
+      - scheduler
+    restart: unless-stopped
+    command: python scripts/run_pipeline.py --mode paper
+
+  scheduler:
+    image: aiquant:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiquant-scheduler
+    environment:
+      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
+      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
+      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
+      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
+    env_file: .env
+    volumes:
+      - qlib_data:/app/data/qlib_data
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: python src/scheduler.py --loop
+
+  dashboard:
+    image: aiquant:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiquant-dashboard
+    environment:
+      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
+      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
+      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
+      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - qlib_data:/app/data/qlib_data
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: streamlit run src/dashboard.py --server.port 8501 --server.headless true
+
+volumes:
+  qlib_data:
+    driver: local
