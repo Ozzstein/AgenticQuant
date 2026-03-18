@@ -28,6 +28,20 @@ def _reset_config_cache():
     reset_config()
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_generated_artifacts():
+    """Remove generated output artifacts that interfere with unit tests."""
+    from pathlib import Path
+    _ARTIFACTS = [
+        Path("outputs/best_model_config.yaml"),
+    ]
+    for p in _ARTIFACTS:
+        p.unlink(missing_ok=True)
+    yield
+    for p in _ARTIFACTS:
+        p.unlink(missing_ok=True)
+
+
 @pytest.fixture
 def mock_config() -> AppConfig:
     """Return a test AppConfig with defaults."""
