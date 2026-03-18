@@ -289,13 +289,13 @@ class AuditLogger:
     # Finalise
     # ------------------------------------------------------------------
 
-    def finalize_run(self) -> Path:
+    def finalize_run(self) -> Path | None:
         """Write the audit record to ``data/audit/YYYY-MM-DD.json``.
 
         Creates the directory if it does not exist.
 
         Returns:
-            Path to the written audit file.
+            Path to the written audit file, or None if write failed.
         """
         if self._run_date is None:
             self._run_date = datetime.now(UTC).date().isoformat()
@@ -305,6 +305,7 @@ class AuditLogger:
             audit_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             logger.error("AuditLogger: could not create audit directory {}: {}", audit_dir, exc)
+            return None
 
         filepath = audit_dir / f"{self._run_date}.json"
 
@@ -329,10 +330,10 @@ class AuditLogger:
                 self._run_id,
                 filepath,
             )
+            return filepath
         except (OSError, TypeError) as exc:
             logger.error("AuditLogger: failed to write audit file {}: {}", filepath, exc)
-
-        return filepath
+            return None
 
 
 # ---------------------------------------------------------------------------

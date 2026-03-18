@@ -65,7 +65,7 @@ def _run_pipeline_once(mode: str) -> dict:
     from src.execution.signal_translator import signals_to_orders
     from src.utils.audit import AuditLogger
     from src.utils.config import get_config
-    from src.utils.schemas import Decision, Signal, SignalDirection
+    from src.utils.schemas import Signal, SignalDirection
 
     config = get_config()
     start = config.qlib.test_start
@@ -295,7 +295,10 @@ def _run_pipeline_once(mode: str) -> dict:
 
     finally:
         audit_path = audit.finalize_run()
-        logger.info("[pipeline] Audit trail written to {}", audit_path)
+        if audit_path:
+            logger.info("[pipeline] Audit trail written to {}", audit_path)
+        else:
+            logger.warning("[pipeline] Audit trail write failed — check logs")
 
 
 # ---------------------------------------------------------------------------
