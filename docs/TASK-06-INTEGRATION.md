@@ -32,6 +32,12 @@ Each weekly/monthly run loads the knowledge base before starting and saves updat
 
 **Library management**: load all factors from library, return summary (count, avg IC, last discovery date, knowledge base stats), validate library with a dedicated backtest.
 
+**Factor Copilot (interactive mode)**: Unlike the autonomous modes above where RD-Agent decides what to explore, this is the interactive mode. You describe a factor hypothesis in plain English — for example "build me a factor that captures stocks with accelerating revenue growth AND declining short interest" — and RD-Agent implements it as code, evaluates it (IC, ICIR, turnover), and reports back. If it passes quality thresholds, it's saved to the factor library. This uses RD-Agent's Finance Data Copilot scenario. The value: when you read something interesting or have a trading intuition, you can test it instantly without writing code yourself. Expose this as a CLI command and also as a function callable from notebooks.
+
+**Model Copilot (full architecture from papers)**: Extends the paper implementation mode beyond just extracting factors. This mode reads a paper describing a full model architecture (e.g., a temporal fusion transformer, an attention-based LSTM, a graph neural network for stock relationships) and implements it as a complete Qlib-compatible model — PyTorch code, training loop, integration with Qlib's DataHandler and backtest. This uses RD-Agent's General Model Copilot scenario. The result is a new model added to the model zoo that can be compared against LightGBM in backtests. This is how you'd explore LSTM/Transformer models without coding them manually.
+
+**RD-Agent built-in UI**: RD-Agent ships with its own Streamlit-based web UI (`rdagent ui --port 8080 --log-dir log/`). It shows every R&D loop with: hypothesis generated, code implemented, backtest results, feedback analysis, and knowledge base state. Pre-defined views for: Qlib Model, Qlib Factor, Data Mining, Model from Paper. Wire this into the project so it runs as part of the docker-compose stack (or standalone). This replaces the need to build a custom dashboard for the RD-Agent research monitoring — use the built-in one directly. The project's own Streamlit dashboard (Task 07) should focus on the daily pipeline, portfolio, and agents. The RD-Agent UI covers the periodic research side.
+
 ### 2. Pipeline Integration Points
 
 The daily pipeline must wire these connections:
@@ -62,6 +68,9 @@ The daily pipeline must wire these connections:
 - `library-status` — show factor library contents, knowledge base stats, last run date, cumulative discoveries
 - `validate-library` — run 3-way backtest: Alpha158 only vs library only vs combined
 - `reset-knowledge` — clear the knowledge base (start fresh, use with caution)
+- `copilot-factor "description of your factor idea"` — interactive mode: describe a factor in plain English, RD-Agent implements it, evaluates it, saves to library if it passes. Uses the Finance Data Copilot scenario.
+- `copilot-model --source ./papers/model_paper.pdf` — read a paper describing a full model architecture, implement it as a Qlib-compatible PyTorch model, backtest it, add to model zoo if results are good. Uses the General Model Copilot scenario. Different from `implement-paper` which only extracts factors — this builds entire models.
+- `ui --port 8080` — launch RD-Agent's built-in Streamlit dashboard showing all R&D loops, hypotheses, implementations, and results. Reads from `log/` directory. Pre-defined views for Qlib Factor, Qlib Model, Data Mining, Model from Paper.
 
 ### 4. Full Pipeline Flow (`scripts/run_pipeline.py`)
 
@@ -95,8 +104,11 @@ Create 4 Jupyter notebooks (as .py percent-format scripts):
 
 ## Outputs
 - Working end-to-end pipeline in all three modes
-- RD-Agent CLI with all subcommands functional
+- RD-Agent CLI with all subcommands functional (co-optimize, mine-factors, optimize-model, copilot-factor, copilot-model, implement-paper, library-status, validate-library, ui)
 - Factor library integration verified
+- Factor Copilot producing factors from natural language descriptions
+- Model Copilot producing Qlib-compatible models from paper PDFs
+- RD-Agent built-in UI running and showing R&D loop traces
 - 4 runnable notebooks
 
 ## Done Criteria
@@ -112,6 +124,10 @@ Create 4 Jupyter notebooks (as .py percent-format scripts):
 - [x] `python scripts/run_rd_agent.py implement-paper --source ./papers/test_paper.pdf` extracts and backtests at least one factor or model from a paper
 - [x] Knowledge base persists between runs: run co-optimize twice, second run loads knowledge from first run (verify via logs showing "loaded N prior experiments")
 - [x] Knowledge base prevents re-proposing known failures: if a factor failed in run 1, it should not be re-proposed identically in run 2
+- [x] `python scripts/run_rd_agent.py copilot-factor "momentum factor for stocks with rising earnings estimates and high short interest"` implements, evaluates, and reports IC/ICIR for the described factor
+- [x] `python scripts/run_rd_agent.py copilot-model --source ./papers/test_model_paper.pdf` reads a paper and produces a working Qlib-compatible model that trains and backtests
+- [x] `python scripts/run_rd_agent.py ui --port 8080` launches the RD-Agent Streamlit dashboard and it loads without errors
+- [x] RD-Agent UI shows at least one completed R&D loop after running co-optimize
 - [x] Factor library JSON files load correctly and merge into dataset
 - [x] Pipeline is idempotent: running twice with same data produces same trades
 - [x] All 4 notebooks execute without errors

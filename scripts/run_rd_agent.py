@@ -9,6 +9,7 @@ Usage::
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -196,6 +197,95 @@ def validate_library() -> None:
     console.print(table)
     winner = result["winner"]
     console.print(f"[green bold]Winner:[/green bold] {winner}")
+
+
+@app.command("copilot-factor")
+def copilot_factor_cmd(
+    description: str = typer.Argument(..., help="Natural-language description of the factor."),
+) -> None:
+    """Implement and evaluate a factor from a plain-English description.
+
+    Matches keywords in the description to known factor templates, evaluates
+    each, and saves passing factors to the library.
+
+    Example::
+
+        python scripts/run_rd_agent.py copilot-factor "momentum with rising earnings"
+    """
+    console.print(f"[bold cyan]copilot-factor[/bold cyan]: '{description}'")
+    runner = _runner()
+    result = runner.copilot_factor(description)
+
+    _print_dict("copilot-factor result", {k: v for k, v in result.items() if k != "accepted"})
+
+    accepted = result.get("accepted", [])
+    if accepted:
+        table = Table(title=f"Accepted Factors ({len(accepted)})", show_lines=True)
+        table.add_column("Name", style="green")
+        table.add_column("Category")
+        table.add_column("IC Mean", justify="right")
+        table.add_column("ICIR", justify="right")
+        for f in accepted:
+            table.add_row(
+                f["name"],
+                f["category"],
+                f"{f['ic_mean']:.4f}",
+                f"{f['icir']:.4f}",
+            )
+        console.print(table)
+    else:
+        console.print("[yellow]No factors accepted from this description.[/yellow]")
+
+
+@app.command("copilot-model")
+def copilot_model_cmd(
+    source: str = typer.Option(..., "--source", "-s", help="URL, arXiv ID, or local file path."),
+) -> None:
+    """Build a model config from a paper or local text file.
+
+    Reads the source, detects model architecture keywords, and produces a
+    hyperparameter config. Saves to best_model_config.yaml if Sharpe > 0.5.
+
+    Example::
+
+        python scripts/run_rd_agent.py copilot-model --source ./papers/model.txt
+    """
+    console.print(f"[bold cyan]copilot-model[/bold cyan]: source='{source}'")
+    runner = _runner()
+    result = runner.copilot_model(source=source)
+    _print_dict("copilot-model result", result)
+
+
+@app.command("ui")
+def ui_cmd(
+    port: int = typer.Option(8080, "--port", "-p", help="Port to run the dashboard on."),
+) -> None:
+    """Launch the RD-Agent Streamlit dashboard.
+
+    Shows knowledge base status, factor library, and R&D loop results.
+
+    Example::
+
+        python scripts/run_rd_agent.py ui --port 8080
+    """
+    dashboard_path = _ROOT / "src" / "rd_agent_dashboard.py"
+    console.print(
+        f"[bold cyan]ui[/bold cyan]: launching dashboard at http://localhost:{port}"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(dashboard_path),
+            "--server.port",
+            str(port),
+            "--server.headless",
+            "true",
+        ],
+        check=False,
+    )
 
 
 @app.command("reset-knowledge")

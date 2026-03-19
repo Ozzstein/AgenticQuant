@@ -10,6 +10,9 @@ from pathlib import Path
 # Allow running directly from repo root: `python scripts/run_pipeline.py`
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import json
+from datetime import date
+
 import typer
 from loguru import logger
 from rich.console import Console
@@ -22,12 +25,53 @@ app = typer.Typer(
 )
 console = Console()
 
+_PIPELINE_STATE_DIR = Path("data/pipeline_state")
+
 _UNIVERSE: list[str] = [
     "SPY", "AAPL", "MSFT", "GOOGL", "AMZN",
     "NVDA", "TSLA", "JPM", "V", "UNH",
 ]
 
 _TOP_N = 5
+
+
+# ---------------------------------------------------------------------------
+# Idempotency helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_idempotency(mode: str) -> dict | None:
+    """Return cached summary if pipeline already ran today for this mode.
+
+    Args:
+        mode: Pipeline mode string (backtest, paper, paper-loop).
+
+    Returns:
+        Cached summary dict if today's run exists, else None.
+    """
+    state_file = _PIPELINE_STATE_DIR / f"last_run_{mode}.json"
+    if not state_file.exists():
+        return None
+    try:
+        state = json.loads(state_file.read_text())
+        if state.get("date") == date.today().isoformat():
+            return state.get("summary")
+    except Exception:
+        pass
+    return None
+
+
+def _save_pipeline_state(mode: str, summary: dict) -> None:
+    """Persist pipeline run state for idempotency checks.
+
+    Args:
+        mode: Pipeline mode string.
+        summary: Summary dict returned by _run_pipeline_once.
+    """
+    _PIPELINE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_file = _PIPELINE_STATE_DIR / f"last_run_{mode}.json"
+    state = {"date": date.today().isoformat(), "summary": summary}
+    state_file.write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +105,15 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
     Returns:
         Summary dict with tickers_analyzed, orders_placed, nav, active_strategy.
     """
+    # Idempotency: skip if already ran today (not applicable to paper-loop demo)
+    if mode != "paper-loop":
+        cached = _check_idempotency(mode)
+        if cached is not None:
+            logger.warning(
+                "[pipeline] Already ran today in mode='{}'. Returning cached result.", mode
+            )
+            return cached
+
     from src.agents.graph import analyze_ticker
     from src.core.data_pipeline import DataPipeline
     from src.core.strategy_selector import StrategySelector
@@ -367,12 +420,18 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
             active_strategy_name,
         )
 
-        return {
+        summary = {
             "tickers_analyzed": len(results),
             "orders_placed": orders_placed,
             "nav": final_portfolio.nav,
             "active_strategy": active_strategy_name,
         }
+
+        # Save state for idempotency (skip paper-loop demo mode)
+        if mode != "paper-loop":
+            _save_pipeline_state(mode, summary)
+
+        return summary
 
     finally:
         audit_path = audit.finalize_run()
@@ -496,6 +555,7 @@ def setup() -> None:
         Path(config.log_dir),
         Path("outputs/batch_analysis"),
         Path("data/rd_knowledge_base"),
+        _PIPELINE_STATE_DIR,
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
