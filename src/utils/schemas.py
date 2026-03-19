@@ -348,3 +348,30 @@ class ValidationReport(BaseModel):
     overall: str  # "RELIABLE" or "NOT RELIABLE"
     summary: str
     benchmark: BenchmarkComparison | None = None
+
+
+# --- Regime Models ---
+
+
+class RegimeDetectionResult(BaseModel):
+    """Output of the HMM regime detector for a single inference step."""
+
+    regime: MacroRegime
+    confidence: float = Field(ge=0.0, le=1.0)
+    state_probabilities: dict[str, float] = Field(default_factory=dict)
+    signal_values: dict[str, float] = Field(default_factory=dict)
+    regime_history_20d: list[str] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+class RegimeEvolutionResult(BaseModel):
+    """Single RD-Agent regime evolution iteration result."""
+
+    iteration: int
+    change_description: str
+    baseline_sharpe: float
+    modified_sharpe: float
+    improvement: float
+    accepted: bool
+    signals_used: list[str] = Field(default_factory=list)
+    n_states: int = 4
