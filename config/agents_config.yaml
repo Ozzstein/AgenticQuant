@@ -18,3 +18,19 @@ langgraph:
   max_recursion: 50
   parallel_analysts: true
   earnings_lookforward_days: 5
+
+macro_regime:
+  hmm_states: 4
+  confidence_threshold: 0.7
+  min_regime_days: 3
+  retrain_frequency: "quarterly"
+  normalization_window: 252
+  signals:
+    - vix_level
+    - vix_roc_10d
+    - yield_curve_10y2y
+    - sp500_breadth
+    - sp500_realized_vol_20d
+    - sp500_momentum_20d
+    - dxy_roc_20d
+    - credit_spread_proxy

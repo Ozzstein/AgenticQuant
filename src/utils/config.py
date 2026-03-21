@@ -134,6 +134,26 @@ class StrategyConfig(BaseModel):
     default_strategy: str = "momentum_topk"
 
 
+class MacroRegimeConfig(BaseModel):
+    """HMM regime detector configuration."""
+
+    hmm_states: int = 4
+    confidence_threshold: float = 0.7
+    min_regime_days: int = 3
+    retrain_frequency: str = "quarterly"
+    normalization_window: int = 252
+    signals: list[str] = Field(default_factory=lambda: [
+        "vix_level",
+        "vix_roc_10d",
+        "yield_curve_10y2y",
+        "sp500_breadth",
+        "sp500_realized_vol_20d",
+        "sp500_momentum_20d",
+        "dxy_roc_20d",
+        "credit_spread_proxy",
+    ])
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -157,6 +177,7 @@ class AppConfig(BaseSettings):
     models: ModelConfig = Field(default_factory=ModelConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    macro_regime: MacroRegimeConfig = Field(default_factory=MacroRegimeConfig)
 
     @field_validator("log_level")
     @classmethod

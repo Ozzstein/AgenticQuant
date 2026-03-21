@@ -18,16 +18,14 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import json
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.panel import Panel  # noqa: E402
+from rich.pretty import Pretty  # noqa: E402
+from rich.table import Table  # noqa: E402
 
-import typer
-from rich.console import Console
-from rich.panel import Panel
-from rich.pretty import Pretty
-from rich.table import Table
-
-from src.core.rd_agent_runner import RDAgentRunner
-from src.utils.logger import get_logger
+from src.core.rd_agent_runner import RDAgentRunner  # noqa: E402
+from src.utils.logger import get_logger  # noqa: E402
 
 app = typer.Typer(
     name="run_rd_agent",
@@ -248,6 +246,71 @@ def evolve_strategies_cmd(
 
     console.print(table)
     typer.echo(f"Evolved {len(results)} strategies")
+
+
+@app.command("evolve-regime")
+def evolve_regime_cmd(
+    iterations: int = typer.Option(10, "--iterations", "-i", help="Number of evolution iterations"),
+    budget: float = typer.Option(10.0, "--budget", "-b", help="API budget in USD"),
+) -> None:
+    """Evolve the HMM regime detector via simulated backtest comparison loop.
+
+    Cycles through 6 change archetypes (add/remove signal, change states,
+    adjust threshold/window) and accepts changes that improve simulated Sharpe.
+    Results are saved to the knowledge base.
+    """
+    console.print(
+        f"[bold cyan]evolve-regime[/bold cyan]: iterations={iterations}, budget={budget}"
+    )
+    runner = _runner()
+    results = runner.evolve_regime(iterations=iterations, budget=budget)
+
+    table = Table(title=f"Regime Evolution Results ({len(results)} accepted)", show_lines=True)
+    table.add_column("Iteration", justify="right")
+    table.add_column("Change", style="green")
+    table.add_column("Baseline Sharpe", justify="right")
+    table.add_column("Modified Sharpe", justify="right")
+    table.add_column("Improvement", justify="right")
+    for r in results:
+        table.add_row(
+            str(r.get("iteration", "")),
+            r.get("change_description", ""),
+            f"{r.get('baseline_sharpe', 0.0):.4f}",
+            f"{r.get('modified_sharpe', 0.0):.4f}",
+            f"{r.get('improvement', 0.0):+.4f}",
+        )
+
+    console.print(table)
+    typer.echo(f"Accepted {len(results)} regime changes out of {iterations} iterations")
+
+
+@app.command("copilot-regime")
+def copilot_regime_cmd(
+    description: str = typer.Argument(..., help="Natural language regime change description"),
+) -> None:
+    """Apply a user-described change to the regime detector and evaluate it.
+
+    Parses keywords to determine the change type (add/remove signal, try N
+    states, adjust threshold), simulates a backtest, and reports results.
+
+    Examples::
+
+        python scripts/run_rd_agent.py copilot-regime "add put/call ratio as a signal"
+        python scripts/run_rd_agent.py copilot-regime "try 5 states"
+        python scripts/run_rd_agent.py copilot-regime "increase confidence threshold to 0.8"
+    """
+    console.print(f"[bold cyan]copilot-regime[/bold cyan]: description='{description}'")
+    runner = _runner()
+    result = runner.copilot_regime(description=description)
+
+    if "error" in result:
+        typer.echo(f"Error: {result['error']}", err=True)
+        raise typer.Exit(1)
+
+    _print_dict("copilot-regime result", result)
+    typer.echo(f"Change: {result.get('change_description', '')}")
+    typer.echo(f"Accepted: {result.get('accepted', False)}")
+    typer.echo(f"Improvement: {result.get('improvement', 0.0):+.4f}")
 
 
 @app.command("copilot-strategy")

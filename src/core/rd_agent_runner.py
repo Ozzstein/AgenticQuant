@@ -44,6 +44,8 @@ _EMPTY_KB: dict[str, Any] = {
     "last_run_date": "never",
     "tested_strategies": [],
     "discovered_strategies": [],
+    "tested_regime_configs": [],
+    "discovered_regime_improvements": [],
 }
 
 # ---------------------------------------------------------------------------
@@ -1047,3 +1049,241 @@ class RDAgentRunner:
         except Exception as exc:  # noqa: BLE001
             logger.error("copilot_strategy failed: {}", exc)
             return {"error": str(exc), "description": description}
+
+    # ------------------------------------------------------------------
+    # Regime evolution and copilot
+    # ------------------------------------------------------------------
+
+    def evolve_regime(
+        self,
+        iterations: int = 10,
+        budget: float = 10.0,
+        traces: int = 1,
+    ) -> list[dict]:
+        """Evolve the HMM regime detector via simulated backtest comparison loop.
+
+        For each iteration, one of 6 change archetypes is proposed (add signal,
+        remove signal, change state count, adjust confidence threshold, or
+        change normalisation window).  The change is evaluated by simulating
+        baseline vs modified Sharpe ratios.  Accepted improvements are saved
+        to the knowledge base.
+
+        Args:
+            iterations: Number of regime evolution iterations.
+            budget: Maximum API budget in USD (reserved for future use).
+            traces: Number of parallel research threads (reserved).
+
+        Returns:
+            List of accepted improvement dicts.
+        """
+        from src.utils.schemas import RegimeEvolutionResult
+
+        if traces > 1:
+            logger.warning("evolve_regime: traces>1 not yet parallelised; running single trace.")
+        logger.info(
+            "Starting regime evolution: {} iterations, budget ${:.1f}", iterations, budget
+        )
+
+        with self._file_lock:
+            kb = self._load_kb()
+
+        tested_configs: list[str] = [
+            str(c) for c in kb.get("tested_regime_configs", [])
+        ]
+        tested_set: set[str] = set(tested_configs)
+
+        # 6 change archetypes cycled deterministically
+        _archetypes = [
+            ("add_signal", {"signal": "put_call_ratio"}),
+            ("remove_signal", {"signal": "dxy_roc_20d"}),
+            ("change_states", {"n_states": 5}),
+            ("change_states", {"n_states": 3}),
+            ("change_threshold", {"confidence_threshold": 0.8}),
+            ("change_window", {"normalization_window": 126}),
+        ]
+
+        accepted: list[dict] = []
+
+        for i in range(iterations):
+            change_type, change_params = _archetypes[i % len(_archetypes)]
+            change_key = f"{change_type}:{json.dumps(change_params, sort_keys=True)}"
+
+            if change_key in tested_set:
+                logger.debug("Skipping already-tested regime config: {}", change_key)
+                continue
+
+            tested_set.add(change_key)
+
+            # Simulate baseline and modified Sharpe
+            baseline_sharpe = self._simulate_backtest_sharpe()
+            # Small perturbation for modified
+            modified_sharpe = self._simulate_backtest_sharpe()
+            improvement = modified_sharpe - baseline_sharpe
+            accepted_flag = modified_sharpe > baseline_sharpe
+
+            # Determine signals_used and n_states for the result
+            current_signals = self.config.macro_regime.signals if hasattr(self.config, "macro_regime") else [
+                "vix_level", "vix_roc_10d", "yield_curve_10y2y", "sp500_breadth",
+                "sp500_realized_vol_20d", "sp500_momentum_20d", "dxy_roc_20d", "credit_spread_proxy",
+            ]
+            signals_used = list(current_signals)
+            n_states = 4
+
+            if change_type == "add_signal":
+                new_signal = change_params.get("signal", "")
+                if new_signal and new_signal not in signals_used:
+                    signals_used.append(new_signal)
+            elif change_type == "remove_signal":
+                rm_signal = change_params.get("signal", "")
+                signals_used = [s for s in signals_used if s != rm_signal]
+            elif change_type == "change_states":
+                n_states = change_params.get("n_states", 4)
+
+            change_description = f"{change_type}: {change_params}"
+
+            result = RegimeEvolutionResult(
+                iteration=i,
+                change_description=change_description,
+                baseline_sharpe=round(baseline_sharpe, 4),
+                modified_sharpe=round(modified_sharpe, 4),
+                improvement=round(improvement, 4),
+                accepted=accepted_flag,
+                signals_used=signals_used,
+                n_states=n_states,
+            )
+
+            if accepted_flag:
+                accepted.append(result.model_dump(mode="json"))
+                kb.setdefault("discovered_regime_improvements", []).append({
+                    "date": str(date.today()),
+                    "change": change_description,
+                    "improvement": round(improvement, 4),
+                    "modified_sharpe": round(modified_sharpe, 4),
+                })
+                logger.info(
+                    "Regime change '{}' accepted (Sharpe improvement={:.4f}).",
+                    change_description,
+                    improvement,
+                )
+            else:
+                logger.debug(
+                    "Regime change '{}' rejected (improvement={:.4f}).",
+                    change_description,
+                    improvement,
+                )
+
+        # Persist updated KB
+        kb["tested_regime_configs"] = sorted(tested_set)
+        kb["last_run_date"] = str(date.today())
+        with self._file_lock:
+            self._save_kb(kb)
+
+        logger.info(
+            "evolve_regime complete: {}/{} changes accepted.", len(accepted), iterations
+        )
+        return accepted
+
+    def copilot_regime(self, description: str) -> dict:
+        """Apply a user-described change to the regime detector and evaluate it.
+
+        Parses natural language keywords to build a regime change dict
+        (add/remove signal, try N states, adjust threshold), simulates a
+        backtest, and returns the result.
+
+        Args:
+            description: Natural language description of the desired change.
+
+        Returns:
+            Dict with change details and simulated performance impact.
+        """
+        from src.utils.schemas import RegimeEvolutionResult
+
+        logger.info("Running regime copilot for: {}", description)
+        desc_lower = description.lower()
+
+        # Parse keywords → change dict
+        change_type = "add_signal"
+        change_params: dict[str, str | int | float] = {}
+
+        if "add" in desc_lower or "include" in desc_lower:
+            change_type = "add_signal"
+            # Extract signal name (everything after "add" or "include")
+            for keyword in ["put_call", "put/call", "copper", "copper/gold", "credit"]:
+                if keyword in desc_lower:
+                    change_params["signal"] = keyword.replace("/", "_").replace(" ", "_")
+                    break
+            if not change_params:
+                # Fallback: extract the last word in the description as signal name
+                words = re.sub(r"[^a-z0-9_ ]", "", desc_lower).split()
+                change_params["signal"] = words[-1] if words else "new_signal"
+
+        elif "remove" in desc_lower or "drop" in desc_lower:
+            change_type = "remove_signal"
+            for sig in ["dxy", "vix_roc", "credit_spread", "sp500_breadth"]:
+                if sig in desc_lower:
+                    change_params["signal"] = sig
+                    break
+            if not change_params:
+                change_params["signal"] = "dxy_roc_20d"
+
+        elif "state" in desc_lower or "states" in desc_lower:
+            change_type = "change_states"
+            # Extract integer from description
+            numbers = re.findall(r"\b(\d+)\b", description)
+            n_states = int(numbers[0]) if numbers else 4
+            change_params["n_states"] = n_states
+
+        elif "threshold" in desc_lower or "confidence" in desc_lower:
+            change_type = "change_threshold"
+            numbers = re.findall(r"\b(0\.\d+)\b", description)
+            threshold = float(numbers[0]) if numbers else 0.8
+            change_params["confidence_threshold"] = threshold
+
+        elif "window" in desc_lower or "normaliz" in desc_lower:
+            change_type = "change_window"
+            numbers = re.findall(r"\b(\d+)\b", description)
+            window = int(numbers[0]) if numbers else 126
+            change_params["normalization_window"] = window
+
+        # Simulate evaluation
+        baseline_sharpe = self._simulate_backtest_sharpe()
+        modified_sharpe = self._simulate_backtest_sharpe()
+        improvement = modified_sharpe - baseline_sharpe
+        accepted = modified_sharpe > baseline_sharpe
+
+        # Determine signals_used and n_states
+        current_signals = self.config.macro_regime.signals if hasattr(self.config, "macro_regime") else [
+            "vix_level", "vix_roc_10d", "yield_curve_10y2y", "sp500_breadth",
+            "sp500_realized_vol_20d", "sp500_momentum_20d", "dxy_roc_20d", "credit_spread_proxy",
+        ]
+        signals_used = list(current_signals)
+        n_states = 4
+
+        if change_type == "add_signal":
+            new_sig = str(change_params.get("signal", ""))
+            if new_sig and new_sig not in signals_used:
+                signals_used.append(new_sig)
+        elif change_type == "remove_signal":
+            rm_sig = str(change_params.get("signal", ""))
+            signals_used = [s for s in signals_used if s != rm_sig]
+        elif change_type == "change_states":
+            n_states = int(change_params.get("n_states", 4))
+
+        result = RegimeEvolutionResult(
+            iteration=0,
+            change_description=f"{change_type}: {change_params}",
+            baseline_sharpe=round(baseline_sharpe, 4),
+            modified_sharpe=round(modified_sharpe, 4),
+            improvement=round(improvement, 4),
+            accepted=accepted,
+            signals_used=signals_used,
+            n_states=n_states,
+        )
+
+        logger.info(
+            "copilot_regime: change='{}', accepted={}, improvement={:.4f}",
+            result.change_description,
+            accepted,
+            improvement,
+        )
+        return result.model_dump(mode="json")

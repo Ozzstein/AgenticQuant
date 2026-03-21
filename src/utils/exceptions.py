@@ -25,6 +25,10 @@ class BacktestError(AiQuantError):
     """Error in backtesting engine."""
 
 
+class RegimeError(AiQuantError):
+    """Error in regime detection or HMM model operations."""
+
+
 class AgentError(AiQuantError):
     """Error in agent node execution."""
 
