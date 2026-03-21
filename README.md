@@ -99,7 +99,7 @@ QuantAgentLab/
 │   │   ├── model_zoo.py         # LGB/CatBoost/XGB/Linear
 │   │   ├── backtester.py        # WalkForwardBacktester
 │   │   ├── benchmark.py         # SPY/BTC/60-40/EW benchmarks
-│   │   └── rd_agent_runner.py   # RD-Agent factor/model search
+│   │   └── rd_agent_runner.py   # RD-Agent factor/model search (9 modes)
 │   ├── agents/
 │   │   ├── state.py             # TradingDeskState TypedDict
 │   │   ├── llm.py               # get_llm() factory
@@ -120,14 +120,17 @@ QuantAgentLab/
 │   │   ├── qlib_ml.py
 │   │   ├── agent_enhanced.py
 │   │   └── allocator.py
-│   └── monitoring/
-│       ├── telegram_bot.py
-│       ├── portfolio_monitor.py
-│       └── scheduler.py
+│   ├── monitoring/
+│   │   ├── telegram_bot.py
+│   │   ├── portfolio_monitor.py
+│   │   └── scheduler.py
+│   ├── dashboard.py             # Streamlit trading dashboard (portfolio, agents, factors)
+│   └── rd_agent_dashboard.py    # Streamlit RD-Agent research dashboard (KB, factor library)
 ├── scripts/
 │   ├── run_backtest.py
 │   ├── run_agents.py
-│   └── run_pipeline.py
+│   ├── run_pipeline.py
+│   └── run_rd_agent.py          # RD-Agent CLI (9 commands)
 ├── tests/                       # pytest suite
 ├── notebooks/                   # Jupyter exploration notebooks
 └── docs/                        # Extended documentation
@@ -219,6 +222,7 @@ aiquant optimize                      # Run RD-Agent factor/model search
 ```bash
 # Backtesting
 conda run -n aiquant python scripts/run_backtest.py run --model LightGBM --topk 30
+conda run -n aiquant python scripts/run_backtest.py run --with-rd-factors   # merge RD-Agent factors
 conda run -n aiquant python scripts/run_backtest.py compare --models LightGBM,CatBoost
 conda run -n aiquant python scripts/run_backtest.py validate --model LightGBM
 
@@ -227,10 +231,24 @@ conda run -n aiquant python scripts/run_agents.py analyze AAPL
 conda run -n aiquant python scripts/run_agents.py batch --tickers AAPL,MSFT,GOOGL
 conda run -n aiquant python scripts/run_agents.py debate TSLA --rounds 3
 
-# Pipeline
+# Pipeline (idempotent — second run same day is a no-op)
 conda run -n aiquant python scripts/run_pipeline.py run
 conda run -n aiquant python scripts/run_pipeline.py paper-loop
 conda run -n aiquant python scripts/run_pipeline.py setup
+
+# RD-Agent research (factor/model/strategy discovery)
+conda run -n aiquant python scripts/run_rd_agent.py library-status
+conda run -n aiquant python scripts/run_rd_agent.py co-optimize --iterations 10
+conda run -n aiquant python scripts/run_rd_agent.py mine-factors --iterations 20 --min-ic 0.02
+conda run -n aiquant python scripts/run_rd_agent.py optimize-model --iterations 10
+conda run -n aiquant python scripts/run_rd_agent.py multi-trace --traces 3 --iterations 5
+conda run -n aiquant python scripts/run_rd_agent.py implement-paper ./papers/my_paper.txt
+conda run -n aiquant python scripts/run_rd_agent.py evolve-strategies --iterations 10
+conda run -n aiquant python scripts/run_rd_agent.py evolve-regime --iterations 10
+conda run -n aiquant python scripts/run_rd_agent.py copilot-factor "momentum with rising earnings"
+conda run -n aiquant python scripts/run_rd_agent.py copilot-strategy "mean reversion on earnings misses"
+conda run -n aiquant python scripts/run_rd_agent.py copilot-model --source ./papers/model.txt
+conda run -n aiquant python scripts/run_rd_agent.py ui --port 8080   # Streamlit research dashboard
 ```
 
 ---
@@ -333,7 +351,6 @@ The following capabilities are planned but not yet implemented:
 - **Additional data sources** — Quandl macro series, earnings call transcript NLP, satellite data
 - **Multi-asset allocation** — extend MetaAllocator to commodities and fixed income ETFs
 - **On-premise LLM** — Ollama provider is already wired; test with Llama-3 70B for cost reduction
-- **Streamlit dashboard** — portfolio health, agent debate transcripts, factor importance charts
 - **Web3 on-chain data** — DeFi protocol TVL, whale wallet tracking via Dune Analytics
 
 ---

@@ -1,6 +1,6 @@
 # QuantAgentLab — Technical Documentation
 
-> Version 0.1.0 | Python 3.11+ | Last updated: 2026-03-18
+> Version 0.1.0 | Python 3.11+ | Last updated: 2026-03-21
 
 ---
 
@@ -47,7 +47,8 @@ explicit configuration.
   (158 price/volume/fundamental signals computed from OHLCV). Falls back to yfinance-derived
   features when Qlib data is unavailable.
 - `load_factor_library()` — loads RD-Agent-discovered factors from
-  `outputs/factor_library.json` and merges them into the feature matrix.
+  `outputs/factor_library/factor_library.json` and merges them into the feature matrix.
+  Pass `--with-rd-factors` to `run_backtest.py` to include these in the feature matrix.
 - `create_dataset_with_custom_factors()` — convenience wrapper used by the daily pipeline.
 
 ### Alpha158 Feature Library (`src/core/factor_engine.py`)
@@ -454,17 +455,19 @@ with open('outputs/analysis_log.jsonl') as f:
 
 ## 11. Dashboard Guide
 
-The Streamlit dashboard provides five pages:
+The platform ships with two separate Streamlit dashboards:
 
-| Page | Path | Description |
-|---|---|---|
-| **Portfolio Overview** | `/` | P&L curve, health score, top positions |
-| **Analysis Feed** | `/analysis` | Latest AnalysisResult cards per ticker |
-| **Agent Debate** | `/debate` | Full debate transcript viewer |
-| **Factor Importance** | `/factors` | LightGBM feature importances |
-| **Cost Tracker** | `/costs` | Daily LLM API cost vs budget |
+### Trading Dashboard (`src/dashboard.py`)
 
-### Running the Dashboard
+The main operational dashboard for monitoring live/paper trading. Provides five pages:
+
+| Page | Description |
+|---|---|
+| **Portfolio Overview** | P&L curve, health score, top positions |
+| **Analysis Feed** | Latest AnalysisResult cards per ticker |
+| **Agent Debate** | Full debate transcript viewer |
+| **Factor Importance** | LightGBM feature importances |
+| **Cost Tracker** | Daily LLM API cost vs budget |
 
 ```bash
 conda run -n aiquant streamlit run src/dashboard.py
@@ -473,47 +476,170 @@ conda run -n aiquant streamlit run src/dashboard.py
 
 Data refresh rate is 60 seconds (controlled by `st.cache_data(ttl=60)`).
 
-For a production deployment the dashboard should be served behind an authenticated reverse
-proxy (nginx + basic auth) since it displays portfolio positions and API cost information.
+### RD-Agent Research Dashboard (`src/rd_agent_dashboard.py`)
+
+A dedicated dashboard for monitoring the R&D loop results — factor discovery, knowledge base
+state, and model optimisation history. Provides three pages:
+
+| Page | Description |
+|---|---|
+| **Knowledge Base** | Last run date, tested/failed factor counts, discoveries table and IC bar chart |
+| **Factor Library** | Full factor library (name, category, IC mean, ICIR, source), IC ranking chart |
+| **R&D Loop Results** | Discoveries grouped by date, tested model configs, best model config YAML |
+
+```bash
+# Launch via CLI (recommended)
+conda run -n aiquant python scripts/run_rd_agent.py ui --port 8080
+# Opens at http://localhost:8080
+
+# Or directly
+conda run -n aiquant streamlit run src/rd_agent_dashboard.py --server.port 8080
+```
+
+Data refresh rate is 30 seconds (controlled by `st.cache_data(ttl=30)`).
+
+For production deployments, serve both dashboards behind an authenticated reverse proxy
+(nginx + basic auth) since they display portfolio positions and API cost information.
 
 ---
 
-## 12. RD-Agent Factor Mining
+## 12. RD-Agent Research Loop
 
 ### What RD-Agent Does
 
-Microsoft's RD-Agent (`src/core/rd_agent_runner.py`) implements a `co_optimize` loop that
-autonomously proposes, codes, evaluates, and refines new alpha factors and model hyperparameters.
-It uses an LLM to generate factor hypotheses, a Qlib evaluator to score them, and a knowledge
-base (KB) to persist winning discoveries across runs.
+`RDAgentRunner` (`src/core/rd_agent_runner.py`) is a Python-native research loop that
+autonomously proposes, evaluates, and refines alpha factors, model hyperparameters, and full
+trading strategies. All modes share a persistent knowledge base (KB) that prevents re-testing
+known failures and accumulates discoveries across runs.
 
-### Factor Discovery Workflow
+### All 9 Modes
+
+| Mode | Type | What It Does |
+|---|---|---|
+| `co-optimize` | Autonomous | Joint factor-model alternation via multi-armed bandit |
+| `mine-factors` | Autonomous | Factor evolution only — no model optimisation |
+| `optimize-model` | Autonomous | LightGBM hyperparameter random search |
+| `evolve-strategies` | Autonomous | Proposes, backtests, and saves full strategy definitions |
+| `evolve-regime` | Autonomous | Evolves the HMM regime detector via simulated backtest comparison |
+| `implement-paper` | Autonomous | Derives a trading factor from a research paper |
+| `copilot-factor` | Interactive | Describe a factor in plain English → builds + evaluates |
+| `copilot-strategy` | Interactive | Describe a strategy in plain English → formalizes + backtests |
+| `copilot-model` | Interactive | Paper/file → detects model architecture, produces hyperparameter config |
+
+### Co-Optimize Loop
+
+The primary autonomous mode alternates between factor mining and model optimisation:
 
 ```
-RDAgentRunner.run_factor_search():
-  1. LLM proposes factor hypothesis (Python expression over OHLCV)
-  2. Factor is computed on training universe
-  3. IC (Information Coefficient) is evaluated
-  4. If IC > threshold: factor is added to factor_library.json
-  5. Loop for N iterations
+RDAgentRunner.co_optimize(iterations, budget, traces):
+  1. Sample factor templates via epsilon-greedy bandit
+  2. Simulate IC for each candidate factor
+  3. Accept factors above min_ic threshold → append to factor library
+  4. Sample random model hyperparameter configs from _PARAM_GRID
+  5. Simulate Sharpe for each config
+  6. Save best config to outputs/best_model_config.yaml
+  7. Update KB (tested_factors, failed_factors, discoveries, tested_configs)
+  8. Repeat for N iterations
 ```
 
-### What Factors Get Discovered
+### Copilot Modes (Interactive)
 
-In practice, RD-Agent tends to rediscover known factors (momentum, mean-reversion) in novel
-combinations, and occasionally finds genuinely new micro-structure signals. The factor library
-at `outputs/factor_library.json` stores each factor's expression, IC, ICIR, and discovery date.
+**`copilot-factor`** — natural language to evaluated factor:
 
-### KB Persistence
+```bash
+python scripts/run_rd_agent.py copilot-factor "momentum factor with rising earnings"
+```
 
-The knowledge base is stored in `outputs/rd_agent_kb/`. Each entry records what was tried,
-the evaluation result, and notes for future iterations. This prevents RD-Agent from re-testing
-the same hypotheses and gradually builds institutional memory about what works in the current
-market regime.
+Scans the description for keywords (momentum, rsi, macd, bollinger, atr, obv, volume), matches
+to built-in factor templates, evaluates IC, and saves passing factors to the library.
+
+**`copilot-model`** — paper or text file to model config:
+
+```bash
+python scripts/run_rd_agent.py copilot-model --source ./papers/my_paper.txt
+```
+
+Reads the file, detects model architecture keywords (lightgbm, catboost, xgboost, lstm,
+transformer), produces a hyperparameter config, simulates Sharpe, and saves if Sharpe > 0.5.
+
+**`copilot-strategy`** — natural language to strategy definition:
+
+```bash
+python scripts/run_rd_agent.py copilot-strategy "mean reversion on earnings misses"
+```
+
+### Factor Library
+
+Accepted factors are saved to `outputs/factor_library/factor_library.json`. Each entry stores:
+`name`, `expression`, `category`, `ic_mean`, `icir`, `source`, and `description`.
+
+### Knowledge Base Persistence
+
+The KB is stored in `data/rd_knowledge_base/kb.json`. It records:
+
+- `tested_factors` — all factor names ever evaluated
+- `failed_factors` — names that failed IC threshold (never re-proposed)
+- `tested_configs` — model configs evaluated with their simulated Sharpe
+- `discoveries` — accepted factors with date, IC, and category
+- `last_run_date` — ISO date of the last successful run
+
+The KB is loaded at the start of every run and saved at the end. Running `co-optimize` twice
+with the same budget will yield different results because the second run starts with a populated
+KB and explores new directions.
+
+### CLI Quick Reference
+
+```bash
+python scripts/run_rd_agent.py library-status          # show KB + library counts
+python scripts/run_rd_agent.py validate-library         # 3-way Sharpe comparison
+python scripts/run_rd_agent.py co-optimize -i 10        # 10 factor+model iterations
+python scripts/run_rd_agent.py mine-factors -i 20       # factor-only, 20 iterations
+python scripts/run_rd_agent.py multi-trace -t 3 -i 5    # 3 parallel traces, 5 iters each
+python scripts/run_rd_agent.py evolve-strategies -i 10  # evolve full strategies
+python scripts/run_rd_agent.py evolve-regime -i 10      # evolve regime detector
+python scripts/run_rd_agent.py reset-knowledge          # clear KB (irreversible)
+python scripts/run_rd_agent.py ui --port 8080           # launch research dashboard
+```
 
 ---
 
-## 13. API Cost Management
+## 13. Pipeline Idempotency
+
+The daily pipeline (`scripts/run_pipeline.py`) is idempotent: running it twice on the same
+calendar day has the same effect as running it once. This prevents double-trades and duplicate
+Telegram alerts when the scheduler restarts after a crash.
+
+### How It Works
+
+At startup, `_run_pipeline_once(mode)` checks `data/pipeline_state/last_run_{mode}.json`:
+
+```json
+{
+  "date": "2026-03-21",
+  "summary": { "tickers_analyzed": 10, "nav": 105230.0, ... }
+}
+```
+
+If `date` matches today, the cached summary is returned immediately without fetching data or
+calling any agents. At the end of a successful run, the state file is written with today's date
+and the result summary.
+
+Idempotency is intentionally skipped for `paper-loop` mode (which is a demo loop that runs
+repeatedly by design).
+
+### Resetting the Cache
+
+To force a re-run on the same day (e.g., after changing configuration):
+
+```bash
+rm data/pipeline_state/last_run_backtest.json
+```
+
+Or run in `paper-loop` mode which bypasses the check.
+
+---
+
+## 14. API Cost Management
 
 ### Pricing Reference (as of early 2026)
 
@@ -543,7 +669,7 @@ Cost Tracker page.
 
 ---
 
-## 14. Troubleshooting & Glossary
+## 15. Troubleshooting & Glossary
 
 ### Common Errors
 
