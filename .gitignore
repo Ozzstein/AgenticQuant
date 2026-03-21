@@ -21,6 +21,11 @@ env/
 outputs/
 logs/
 *.log
+data/audit/
+data/pipeline_state/
+
+# Claude Code
+.claude/worktrees/
 
 # IDEs
 .DS_Store
