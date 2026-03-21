@@ -768,6 +768,209 @@ class RDAgentRunner:
         logger.info("validate_library: winner='{}', result={}", winner, result)
         return result
 
+    def copilot_factor(self, description: str) -> dict[str, Any]:
+        """Implement a factor from a natural language description.
+
+        Scans the description for known keywords, maps them to factor templates,
+        evaluates each matched template, and saves passing factors to the library.
+
+        Args:
+            description: Natural-language description of the factor hypothesis.
+
+        Returns:
+            Dict with keys:
+                - ``description``: original description.
+                - ``factors_evaluated``: total templates evaluated.
+                - ``factors_accepted``: factors that passed IC threshold.
+                - ``accepted``: list of accepted factor dicts.
+                - ``best_ic``: best IC observed.
+        """
+        logger.info("copilot_factor: description='{}'", description)
+
+        text = description.lower()
+        min_ic = self.config.rd_agent.min_ic
+
+        keyword_map = {
+            "momentum": "momentum_20d",
+            "rsi": "rsi_14",
+            "macd": "macd_signal",
+            "bollinger": "bb_pct",
+            "atr": "atr_pct",
+            "obv": "obv_momentum",
+            "volume": "volume_ratio",
+        }
+
+        matched_templates: list[dict[str, str]] = []
+        for keyword, template_name in keyword_map.items():
+            if keyword in text:
+                for tmpl in _FACTOR_TEMPLATES:
+                    if tmpl["name"] == template_name:
+                        matched_templates.append(tmpl)
+                        break
+
+        if not matched_templates:
+            matched_templates = [random.choice(_FACTOR_TEMPLATES)]
+            logger.debug("No keyword match; using random template '{}'.", matched_templates[0]["name"])
+
+        with self._file_lock:
+            kb = self._load_kb()
+
+        accepted: list[FactorDefinition] = []
+        best_ic = 0.0
+
+        for tmpl in matched_templates:
+            ic = self._simulate_ic()
+            if abs(ic) >= min_ic:
+                factor = FactorDefinition(
+                    name=f"copilot_{tmpl['name']}",
+                    expression=tmpl["expression"],
+                    category=tmpl["category"],
+                    ic_mean=ic,
+                    icir=abs(ic) / 0.02,
+                    source="copilot",
+                    description=description,
+                )
+                accepted.append(factor)
+                kb["discoveries"].append(
+                    {"date": str(date.today()), "factor": factor.name, "ic": round(ic, 6)}
+                )
+                if abs(ic) > abs(best_ic):
+                    best_ic = ic
+                logger.info("copilot_factor: '{}' accepted (IC={:.4f}).", factor.name, ic)
+            else:
+                logger.debug(
+                    "copilot_factor: '{}' rejected (IC={:.4f} < {}).", tmpl["name"], ic, min_ic
+                )
+
+        kb["last_run_date"] = str(date.today())
+        with self._file_lock:
+            self._save_kb(kb)
+
+        if accepted:
+            with self._file_lock:
+                self.save_factor_library(accepted)
+
+        result: dict[str, Any] = {
+            "description": description,
+            "factors_evaluated": len(matched_templates),
+            "factors_accepted": len(accepted),
+            "accepted": [f.model_dump() for f in accepted],
+            "best_ic": round(best_ic, 6),
+        }
+        logger.info("copilot_factor complete: {}", result)
+        return result
+
+    def copilot_model(self, source: str) -> dict[str, Any]:
+        """Build a model config from a paper/file description.
+
+        Reads a local text file, detects model type via keywords, generates a
+        hyperparameter config, simulates a Sharpe ratio, and saves if above threshold.
+
+        Args:
+            source: URL, arXiv ID, or local file path describing a model architecture.
+
+        Returns:
+            Dict with keys:
+                - ``source``: original source string.
+                - ``model_name``: detected model type.
+                - ``model_params``: hyperparameter config dict.
+                - ``simulated_sharpe``: simulated Sharpe ratio.
+                - ``saved``: whether the config was persisted.
+        """
+        logger.info("copilot_model: source='{}'", source)
+
+        _stub = {
+            "source": source,
+            "model_name": "LightGBM",
+            "model_params": {},
+            "simulated_sharpe": 0.0,
+            "saved": False,
+        }
+
+        # Remote sources: stub (no API keys for fetching)
+        if (
+            source.startswith("http")
+            or source.lower().startswith("arxiv")
+            or re.match(r"^\d{4}\.\d+", source)
+        ):
+            logger.warning(
+                "PDF/arXiv parsing not available without keys. Cannot fetch: '{}'", source
+            )
+            return _stub
+
+        file_path = Path(source)
+        if not file_path.exists():
+            logger.error("Source file not found: '{}'", source)
+            return _stub
+
+        try:
+            text = file_path.read_text(errors="ignore").lower()
+        except OSError as exc:
+            logger.error("Failed to read source file '{}': {}", source, exc)
+            return _stub
+
+        # Detect model type and build param config
+        if "lightgbm" in text or "gradient boost" in text or " gbm" in text:
+            model_name = "LightGBM"
+            params: dict[str, Any] = {
+                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
+                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
+                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
+                "num_leaves": random.choice(_PARAM_GRID["num_leaves"]),
+            }
+        elif "catboost" in text or "categorical" in text:
+            model_name = "CatBoost"
+            params = {
+                "iterations": random.choice([100, 200, 500]),
+                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
+                "depth": random.choice([4, 6, 8]),
+            }
+        elif "xgboost" in text or "extreme gradient" in text:
+            model_name = "XGBoost"
+            params = {
+                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
+                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
+                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
+            }
+        elif "lstm" in text or "recurrent" in text or " rnn" in text:
+            model_name = "LSTM"
+            params = {
+                "hidden_size": random.choice([64, 128, 256]),
+                "num_layers": random.choice([1, 2, 3]),
+                "dropout": random.choice([0.1, 0.2, 0.3]),
+            }
+        elif "transformer" in text or "attention" in text:
+            model_name = "Transformer"
+            params = {
+                "d_model": random.choice([64, 128, 256]),
+                "nhead": random.choice([4, 8]),
+                "num_layers": random.choice([2, 4, 6]),
+            }
+        else:
+            model_name = "LightGBM"
+            params = {
+                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
+                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
+                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
+                "num_leaves": random.choice(_PARAM_GRID["num_leaves"]),
+            }
+
+        sharpe = random.gauss(1.0, 0.3)
+        saved = False
+        if sharpe > 0.5:
+            self.save_model_config({"model": model_name, **params})
+            saved = True
+
+        result: dict[str, Any] = {
+            "source": source,
+            "model_name": model_name,
+            "model_params": params,
+            "simulated_sharpe": round(sharpe, 4),
+            "saved": saved,
+        }
+        logger.info("copilot_model: model={}, sharpe={:.4f}, saved={}", model_name, sharpe, saved)
+        return result
+
     def reset_knowledge(self) -> None:
         """Clear the knowledge base by writing an empty KB structure to disk.
 

@@ -10,8 +10,8 @@ from pathlib import Path
 # Allow running directly from repo root: `python scripts/run_backtest.py`
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import typer
 import pandas as pd
+import typer
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
@@ -40,7 +40,10 @@ _UNIVERSE: list[str] = [
 # ---------------------------------------------------------------------------
 
 
-def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def _build_features(
+    df: pd.DataFrame,
+    extra_factors: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
     """Compute per-ticker features and labels from OHLCV data.
 
     Features computed per ticker then concatenated:
@@ -50,10 +53,12 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     - vol_ratio:  volume / 20-day rolling mean volume
 
     Labels are next-day returns (shifted by -1) to avoid look-ahead bias.
+    If ``extra_factors`` is provided, those columns are joined into the feature matrix.
 
     Args:
         df: OHLCV DataFrame with columns ``close``, ``volume``, ``ticker``
             and a DatetimeIndex.
+        extra_factors: Optional DataFrame of extra factor columns aligned to df's index.
 
     Returns:
         Tuple of (feature_matrix, labels) with NaN rows dropped.
@@ -84,8 +89,18 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     if not frames:
         return pd.DataFrame(), pd.Series(dtype=float)
 
-    combined = pd.concat(frames).dropna(subset=["returns", "mom5", "mom20", "vol_ratio", "label"])
+    combined = pd.concat(frames)
     feature_cols = ["returns", "mom5", "mom20", "vol_ratio"]
+    base_dropna_cols = ["returns", "mom5", "mom20", "vol_ratio", "label"]
+
+    # Merge extra RD-Agent factors if provided
+    if extra_factors is not None and not extra_factors.empty:
+        extra_cols = [c for c in extra_factors.columns if c not in combined.columns]
+        if extra_cols:
+            combined = combined.join(extra_factors[extra_cols], how="left")
+            feature_cols = feature_cols + extra_cols
+
+    combined = combined.dropna(subset=base_dropna_cols)
     X = combined[feature_cols]
     y = combined["label"]
     return X, y
@@ -150,21 +165,40 @@ def _run_pipeline(
         return _mock_backtest_result()
 
     # --- 2. Optional: load RD-Agent factor library ---
+    factor_df: pd.DataFrame | None = None
     if with_rd_factors:
-        factor_path = Path(config.output_dir) / "factor_library.json"
+        from src.core.data_pipeline import _compute_factor
+        from src.utils.schemas import FactorDefinition
+
+        # Check both paths: subdir (where runner saves) and flat (legacy)
+        factor_path = Path(config.output_dir) / "factor_library" / "factor_library.json"
+        if not factor_path.exists():
+            factor_path = Path(config.output_dir) / "factor_library.json"
+
         if factor_path.exists():
             try:
                 with open(factor_path) as fh:
-                    factors = json.load(fh)
-                n = len(factors) if isinstance(factors, list) else len(factors.get("factors", []))
-                logger.info("Loaded {} factors from library", n)
+                    raw_factors = json.load(fh)
+                raw_factors = raw_factors if isinstance(raw_factors, list) else []
+                logger.info("Loaded {} factors from library", len(raw_factors))
+                factor_cols: list[pd.Series] = []
+                for item in raw_factors:
+                    try:
+                        fdef = FactorDefinition(**item)
+                        col = _compute_factor(df, fdef)
+                        if col is not None:
+                            factor_cols.append(col.rename(fdef.name))
+                    except Exception as exc:
+                        logger.warning("Could not compute factor '{}': {}", item.get("name"), exc)
+                if factor_cols:
+                    factor_df = pd.concat(factor_cols, axis=1)
             except Exception as exc:
                 logger.warning("Could not load factor library: {}", exc)
         else:
             logger.warning("factor_library.json not found at {}", factor_path)
 
     # --- 3. Feature engineering ---
-    X, y = _build_features(df)
+    X, y = _build_features(df, extra_factors=factor_df)
     logger.info("Feature matrix: {} rows × {} cols", len(X), X.shape[1] if not X.empty else 0)
 
     if len(X) < 50:

@@ -228,6 +228,147 @@ def test_knowledge_base_persistence(tmp_path):
 # Test 6: KB prevents reproposals
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tests 7-10: TASK-06 remaining done criteria
+# ---------------------------------------------------------------------------
+
+
+def test_copilot_factor(tmp_path):
+    """copilot_factor returns dict with factors_evaluated > 0 and description key."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+    rdmod._KB_PATH = tmp_path / "kb.json"
+    rdmod._KB_DIR = tmp_path
+
+    try:
+        from src.core.rd_agent_runner import RDAgentRunner
+
+        runner = RDAgentRunner()
+        result = runner.copilot_factor("momentum rsi factor")
+
+        assert "description" in result
+        assert "factors_evaluated" in result
+        assert result["factors_evaluated"] > 0
+        assert "factors_accepted" in result
+        assert "accepted" in result
+        assert "best_ic" in result
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
+
+
+def test_copilot_model(tmp_path):
+    """copilot_model returns dict with model_name, simulated_sharpe, saved keys."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+    rdmod._KB_PATH = tmp_path / "kb.json"
+    rdmod._KB_DIR = tmp_path
+
+    try:
+        from src.core.rd_agent_runner import RDAgentRunner
+
+        runner = RDAgentRunner()
+
+        # Write a temp paper file with lightgbm keywords
+        paper_file = tmp_path / "test_paper.txt"
+        paper_file.write_text("This paper describes a lightgbm gradient boosting approach.")
+
+        result = runner.copilot_model(source=str(paper_file))
+
+        assert "model_name" in result
+        assert "simulated_sharpe" in result
+        assert "saved" in result
+        assert result["model_name"] == "LightGBM"
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
+
+
+def test_pipeline_idempotency(tmp_path):
+    """_run_pipeline_once returns cached result on second call same day."""
+    import scripts.run_pipeline as pipeline_mod
+
+    original_state_dir = pipeline_mod._PIPELINE_STATE_DIR
+    pipeline_mod._PIPELINE_STATE_DIR = tmp_path / "pipeline_state"
+
+    from src.utils.schemas import AnalysisResult, Decision
+
+    mock_result = AnalysisResult(
+        ticker="SPY",
+        decision=Decision.HOLD,
+        confidence=50.0,
+        reasoning="Mocked",
+    )
+
+    dates = pd.date_range("2023-01-01", periods=60, freq="B")
+    frames = []
+    for ticker in ["SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "JPM", "V", "UNH"]:
+        frame = pd.DataFrame(
+            {
+                "close": [100 + i for i in range(len(dates))],
+                "open": [99 + i for i in range(len(dates))],
+                "high": [101 + i for i in range(len(dates))],
+                "low": [99 + i for i in range(len(dates))],
+                "volume": [1_000_000] * len(dates),
+                "ticker": ticker,
+            },
+            index=dates,
+        )
+        frames.append(frame)
+    mock_df = pd.concat(frames)
+
+    try:
+        with patch("src.core.data_pipeline.DataPipeline.yfinance_fallback", return_value=mock_df), \
+             patch("src.agents.graph.analyze_ticker", return_value=mock_result):
+
+            from scripts.run_pipeline import _run_pipeline_once
+
+            summary1 = _run_pipeline_once("backtest")
+            # Second call — should hit idempotency cache
+            summary2 = _run_pipeline_once("backtest")
+
+        assert isinstance(summary1, dict)
+        assert isinstance(summary2, dict)
+        assert set(summary1.keys()) == set(summary2.keys())
+        assert "tickers_analyzed" in summary1
+        assert "nav" in summary1
+    finally:
+        pipeline_mod._PIPELINE_STATE_DIR = original_state_dir
+
+
+def test_factor_merge_into_features(tmp_path):
+    """_build_features with extra_factors returns DataFrame with > 4 columns."""
+    dates = pd.date_range("2023-01-01", periods=50, freq="B")
+    mock_df = pd.DataFrame(
+        {
+            "close": [float(i + 100) for i in range(50)],
+            "open": [float(i + 99) for i in range(50)],
+            "high": [float(i + 101) for i in range(50)],
+            "low": [float(i + 99) for i in range(50)],
+            "volume": [1_000_000] * 50,
+            "ticker": ["SPY"] * 50,
+        },
+        index=dates,
+    )
+
+    # Build a simple extra factor column
+    extra_factor = pd.DataFrame(
+        {"custom_factor": [float(i) * 0.01 for i in range(50)]},
+        index=dates,
+    )
+
+    from scripts.run_backtest import _build_features
+
+    X, y = _build_features(mock_df, extra_factors=extra_factor)
+
+    assert not X.empty
+    assert X.shape[1] > 4, f"Expected > 4 cols, got {X.shape[1]}: {list(X.columns)}"
+    assert "custom_factor" in X.columns
+
 
 def test_kb_prevents_reproposals(tmp_path):
     """Factors that failed IC threshold are not re-proposed in subsequent runs."""
