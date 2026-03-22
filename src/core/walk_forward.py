@@ -16,6 +16,7 @@ from src.utils.config import AppConfig, get_config
 from src.utils.exceptions import BacktestError
 from src.utils.logger import get_logger
 from src.utils.schemas import (
+    EnsembleWeights,
     WalkForwardFold,
     WalkForwardResult,
 )
@@ -98,6 +99,7 @@ class WalkForwardRunner:
         feature_importances: list[pd.Series] = []
         # Each entry: (test_start_str, list[float]) for stitching
         fold_period_returns: list[tuple[str, list[float]]] = []
+        ensemble_weights_per_fold: list[EnsembleWeights] = []
 
         # Determine display name for result
         if model_factory is not None:
@@ -139,6 +141,19 @@ class WalkForwardRunner:
             else:
                 model = ModelWrapper(model_name, self.config)
             model.train(X_train.values, y_train.values)
+
+            # Capture ensemble weights if model supports it
+            if hasattr(model, "get_weights"):
+                w = model.get_weights()
+                if w:  # non-empty means model is trained and ensemble
+                    ensemble_weights_per_fold.append(
+                        EnsembleWeights(
+                            model_weights=w,
+                            weighting_method=getattr(model, "_weighting", "unknown"),
+                            fold_id=i,
+                        )
+                    )
+
             is_preds = model.predict(X_train.values)
             oos_preds = model.predict(X_test.values)
 
@@ -254,6 +269,7 @@ class WalkForwardRunner:
             feature_importance_drift=feature_importance_drift,
             rolling_ic=rolling_ic,
             model_name=result_model_name,
+            ensemble_weights_per_fold=ensemble_weights_per_fold,
         )
 
     def generate_html_report(self, result: WalkForwardResult, output_path: str) -> str:

@@ -117,8 +117,8 @@ class TestTrain:
         weights = e.get_weights()
         assert abs(sum(weights.values()) - 1.0) < 1e-6
 
-    def test_ic_fallback_to_equal_when_all_ics_nonpositive(self):
-        """Falls back to equal weights when all validation ICs are <= 0 (pure noise target)."""
+    def test_ic_weighted_handles_noisy_data(self):
+        """IC-weighted training produces valid weights on noise data (may fall back to equal)."""
         rng = np.random.default_rng(0)
         # Large enough to have > 20 val samples (200 * 0.15 = 30 val samples)
         X = pd.DataFrame(rng.standard_normal((200, 5)), columns=[f"f{i}" for i in range(5)])
@@ -128,13 +128,14 @@ class TestTrain:
         e = EnsembleModel(
             model_names=["LightGBM", "Linear"],
             weighting="ic_weighted",
-            val_fraction=0.15,  # 200 * 0.15 = 30 val samples, well above threshold
+            val_fraction=0.15,
         )
         e.train(X, y)
         weights = e.get_weights()
-        # Should sum to 1.0 (either equal or any IC-based weights that happen to work)
+        # Weights must always sum to 1 and cover all models
         assert abs(sum(weights.values()) - 1.0) < 1e-6
         assert len(weights) == 2
+        assert all(w >= 0.0 for w in weights.values())
 
 
 # ---------------------------------------------------------------------------

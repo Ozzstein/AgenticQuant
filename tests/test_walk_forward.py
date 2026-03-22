@@ -48,6 +48,9 @@ def _mock_model() -> MagicMock:
     mock.get_feature_importance.return_value = pd.Series(
         np.abs(np.random.randn(5)), index=[f"f{i}" for i in range(5)]
     )
+    # ModelWrapper does not have get_weights; remove auto-created attribute so
+    # hasattr() returns False and the ensemble-weight capture path is not triggered.
+    del mock.get_weights
     return mock
 
 

@@ -117,6 +117,11 @@ class EnsembleModel:
             weights = self._ic_weighted_train(X_df, y_s, n)
         elif self._weighting == "custom":
             filtered = {k: v for k, v in self._custom_weights.items() if k in self._model_names}
+            dropped = set(self._custom_weights) - set(filtered)
+            if dropped:
+                _logger.warning(
+                    "custom_weights contains keys not in model_names, ignoring: {}", dropped
+                )
             weights = self._normalise(filtered)
         else:
             _logger.warning("Unknown weighting '{}'; falling back to equal.", self._weighting)
