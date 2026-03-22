@@ -143,6 +143,10 @@ def sentiment_node(
         "(e.g. sentiment_score, fear_greed_level, news_tone, analyst_momentum)."
     )
 
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
+
     structured_llm = llm.with_structured_output(AgentReport)
 
     try:

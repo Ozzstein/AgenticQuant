@@ -155,6 +155,10 @@ def technical_node(
         "(e.g. rsi, macd_signal, trend_direction, above_sma200, put_call_ratio)."
     )
 
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
+
     structured_llm = llm.with_structured_output(AgentReport)
 
     try:

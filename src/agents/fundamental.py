@@ -152,6 +152,10 @@ def fundamental_node(
         "(e.g. pe_ratio, revenue_growth, debt_equity, roe)."
     )
 
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
+
     structured_llm = llm.with_structured_output(AgentReport)
 
     try:

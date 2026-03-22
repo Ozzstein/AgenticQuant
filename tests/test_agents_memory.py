@@ -319,3 +319,153 @@ class TestMemoryGraphNodes:
 
         store_file = tmp_path / "test.jsonl"
         assert not store_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# TestMemoryGraphIntegration
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryGraphIntegration:
+    """Integration tests for memory nodes + graph + prompt injection."""
+
+    def test_graph_has_memory_nodes(self):
+        """Build graph, verify load_memory and save_memory nodes exist."""
+        from src.agents.graph import build_trading_desk_graph
+
+        graph = build_trading_desk_graph()
+        assert "load_memory" in graph.nodes
+        assert "save_memory" in graph.nodes
+
+    def test_initial_state_has_memory_context(self):
+        """Verify analyze_ticker would produce state with memory_context key."""
+        from unittest.mock import MagicMock, patch
+
+        from src.agents.graph import analyze_ticker
+        from src.utils.schemas import AnalysisResult, Decision
+
+        mock_result = AnalysisResult(
+            ticker="AAPL", decision=Decision.HOLD, confidence=50.0, reasoning="test"
+        )
+
+        captured_states = []
+
+        def mock_invoke(state):
+            captured_states.append(state)
+            return {"result": mock_result}
+
+        with patch("src.agents.graph.build_trading_desk_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_graph.invoke.side_effect = mock_invoke
+            mock_build.return_value = mock_graph
+            analyze_ticker("AAPL")
+
+        assert len(captured_states) == 1
+        assert "memory_context" in captured_states[0]
+        assert captured_states[0]["memory_context"] == ""
+
+    def test_analyst_includes_memory_in_prompt(self):
+        """Mock LLM, set memory_context in state, verify HumanMessage contains prior history."""
+        from unittest.mock import MagicMock
+
+        from langchain_core.messages import HumanMessage
+
+        from src.agents.fundamental import fundamental_node
+        from src.utils.schemas import AgentReport, Decision
+
+        mock_report = AgentReport(
+            agent_name="fundamental",
+            decision=Decision.HOLD,
+            confidence=50.0,
+            reasoning="test",
+            data_points={},
+        )
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.return_value = mock_report
+
+        state = {
+            "ticker": "AAPL",
+            "asset_class": "EQUITY",
+            "memory_context": "2024-01-01 | BUY | conf=75 | Test reasoning",
+            "qlib_context": "",
+            "market_context": "",
+            "macro_regime": "neutral",
+            "macro_confidence": 50.0,
+            "agent_reports": {},
+            "debate_round": 0,
+            "debate_transcript": [],
+            "risk_veto": False,
+            "risk_veto_reason": "",
+            "result": None,
+        }
+
+        fundamental_node(state, llm=mock_llm)
+
+        invoke_calls = mock_llm.with_structured_output.return_value.invoke.call_args_list
+        assert len(invoke_calls) == 1
+        messages = invoke_calls[0][0][0]  # first positional arg to invoke
+        human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+        assert len(human_messages) == 1
+        assert "Prior analysis history for AAPL" in human_messages[0].content
+
+    def test_analyst_omits_memory_when_empty(self):
+        """Empty memory_context means prompt does NOT contain 'Prior analysis history'."""
+        from unittest.mock import MagicMock
+
+        from langchain_core.messages import HumanMessage
+
+        from src.agents.fundamental import fundamental_node
+        from src.utils.schemas import AgentReport, Decision
+
+        mock_report = AgentReport(
+            agent_name="fundamental",
+            decision=Decision.HOLD,
+            confidence=50.0,
+            reasoning="test",
+            data_points={},
+        )
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value.invoke.return_value = mock_report
+
+        state = {
+            "ticker": "AAPL",
+            "asset_class": "EQUITY",
+            "memory_context": "",  # empty
+            "qlib_context": "",
+            "market_context": "",
+            "macro_regime": "neutral",
+            "macro_confidence": 50.0,
+            "agent_reports": {},
+            "debate_round": 0,
+            "debate_transcript": [],
+            "risk_veto": False,
+            "risk_veto_reason": "",
+            "result": None,
+        }
+
+        fundamental_node(state, llm=mock_llm)
+
+        invoke_calls = mock_llm.with_structured_output.return_value.invoke.call_args_list
+        messages = invoke_calls[0][0][0]
+        human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+        assert "Prior analysis history" not in human_messages[0].content
+
+    def test_graph_invoke_produces_result_with_memory(self):
+        """Full mocked graph invoke with memory enabled produces a result."""
+        from unittest.mock import MagicMock, patch
+
+        from src.agents.graph import analyze_ticker
+        from src.utils.schemas import AnalysisResult, Decision
+
+        mock_result = AnalysisResult(
+            ticker="AAPL", decision=Decision.BUY, confidence=80.0, reasoning="mocked"
+        )
+
+        with patch("src.agents.graph.build_trading_desk_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_graph.invoke.return_value = {"result": mock_result}
+            mock_build.return_value = mock_graph
+            result = analyze_ticker("AAPL")
+
+        assert result is not None
+        assert result.ticker == "AAPL"

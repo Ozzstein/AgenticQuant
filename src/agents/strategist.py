@@ -121,6 +121,10 @@ def strategist_node(state: TradingDeskState, llm: BaseChatModel | None = None) -
         "If risk_veto is True, you MUST recommend HOLD or SELL."
     )
 
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
+
     structured_llm = llm.with_structured_output(AnalysisResult)
 
     try:
