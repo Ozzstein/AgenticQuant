@@ -32,9 +32,8 @@ sys.modules.setdefault("alpaca.trading.enums", _alpaca_stub.trading.enums)
 from src.execution.alpaca_trader import AlpacaTrader  # noqa: E402
 from src.execution.broker import BaseBroker  # noqa: E402
 from src.utils.config import AlpacaConfig  # noqa: E402
-from src.utils.exceptions import AlpacaConnectionError, AlpacaError, AlpacaOrderError  # noqa: E402
+from src.utils.exceptions import AlpacaError  # noqa: E402
 from src.utils.schemas import Order, OrderSide, OrderStatus, OrderType, Position  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,7 +121,8 @@ def _make_trader_with_mock_client(config: AlpacaConfig | None = None) -> tuple[A
 # ---------------------------------------------------------------------------
 
 # We set the real enum values directly on the mock so assertions work:
-from alpaca.trading.enums import OrderSide as _AS, OrderStatus as _AOS  # noqa: E402
+from alpaca.trading.enums import OrderSide as _AS  # noqa: E402
+from alpaca.trading.enums import OrderStatus as _AOS  # noqa: E402
 
 _AS.BUY = "buy"
 _AS.SELL = "sell"
@@ -246,7 +246,7 @@ class TestAlpacaTrader:
         mock_client.get_order_by_id.return_value = alpaca_order
 
         # Configure what the request classes look like
-        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        from alpaca.trading.requests import LimitOrderRequest
 
         # Track which request type was constructed
         captured = []
@@ -317,7 +317,14 @@ class TestAlpacaTrader:
             timestamp=datetime.now(),
         )
 
-        result = trader.execute_order(order, {"AAPL": 150.0})
+        # Patch time so the loop exits immediately without real sleeping:
+        # start=0.0, then on the next check time is already past timeout=2
+        with (
+            patch("src.execution.alpaca_trader.time.sleep"),
+            patch("src.execution.alpaca_trader.time.time", side_effect=[0.0, 100.0]),
+        ):
+            result = trader.execute_order(order, {"AAPL": 150.0})
+
         assert result is None
 
     # 10 ------------------------------------------------------------------
@@ -331,7 +338,13 @@ class TestAlpacaTrader:
         # First call returns pending, second returns filled
         mock_client.get_order_by_id.side_effect = [pending, filled]
 
-        result = trader._wait_for_fill("alpaca-order-id-123", timeout=5)
+        # Patch time so loop never waits for real; time advances slowly so it
+        # doesn't hit the timeout before the second poll returns filled.
+        with (
+            patch("src.execution.alpaca_trader.time.sleep"),
+            patch("src.execution.alpaca_trader.time.time", side_effect=[0.0, 0.1, 0.2]),
+        ):
+            result = trader._wait_for_fill("alpaca-order-id-123", timeout=5)
 
         assert result is not None
         assert result.status == OrderStatus.FILLED
@@ -444,7 +457,6 @@ class TestAlpacaTrader:
         trader = AlpacaTrader(make_config())
 
         # Inject a rising NAV series so there is a measurable return
-        now = datetime.now()
         trader._nav_history = [
             (datetime(2025, 1, d), 100_000.0 + d * 500.0) for d in range(1, 31)
         ]
