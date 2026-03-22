@@ -301,7 +301,7 @@ def _make_runner_with_mocks(tmp_path, ic_pass_count=1, bt_pass_count=1):
     """
     import src.core.rd_agent_runner as rdmod
     from src.core.rd_agent_runner import RDAgentRunner
-    from src.utils.schemas import EvalResult, BacktestValidationResult, FactorDefinition
+    from src.utils.schemas import BacktestValidationResult, EvalResult, FactorDefinition
 
     rdmod._KB_PATH = tmp_path / "kb.json"
     rdmod._KB_DIR = tmp_path
@@ -337,7 +337,7 @@ def _make_runner_with_mocks(tmp_path, ic_pass_count=1, bt_pass_count=1):
             reason="passed" if i < bt_pass_count else "low_sharpe",
         ))
 
-    with patch("src.core.rd_agent_runner.FactorProposer") as mock_proposer_cls, \
+    with patch("src.core.rd_agent_runner.FactorProposer"), \
          patch("src.core.rd_agent_runner.FactorEvaluator"), \
          patch("src.core.rd_agent_runner.ResearchAnalyst"), \
          patch("src.core.rd_agent_runner.FactorBacktester"):
