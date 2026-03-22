@@ -22,10 +22,11 @@ import yaml
 
 from src.core.factor_evaluator import FactorEvaluator
 from src.core.factor_proposer import FactorProposer
+from src.core.factor_backtester import FactorBacktester
 from src.core.research_analyst import ResearchAnalyst
 from src.utils.config_loader import FullAppConfig, get_full_config
 from src.utils.logger import get_logger
-from src.utils.schemas import FactorDefinition, Strategy
+from src.utils.schemas import BacktestValidationResult, FactorDefinition, Strategy
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,7 @@ _EMPTY_KB: dict[str, Any] = {
     "failed_factors": [],
     "tested_configs": [],
     "discoveries": [],
+    "backtest_failed": [],          # NEW — IC-pass/bt-fail factors for analyst review
     "last_run_date": "never",
     "tested_strategies": [],
     "discovered_strategies": [],
@@ -144,6 +146,7 @@ class RDAgentRunner:
         self._proposer = FactorProposer(self.config)
         self._evaluator = FactorEvaluator(self.config)
         self._analyst = ResearchAnalyst(self.config)
+        self._backtester = FactorBacktester(self.config)
 
     # ------------------------------------------------------------------
     # Knowledge-base helpers
@@ -167,7 +170,7 @@ class RDAgentRunner:
             return kb
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not load KB ({}); starting fresh.", exc)
-            return dict(_EMPTY_KB)
+            return copy.deepcopy(_EMPTY_KB)
 
     def _save_kb(self, kb: dict[str, Any]) -> None:
         """Persist the knowledge base to disk.
@@ -452,26 +455,52 @@ class RDAgentRunner:
             )
             eval_results = self._evaluator.evaluate_factors_batch(proposals)
 
-            batch_accepted: list[FactorDefinition] = []
-            for er, factor in zip(eval_results, proposals):
+            # Separate IC-passing from IC-failing
+            ic_passed_pairs = [(er, f) for er, f in zip(eval_results, proposals) if er.passed]
+            ic_failed = [er for er in eval_results if not er.passed]
+
+            # Log IC-failed to tested list (no backtest needed)
+            for er in ic_failed:
                 tested_names.append(er.factor_name)
-                if er.passed:
-                    factor = FactorDefinition(
-                        name=factor.name,
-                        expression=factor.expression,
-                        category=factor.category,
-                        ic_mean=er.stage2_ic or er.stage1_ic,
-                        icir=er.stage2_icir or 0.0,
-                        source="rd_agent_llm",
-                        description=factor.description,
-                    )
+
+            # Stage 3: backtest gate — IC-passing factors only
+            bt_results = (
+                self._backtester.validate_batch([f for _, f in ic_passed_pairs])
+                if ic_passed_pairs else []
+            )
+
+            batch_accepted: list[FactorDefinition] = []
+            bt_results_by_name: dict[str, BacktestValidationResult] = {}
+            for (er, factor), bt_result in zip(ic_passed_pairs, bt_results):
+                tested_names.append(er.factor_name)
+                bt_results_by_name[factor.name] = bt_result
+                if bt_result.passed:
+                    # Enrich with IC data + backtest data in one model_copy call.
+                    factor = factor.model_copy(update={
+                        "ic_mean": er.stage2_ic or er.stage1_ic,
+                        "icir": er.stage2_icir or 0.0,
+                        "source": "rd_agent_llm",
+                        "backtest_sharpe": bt_result.sharpe,
+                        "backtest_max_drawdown": bt_result.max_drawdown,
+                        "validation_checks": bt_result.checks,
+                    })
                     batch_accepted.append(factor)
                     kb["discoveries"].append({
                         "date": str(date.today()),
                         "factor": factor.name,
                         "ic": round(er.stage2_ic or er.stage1_ic, 6),
+                        "sharpe": round(bt_result.sharpe, 4) if bt_result.sharpe else None,
+                    })
+                else:
+                    kb["backtest_failed"].append({
+                        "date": str(date.today()),
+                        "factor": factor.name,
+                        "stage1_ic": er.stage1_ic,
+                        "reason": bt_result.reason,
                     })
 
+            # Preserve existing eval_results tracking (all factors, IC-pass and IC-fail).
+            # Use "factor_name" key to match existing KB schema.
             kb.setdefault("eval_results", [])
             for er in eval_results:
                 kb["eval_results"].append({
@@ -484,7 +513,7 @@ class RDAgentRunner:
                     "reason": er.reason,
                 })
 
-            memo_text = self._analyst.write_memo(eval_results, kb)
+            memo_text = self._analyst.write_memo(eval_results, kb, bt_results=bt_results_by_name)
             self._analyst.save_memo(memo_text, kb)
             accepted.extend(batch_accepted)
 

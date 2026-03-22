@@ -286,3 +286,162 @@ def test_validate_batch_mixed_results():
     assert results[0].passed is True
     assert results[1].passed is False
     assert results[1].reason == "low_sharpe"
+
+
+# ---------------------------------------------------------------------------
+# Task 3: RDAgentRunner wiring tests
+# ---------------------------------------------------------------------------
+
+def _make_runner_with_mocks(tmp_path, ic_pass_count=1, bt_pass_count=1):
+    """
+    Build an RDAgentRunner with:
+      - _evaluator.evaluate_factors_batch mocked to return ic_pass_count passing EvalResults
+      - _backtester.validate_batch mocked to return bt_pass_count passing BacktestValidationResults
+      - KB stored in tmp_path
+    """
+    import src.core.rd_agent_runner as rdmod
+    from src.core.rd_agent_runner import RDAgentRunner
+    from src.utils.schemas import EvalResult, BacktestValidationResult, FactorDefinition
+
+    rdmod._KB_PATH = tmp_path / "kb.json"
+    rdmod._KB_DIR = tmp_path
+
+    # Build fake proposals returned by _proposer
+    n_factors = max(ic_pass_count, 1)
+    fake_factors = [
+        FactorDefinition(name=f"factor_{i}", expression="close.pct_change(20)")
+        for i in range(n_factors)
+    ]
+
+    # Build fake eval results: first ic_pass_count pass, rest fail
+    fake_eval_results = []
+    for i in range(n_factors):
+        fake_eval_results.append(EvalResult(
+            factor_name=f"factor_{i}",
+            stage1_ic=0.05 if i < ic_pass_count else 0.001,
+            stage1_passed=i < ic_pass_count,
+            stage2_ic=0.04 if i < ic_pass_count else None,
+            stage2_icir=0.5 if i < ic_pass_count else None,
+            passed=i < ic_pass_count,
+            reason="passed" if i < ic_pass_count else "low_ic",
+        ))
+
+    # Build fake backtest results: first bt_pass_count pass
+    fake_bt_results = []
+    for i in range(ic_pass_count):
+        fake_bt_results.append(BacktestValidationResult(
+            factor_name=f"factor_{i}",
+            passed=i < bt_pass_count,
+            sharpe=1.2 if i < bt_pass_count else 0.1,
+            max_drawdown=-0.05,
+            reason="passed" if i < bt_pass_count else "low_sharpe",
+        ))
+
+    with patch("src.core.rd_agent_runner.FactorProposer") as mock_proposer_cls, \
+         patch("src.core.rd_agent_runner.FactorEvaluator"), \
+         patch("src.core.rd_agent_runner.ResearchAnalyst"), \
+         patch("src.core.rd_agent_runner.FactorBacktester"):
+        runner = RDAgentRunner()
+
+    runner._proposer = MagicMock()
+    runner._proposer.propose_factors.return_value = fake_factors
+    runner._evaluator = MagicMock()
+    runner._evaluator.evaluate_factors_batch.return_value = fake_eval_results
+    runner._backtester = MagicMock()
+    runner._backtester.validate_batch.return_value = fake_bt_results
+    runner._analyst = MagicMock()
+    runner._analyst.load_memo.return_value = ""
+    runner._analyst.write_memo.return_value = "memo"
+
+    return runner
+
+
+def test_mine_factors_backtest_gate(tmp_path):
+    """Only factors that pass BOTH IC gate and backtest gate are saved to library."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+
+    try:
+        runner = _make_runner_with_mocks(tmp_path, ic_pass_count=2, bt_pass_count=1)
+
+        with patch.object(runner, "save_factor_library") as mock_save:
+            results = runner.mine_factors(iterations=1)
+
+        # Only 1 of 2 IC-passing factors also passed backtest
+        assert len(results) == 1, f"Expected 1 double-gated factor, got {len(results)}"
+        mock_save.assert_called_once()
+        saved_factors = mock_save.call_args[0][0]
+        assert len(saved_factors) == 1
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
+
+
+def test_mine_factors_backtest_failed_logged(tmp_path):
+    """IC-pass/bt-fail factors are logged to kb['backtest_failed']."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+
+    try:
+        runner = _make_runner_with_mocks(tmp_path, ic_pass_count=1, bt_pass_count=0)
+        runner.mine_factors(iterations=1)
+
+        kb = runner._load_kb()
+        assert "backtest_failed" in kb, "kb should have 'backtest_failed' key"
+        assert len(kb["backtest_failed"]) >= 1
+        entry = kb["backtest_failed"][0]
+        assert "factor" in entry
+        assert "reason" in entry
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
+
+
+def test_mine_factors_discoveries_include_sharpe(tmp_path):
+    """kb['discoveries'] entries include 'sharpe' key for double-gated factors."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+
+    try:
+        runner = _make_runner_with_mocks(tmp_path, ic_pass_count=1, bt_pass_count=1)
+        runner.mine_factors(iterations=1)
+
+        kb = runner._load_kb()
+        assert len(kb["discoveries"]) >= 1
+        entry = kb["discoveries"][0]
+        assert "sharpe" in entry, f"discovery entry missing 'sharpe' key: {entry}"
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
+
+
+def test_load_kb_error_recovery_does_not_mutate_empty_kb(tmp_path):
+    """_load_kb() error-recovery path must use deepcopy to avoid mutating _EMPTY_KB."""
+    import src.core.rd_agent_runner as rdmod
+
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+    rdmod._KB_PATH = tmp_path / "kb.json"
+    rdmod._KB_DIR = tmp_path
+
+    try:
+        # Write invalid JSON to trigger the error-recovery path
+        (tmp_path / "kb.json").write_text("{invalid json}")
+        from src.core.rd_agent_runner import RDAgentRunner
+
+        runner = RDAgentRunner()
+        kb = runner._load_kb()
+        # Mutate the returned kb
+        kb["backtest_failed"].append({"test": "mutation"})
+        # _EMPTY_KB sentinel must NOT be mutated
+        assert rdmod._EMPTY_KB.get("backtest_failed") == [], \
+            "_EMPTY_KB['backtest_failed'] was mutated — use copy.deepcopy(), not dict()"
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
