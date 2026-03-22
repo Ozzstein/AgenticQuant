@@ -1,9 +1,6 @@
 """Tests for RD-Agent LLM integration components."""
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Task 1 — Schema tests
 # ---------------------------------------------------------------------------
