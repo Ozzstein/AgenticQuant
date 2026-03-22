@@ -20,9 +20,9 @@ from typing import Any
 
 import yaml
 
+from src.core.factor_backtester import FactorBacktester
 from src.core.factor_evaluator import FactorEvaluator
 from src.core.factor_proposer import FactorProposer
-from src.core.factor_backtester import FactorBacktester
 from src.core.research_analyst import ResearchAnalyst
 from src.utils.config_loader import FullAppConfig, get_full_config
 from src.utils.logger import get_logger
@@ -166,7 +166,7 @@ class RDAgentRunner:
                 kb = json.load(fh)
             # Ensure all expected keys exist (backward-compat)
             for key, default in _EMPTY_KB.items():
-                kb.setdefault(key, default)
+                kb.setdefault(key, copy.deepcopy(default))
             return kb
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not load KB ({}); starting fresh.", exc)

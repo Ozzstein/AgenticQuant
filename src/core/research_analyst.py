@@ -51,19 +51,25 @@ class ResearchAnalyst:
     # Public API
     # ------------------------------------------------------------------
 
-    def write_memo(self, batch_results: list[EvalResult], kb: dict) -> str:
+    def write_memo(
+        self,
+        batch_results: list[EvalResult],
+        kb: dict,
+        bt_results: dict | None = None,  # dict[str, BacktestValidationResult]
+    ) -> str:
         """Synthesize batch evaluation results into a research memo.
 
         Args:
             batch_results: EvalResult objects from the latest evaluation batch.
             kb: Current knowledge base dict (read-only in this method).
+            bt_results: Optional mapping of factor name to BacktestValidationResult.
 
         Returns:
             200–400 word research memo string.
         """
         if self._llm_available:
             try:
-                return self._llm_write_memo(batch_results, kb)
+                return self._llm_write_memo(batch_results, kb, bt_results=bt_results)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ResearchAnalyst.write_memo LLM failed ({}). Using fallback.", exc)
         return self._fallback_memo(batch_results)
@@ -97,7 +103,12 @@ class ResearchAnalyst:
     # LLM path
     # ------------------------------------------------------------------
 
-    def _llm_write_memo(self, batch_results: list[EvalResult], kb: dict) -> str:
+    def _llm_write_memo(
+        self,
+        batch_results: list[EvalResult],
+        kb: dict,
+        bt_results: dict | None = None,
+    ) -> str:
         """Call Opus to generate a research memo from batch results."""
         prior_memo = self.load_memo(kb)
         results_table = self._format_results_table(batch_results)
