@@ -33,6 +33,7 @@ class TradingDeskState(TypedDict):
         market_context: Gathered market data text produced by the market_context node.
         macro_regime: Current macro regime label — "risk_on", "neutral", "risk_off", or "crisis".
         macro_confidence: Confidence in the macro regime estimate, range 0-100.
+        memory_context: Formatted prior-analysis history injected by load_memory_node (may be "").
         agent_reports: Per-agent analysis reports; merged via _merge_reports on fan-in.
         debate_round: Current debate round counter (starts at 0).
         debate_transcript: Accumulated debate turn strings, appended each round.
@@ -47,6 +48,7 @@ class TradingDeskState(TypedDict):
     market_context: str
     macro_regime: str
     macro_confidence: float
+    memory_context: str
     agent_reports: Annotated[dict[str, AgentReport], _merge_reports]
     debate_round: int
     debate_transcript: Annotated[list[str], operator.add]

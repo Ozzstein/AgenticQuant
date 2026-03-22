@@ -4,9 +4,39 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src.utils.logger import get_logger
 from src.utils.schemas import AnalysisResult
+
+if TYPE_CHECKING:
+    from src.utils.config import AppConfig
+
+try:
+    from src.agents.state import TradingDeskState
+except ImportError:
+    import operator
+    from typing import Annotated, TypedDict
+
+    from src.utils.schemas import AnalysisResult as _AR
+
+    def _merge_reports(a: dict, b: dict) -> dict:  # type: ignore[return]
+        return {**a, **b}
+
+    class TradingDeskState(TypedDict):  # type: ignore[no-redef]
+        ticker: str
+        asset_class: str
+        qlib_context: str
+        market_context: str
+        macro_regime: str
+        macro_confidence: float
+        memory_context: str
+        agent_reports: Annotated[dict, _merge_reports]
+        debate_round: int
+        debate_transcript: Annotated[list, operator.add]
+        risk_veto: bool
+        risk_veto_reason: str
+        result: _AR | None
 
 logger = get_logger(__name__)
 
@@ -144,3 +174,65 @@ class AnalysisMemoryStore:
             formatted.pop()  # drop the oldest (last in reversed list)
 
         return ""
+
+
+# ---------------------------------------------------------------------------
+# LangGraph node functions
+# ---------------------------------------------------------------------------
+
+
+def load_memory_node(state: TradingDeskState, config: "AppConfig | None" = None) -> dict:
+    """Load prior analyses for state['ticker'] and format as context string.
+
+    Args:
+        state: Current trading desk state.
+        config: Optional AppConfig override. Uses get_config() singleton if None.
+
+    Returns:
+        Partial state dict with memory_context set to formatted history string.
+    """
+    from src.utils.config import get_config
+
+    if config is None:
+        config = get_config()
+
+    if not config.memory.enabled:
+        return {"memory_context": ""}
+
+    store = AnalysisMemoryStore(
+        store_path=config.memory.store_path,
+        max_history=config.memory.max_history,
+    )
+    ticker = state["ticker"]
+    results = store.retrieve(ticker)
+    return {"memory_context": store.format_memory_context(results)}
+
+
+def save_memory_node(state: TradingDeskState, config: "AppConfig | None" = None) -> dict:
+    """Persist the completed AnalysisResult to the JSONL memory store.
+
+    Args:
+        state: Current trading desk state (must have result set).
+        config: Optional AppConfig override. Uses get_config() singleton if None.
+
+    Returns:
+        Empty dict (no state mutation needed).
+    """
+    from src.utils.config import get_config
+
+    if config is None:
+        config = get_config()
+
+    if not config.memory.enabled:
+        return {}
+
+    result = state.get("result")
+    if result is None:
+        return {}
+
+    store = AnalysisMemoryStore(
+        store_path=config.memory.store_path,
+        max_history=config.memory.max_history,
+    )
+    store.save(result)
+    return {}

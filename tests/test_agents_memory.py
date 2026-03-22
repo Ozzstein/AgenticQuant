@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.agents.memory import AnalysisMemoryStore
-from src.utils.config import MemoryConfig
+from src.utils.config import AppConfig, MemoryConfig
 from src.utils.schemas import AnalysisResult, Decision
 
 # ---------------------------------------------------------------------------
@@ -207,3 +207,115 @@ class TestMemoryConfig:
         assert cfg.enabled is False
         assert cfg.max_history == 25
         assert cfg.store_path == Path("/tmp/custom.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# TestMemoryGraphNodes
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryGraphNodes:
+    """Tests for load_memory_node and save_memory_node."""
+
+    def _make_config(self, tmp_path: Path, enabled: bool = True) -> AppConfig:
+        return AppConfig(memory=MemoryConfig(enabled=enabled, store_path=tmp_path / "test.jsonl"))
+
+    def _make_state(self, result=None) -> dict:
+        return {
+            "ticker": "AAPL",
+            "asset_class": "EQUITY",
+            "qlib_context": "",
+            "market_context": "",
+            "macro_regime": "neutral",
+            "macro_confidence": 50.0,
+            "memory_context": "",
+            "agent_reports": {},
+            "debate_round": 0,
+            "debate_transcript": [],
+            "risk_veto": False,
+            "risk_veto_reason": "",
+            "result": result,
+        }
+
+    def test_load_memory_returns_dict_with_key(self, tmp_path: Path) -> None:
+        """load_memory_node always returns a dict containing 'memory_context'."""
+        from src.agents.memory import load_memory_node
+
+        config = self._make_config(tmp_path)
+        result = load_memory_node(self._make_state(), config=config)
+        assert isinstance(result, dict)
+        assert "memory_context" in result
+
+    def test_load_memory_empty_when_no_history(self, tmp_path: Path) -> None:
+        """No prior analyses → memory_context is an empty string."""
+        from src.agents.memory import load_memory_node
+
+        config = self._make_config(tmp_path)
+        result = load_memory_node(self._make_state(), config=config)
+        assert result["memory_context"] == ""
+
+    def test_load_memory_returns_context_when_history_exists(self, tmp_path: Path) -> None:
+        """After one saved analysis, load_memory_node returns a non-empty context string."""
+        from src.agents.memory import AnalysisMemoryStore, load_memory_node
+
+        config = self._make_config(tmp_path)
+        analysis = _make_result("AAPL", decision=Decision.BUY, confidence=80.0)
+        store = AnalysisMemoryStore(store_path=tmp_path / "test.jsonl", max_history=10)
+        store.save(analysis)
+
+        result = load_memory_node(self._make_state(), config=config)
+        assert result["memory_context"] != ""
+        assert "AAPL" in result["memory_context"]
+
+    def test_load_memory_disabled_returns_empty(self, tmp_path: Path) -> None:
+        """When memory.enabled=False, load_memory_node returns empty string without reading."""
+        from src.agents.memory import AnalysisMemoryStore, load_memory_node
+
+        config = self._make_config(tmp_path, enabled=False)
+        # Pre-populate store to confirm it's not read
+        analysis = _make_result("AAPL")
+        store = AnalysisMemoryStore(store_path=tmp_path / "test.jsonl", max_history=10)
+        store.save(analysis)
+
+        result = load_memory_node(self._make_state(), config=config)
+        assert result == {"memory_context": ""}
+
+    def test_save_memory_persists_result(self, tmp_path: Path) -> None:
+        """save_memory_node writes the AnalysisResult to a JSONL file."""
+        from src.agents.memory import save_memory_node
+
+        config = self._make_config(tmp_path)
+        analysis = _make_result("AAPL", decision=Decision.SELL, confidence=60.0)
+        state = self._make_state(result=analysis)
+
+        save_memory_node(state, config=config)
+
+        store_file = tmp_path / "test.jsonl"
+        assert store_file.exists()
+        lines = store_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+
+    def test_save_memory_noop_when_none(self, tmp_path: Path) -> None:
+        """When state['result'] is None, no file is created."""
+        from src.agents.memory import save_memory_node
+
+        config = self._make_config(tmp_path)
+        state = self._make_state(result=None)
+
+        save_memory_node(state, config=config)
+
+        store_file = tmp_path / "test.jsonl"
+        assert not store_file.exists()
+
+    def test_save_memory_disabled_does_not_save(self, tmp_path: Path) -> None:
+        """When memory.enabled=False, save_memory_node does not create a file."""
+        from src.agents.memory import save_memory_node
+
+        config = self._make_config(tmp_path, enabled=False)
+        analysis = _make_result("AAPL")
+        state = self._make_state(result=analysis)
+
+        save_memory_node(state, config=config)
+
+        store_file = tmp_path / "test.jsonl"
+        assert not store_file.exists()

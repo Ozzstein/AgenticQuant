@@ -30,6 +30,7 @@ except ImportError:
         market_context: str
         macro_regime: str
         macro_confidence: float
+        memory_context: str
         agent_reports: Annotated[dict, _merge_reports]
         debate_round: int
         debate_transcript: Annotated[list, operator.add]
@@ -227,6 +228,23 @@ def _load_strategist_node():
         return strategist_node
 
 
+def _load_memory_nodes():
+    """Load load_memory_node and save_memory_node, falling back to stubs."""
+    try:
+        from src.agents.memory import load_memory_node, save_memory_node
+
+        return load_memory_node, save_memory_node
+    except ImportError:
+
+        def load_memory_node(state):  # type: ignore[misc]
+            return {"memory_context": ""}
+
+        def save_memory_node(state):  # type: ignore[misc]
+            return {}
+
+        return load_memory_node, save_memory_node
+
+
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
@@ -237,11 +255,11 @@ def build_trading_desk_graph(config: AppConfig | None = None):
 
     LangGraph topology::
 
-        START → market_context → macro_regime
+        START → market_context → macro_regime → load_memory
           → [fundamental, sentiment, technical, earnings]  (parallel fan-out)
           → pre_debate  (fan-in barrier)
           → debate_router → [debate (loop)] or risk_manager
-          → strategist → END
+          → strategist → save_memory → END
 
     Args:
         config: Optional AppConfig. Uses get_config() singleton if None.
@@ -268,6 +286,7 @@ def build_trading_desk_graph(config: AppConfig | None = None):
     risk_manager_node = _load_risk_manager_node()
     debate_node, debate_router = _load_debate_nodes()
     strategist_node = _load_strategist_node()
+    load_memory_node, save_memory_node = _load_memory_nodes()
 
     def pre_debate_node(state: _State) -> dict:  # type: ignore[valid-type]
         """Pass-through fan-in node: convergence point after parallel analysts."""
@@ -279,6 +298,7 @@ def build_trading_desk_graph(config: AppConfig | None = None):
     # Register nodes
     graph.add_node("market_context", market_context_node)
     graph.add_node("macro_regime", macro_regime_node)
+    graph.add_node("load_memory", load_memory_node)
     graph.add_node("fundamental", fundamental_node)
     graph.add_node("sentiment", sentiment_node)
     graph.add_node("technical", technical_node)
@@ -287,16 +307,18 @@ def build_trading_desk_graph(config: AppConfig | None = None):
     graph.add_node("debate", debate_node)
     graph.add_node("risk_manager", risk_manager_node)
     graph.add_node("strategist", strategist_node)
+    graph.add_node("save_memory", save_memory_node)
 
     # Sequential start
     graph.add_edge(START, "market_context")
     graph.add_edge("market_context", "macro_regime")
+    graph.add_edge("macro_regime", "load_memory")
 
-    # Fan-out: macro_regime → all four parallel analysts
-    graph.add_edge("macro_regime", "fundamental")
-    graph.add_edge("macro_regime", "sentiment")
-    graph.add_edge("macro_regime", "technical")
-    graph.add_edge("macro_regime", "earnings")
+    # Fan-out: load_memory → all four parallel analysts
+    graph.add_edge("load_memory", "fundamental")
+    graph.add_edge("load_memory", "sentiment")
+    graph.add_edge("load_memory", "technical")
+    graph.add_edge("load_memory", "earnings")
 
     # Fan-in: all four analysts → pre_debate
     graph.add_edge("fundamental", "pre_debate")
@@ -316,9 +338,10 @@ def build_trading_desk_graph(config: AppConfig | None = None):
         {"debate": "debate", "risk_manager": "risk_manager"},
     )
 
-    # Final synthesis
+    # Final synthesis → persist to memory
     graph.add_edge("risk_manager", "strategist")
-    graph.add_edge("strategist", END)
+    graph.add_edge("strategist", "save_memory")
+    graph.add_edge("save_memory", END)
 
     logger.info("Trading desk graph compiled successfully.")
     return graph.compile()
@@ -357,6 +380,7 @@ def analyze_ticker(
         "market_context": "",
         "macro_regime": "neutral",
         "macro_confidence": 50.0,
+        "memory_context": "",
         "agent_reports": {},
         "debate_round": 0,
         "debate_transcript": [],

@@ -21,6 +21,7 @@ except ImportError:
         market_context: str
         macro_regime: str
         macro_confidence: float
+        memory_context: str
         agent_reports: Annotated[dict, _merge_reports]
         debate_round: int
         debate_transcript: Annotated[list, operator.add]
