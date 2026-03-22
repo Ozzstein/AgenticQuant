@@ -13,6 +13,7 @@ from datetime import datetime
 import ccxt
 from loguru import logger
 
+from src.execution.broker import compute_broker_metrics
 from src.utils.config import CcxtConfig
 from src.utils.exceptions import CcxtConnectionError, CcxtError, CcxtOrderError
 from src.utils.schemas import (
@@ -87,7 +88,7 @@ class CcxtTrader:
                 order.status = OrderStatus.REJECTED
                 return None
 
-            filled = self._wait_for_fill(ccxt_order.id, symbol, self._config.timeout_seconds)
+            filled = self._wait_for_fill(ccxt_order["id"], symbol, self._config.timeout_seconds)
             if filled is not None:
                 self._trade_log.append({
                     "timestamp": filled.timestamp.isoformat(),
@@ -134,7 +135,6 @@ class CcxtTrader:
             Dict with keys: total_return, annualized_return, sharpe, sortino,
             max_drawdown, calmar, volatility, win_rate, avg_win, avg_loss, profit_factor.
         """
-        from src.execution.broker import compute_broker_metrics
         return compute_broker_metrics(self._nav_history, self._trade_log)
 
     # ------------------------------------------------------------------
@@ -231,7 +231,7 @@ class CcxtTrader:
         """
         return f"{ticker}/{self._config.quote_currency}"
 
-    def _submit_order(self, order: Order, symbol: str) -> object | None:
+    def _submit_order(self, order: Order, symbol: str) -> dict | None:
         """Map our Order to ccxt create_order and submit.
 
         Retries up to max_retries times with exponential backoff.
@@ -279,7 +279,7 @@ class CcxtTrader:
         while time.time() - start < timeout:
             try:
                 ccxt_order = ex.fetch_order(order_id, symbol)
-                status = ccxt_order.status
+                status = ccxt_order["status"]
                 if status == "closed":
                     return self._map_ccxt_order(ccxt_order)
                 if status in ("canceled", "cancelled", "expired", "rejected"):
@@ -318,7 +318,12 @@ class CcxtTrader:
                 try:
                     ticker_data = ex.fetch_ticker(self._symbol(currency))
                     price = float(ticker_data["last"])
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "CcxtTrader: fetch_ticker failed for {} — using price=0.0: {}",
+                        currency,
+                        exc,
+                    )
                     price = 0.0
             pos_value = qty_f * price
             total_pos_value += pos_value
@@ -367,26 +372,26 @@ class CcxtTrader:
                 time.sleep(2 ** attempt)
         return {}  # unreachable
 
-    def _map_ccxt_order(self, ccxt_order: object) -> Order:
-        """Map a filled ccxt order object to our Order model.
+    def _map_ccxt_order(self, ccxt_order: dict) -> Order:
+        """Map a filled ccxt order dict to our Order model.
 
         Args:
-            ccxt_order: ccxt order object with status='closed'.
+            ccxt_order: ccxt order dict with status='closed'.
 
         Returns:
             Order with status=FILLED and fill_price set.
         """
-        side = OrderSide.BUY if ccxt_order.side == "buy" else OrderSide.SELL
+        side = OrderSide.BUY if ccxt_order["side"] == "buy" else OrderSide.SELL
         # symbol is "BTC/USDT"; extract base currency
-        ticker = ccxt_order.symbol.split("/")[0]
+        ticker = ccxt_order["symbol"].split("/")[0]
         return Order(
             ticker=ticker,
             side=side,
-            quantity=float(ccxt_order.filled or ccxt_order.amount),
+            quantity=float(ccxt_order.get("filled") or ccxt_order["amount"]),
             order_type=OrderType.MARKET,
             status=OrderStatus.FILLED,
-            fill_price=float(ccxt_order.average) if ccxt_order.average else None,
-            timestamp=datetime.fromtimestamp(ccxt_order.timestamp / 1000)
-            if ccxt_order.timestamp
+            fill_price=float(ccxt_order.get("average")) if ccxt_order.get("average") else None,
+            timestamp=datetime.fromtimestamp(ccxt_order.get("timestamp") / 1000)
+            if ccxt_order.get("timestamp")
             else datetime.now(),
         )

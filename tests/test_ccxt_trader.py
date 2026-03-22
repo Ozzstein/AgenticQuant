@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.utils.config import CcxtConfig
-from src.utils.exceptions import CcxtConnectionError, CcxtError, CcxtOrderError
+from src.utils.exceptions import CcxtError
 from src.utils.schemas import (
     AssetClass,
     Order,
@@ -17,9 +16,7 @@ from src.utils.schemas import (
     OrderStatus,
     OrderType,
     Portfolio,
-    Position,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,17 +45,17 @@ def _make_ccxt_order(
     amount: float = 0.01,
     filled: float = 0.01,
     average: float = 50_000.0,
-) -> MagicMock:
-    o = MagicMock()
-    o.id = id
-    o.status = status
-    o.side = side
-    o.symbol = symbol
-    o.amount = amount
-    o.filled = filled
-    o.average = average
-    o.timestamp = int(datetime.now().timestamp() * 1000)
-    return o
+) -> dict:
+    return {
+        "id": id,
+        "status": status,
+        "side": side,
+        "symbol": symbol,
+        "amount": amount,
+        "filled": filled,
+        "average": average,
+        "timestamp": int(datetime.now().timestamp() * 1000),
+    }
 
 
 def _make_ccxt_balance(
@@ -111,6 +108,7 @@ class TestCcxtTrader:
     # 2 — Exchange created in paper mode (sandbox)
     def test_exchange_created_in_paper_mode(self) -> None:
         import ccxt
+
         from src.execution.ccxt_trader import CcxtTrader
         config = make_config(exchange="binance", paper=True)
         trader = CcxtTrader(config)
