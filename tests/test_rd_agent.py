@@ -379,7 +379,8 @@ def test_evaluator_stage2_not_entered_when_stage1_fails():
         evaluator = FactorEvaluator(cfg)
         result = evaluator.evaluate_factor(factor)
 
-    # Constant signal must fail stage 1 (IC = 0 < 0.02)
+    # Constant expression produces NaN from spearmanr (raised as ValueError → caught as
+    # eval_error). Both "eval_error" and "low_ic" leave Stage 2 unentered.
     assert result.stage1_passed is False
     assert result.stage2_ic is None
     assert result.stage2_icir is None

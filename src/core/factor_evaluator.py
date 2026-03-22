@@ -290,7 +290,10 @@ class FactorEvaluator:
         # Normalise: need date and ticker columns
         df = df.copy()
         if "date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
-            df = df.reset_index().rename(columns={"index": "date"})
+            df = df.reset_index()
+            if "date" not in df.columns:
+                # Index may have any name (e.g. "Date", None→"index") — rename first col
+                df = df.rename(columns={df.columns[0]: "date"})
         if "ticker" not in df.columns:
             # Single-ticker df — cannot compute cross-sectional IC
             raise ValueError("DataFrame must have a 'ticker' column for cross-sectional IC")
