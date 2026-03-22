@@ -46,10 +46,19 @@ class FullAppConfig(AppConfig):
 @lru_cache(maxsize=1)
 def get_full_config() -> FullAppConfig:
     """Get singleton FullAppConfig (extends AppConfig with RDAgentConfig)."""
-    # Reuse all loading logic from get_config()
+    import yaml
+
     base = get_config()
-    # Build FullAppConfig from the base config's data
     data = base.model_dump()
+
+    # Re-read YAML to pick up rd_agent block — AppConfig drops unknown keys
+    yaml_path = PROJECT_ROOT / "config" / "settings.yaml"
+    if yaml_path.exists():
+        with open(yaml_path) as _f:
+            yaml_data: dict = yaml.safe_load(_f) or {}
+        if "rd_agent" in yaml_data:
+            data["rd_agent"] = yaml_data["rd_agent"]
+
     return FullAppConfig(**data)
 
 
