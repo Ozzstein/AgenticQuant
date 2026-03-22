@@ -500,4 +500,4 @@ def test_research_analyst_llm_path():
         analyst = ResearchAnalyst(cfg)
         memo = analyst.write_memo(results, kb)
 
-    assert "Momentum" in memo or len(memo) > 10
+    assert "Momentum" in memo

@@ -150,13 +150,13 @@ class ResearchAnalyst:
     @staticmethod
     def _format_results_table(results: list[EvalResult]) -> str:
         """Format a list of EvalResult objects as a plain-text table."""
-        lines = ["name | category | stage1_IC | stage2_IC | ICIR | passed"]
+        lines = ["name | stage1_IC | stage2_IC | ICIR | passed"]
         lines.append("-" * 60)
         for r in results:
             s2_ic = f"{r.stage2_ic:.4f}" if r.stage2_ic is not None else "—"
             s2_icir = f"{r.stage2_icir:.4f}" if r.stage2_icir is not None else "—"
             lines.append(
-                f"{r.factor_name} | — | {r.stage1_ic:.4f} | {s2_ic} | {s2_icir} | {r.passed}"
+                f"{r.factor_name} | {r.stage1_ic:.4f} | {s2_ic} | {s2_icir} | {r.passed}"
             )
         return "\n".join(lines)
 
