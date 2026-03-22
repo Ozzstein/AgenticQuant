@@ -60,7 +60,7 @@
   - `AlpacaTrader` class alongside `PaperTrader` with same interface
   - Gate behind `AIQUANT_ALPACA_LIVE=true` config flag
 
-- [ ] **3B. CCXT Execution**
+- [x] **3B. CCXT Execution**
   - Live crypto order execution via CCXT
   - Unified interface with paper trader
 
