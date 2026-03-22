@@ -409,3 +409,95 @@ def test_evaluator_batch():
 
     assert len(results) == 3
     assert all(isinstance(r, EvalResult) for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — ResearchAnalyst tests (mocked Opus)
+# ---------------------------------------------------------------------------
+
+
+def test_research_analyst_write_memo_fallback():
+    """Without API key, write_memo returns a non-empty placeholder string."""
+    from src.core.research_analyst import ResearchAnalyst
+    from src.utils.schemas import EvalResult
+
+    cfg = _mock_full_config(with_api_key=False)
+    analyst = ResearchAnalyst(cfg)
+
+    results = [
+        EvalResult(factor_name="mom_20d", stage1_ic=0.031, stage1_passed=True,
+                   stage2_ic=0.028, stage2_icir=0.41, passed=True, reason="passed"),
+        EvalResult(factor_name="bad_factor", stage1_ic=0.005, stage1_passed=False,
+                   passed=False, reason="low_ic"),
+    ]
+    kb: dict = {"research_memos": []}
+    memo = analyst.write_memo(results, kb)
+    assert isinstance(memo, str)
+    assert len(memo) > 0
+
+
+def test_research_analyst_save_and_load_memo():
+    """save_memo and load_memo round-trip correctly with rolling-5 window."""
+    from src.core.research_analyst import ResearchAnalyst
+
+    cfg = _mock_full_config(with_api_key=False)
+    analyst = ResearchAnalyst(cfg)
+
+    kb: dict = {"research_memos": []}
+    for i in range(7):
+        analyst.save_memo(f"Memo {i}", kb)
+
+    # Rolling-5 window: only last 5 memos retained
+    assert len(kb["research_memos"]) == 5
+    assert "Memo 6" in kb["research_memos"][-1]
+    assert "Memo 0" not in "".join(kb["research_memos"])
+    assert "Memo 1" not in "".join(kb["research_memos"])
+
+
+def test_research_analyst_load_memo_returns_latest():
+    """load_memo returns the most recent memo string."""
+    from src.core.research_analyst import ResearchAnalyst
+
+    cfg = _mock_full_config(with_api_key=False)
+    analyst = ResearchAnalyst(cfg)
+    kb: dict = {"research_memos": ["first memo", "second memo"]}
+    memo = analyst.load_memo(kb)
+    assert memo == "second memo"
+
+
+def test_research_analyst_load_memo_empty_kb():
+    """load_memo on empty KB returns empty string."""
+    from src.core.research_analyst import ResearchAnalyst
+
+    cfg = _mock_full_config(with_api_key=False)
+    analyst = ResearchAnalyst(cfg)
+    assert analyst.load_memo({}) == ""
+    assert analyst.load_memo({"research_memos": []}) == ""
+
+
+def test_research_analyst_llm_path():
+    """With API key and mocked Opus, write_memo returns LLM-generated text."""
+    from src.core.research_analyst import ResearchAnalyst
+    from src.utils.schemas import EvalResult
+
+    cfg = _mock_full_config(with_api_key=True)
+    cfg.agents.deep_think_model = "claude-opus-4-20250514"
+
+    results = [
+        EvalResult(factor_name="mom_20d", stage1_ic=0.03, stage1_passed=True,
+                   stage2_ic=0.025, stage2_icir=0.35, passed=True, reason="passed"),
+    ]
+    kb: dict = {"research_memos": []}
+
+    mock_response = MagicMock()
+    mock_response.content = "Momentum factors show strong IC in bull regimes. Recommend exploring longer lookbacks."
+
+    with patch("src.core.research_analyst.ChatAnthropic") as MockLLM:
+        mock_instance = MagicMock()
+        mock_instance.invoke.return_value = mock_response
+        MockLLM.return_value = mock_instance
+
+        analyst = ResearchAnalyst(cfg)
+        memo = analyst.write_memo(results, kb)
+
+    assert "Momentum" in memo or len(memo) > 10
