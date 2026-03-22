@@ -307,3 +307,25 @@ class TestModelSpec:
         )
         assert m.name == "LightGBM"
         assert len(m.feature_set) == 2
+
+
+def test_model_config_ensemble_defaults():
+    """ModelConfig has ensemble defaults: 3 models, ic_weighted, 0.15 val fraction."""
+    from src.utils.config import ModelConfig
+    cfg = ModelConfig()
+    assert cfg.ensemble_models == ["LightGBM", "XGBoost", "Linear"]
+    assert cfg.ensemble_method == "ic_weighted"
+    assert cfg.ensemble_val_fraction == 0.15
+
+
+def test_model_config_ensemble_custom():
+    """ModelConfig accepts custom ensemble settings."""
+    from src.utils.config import ModelConfig
+    cfg = ModelConfig(
+        ensemble_models=["LightGBM", "Linear"],
+        ensemble_method="equal",
+        ensemble_val_fraction=0.2,
+    )
+    assert len(cfg.ensemble_models) == 2
+    assert cfg.ensemble_method == "equal"
+    assert cfg.ensemble_val_fraction == 0.2

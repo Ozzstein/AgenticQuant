@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from src.utils.config import AppConfig, get_config
 from src.utils.exceptions import BacktestError
 from src.utils.logger import get_logger
 from src.utils.schemas import (
+    EnsembleWeights,
     WalkForwardFold,
     WalkForwardResult,
 )
@@ -53,6 +55,7 @@ class WalkForwardRunner:
         walk_months: int = 3,
         embargo_days: int = 5,
         mode: str = "expanding",
+        model_factory: Callable[[], object] | None = None,
     ) -> WalkForwardResult:
         """Run enhanced walk-forward backtest with feature importance drift and rolling IC.
 
@@ -65,6 +68,13 @@ class WalkForwardRunner:
             walk_months: Length of each OOS window in months.
             embargo_days: Gap between train end and test start.
             mode: Walk-forward mode (currently only ``expanding`` is supported).
+            model_factory: Optional callable that returns a fresh model instance per fold.
+                When provided, overrides ``model_name``. The callable must return an object
+                with ``train(X, y)``, ``predict(X)``, and ``get_feature_importance()`` methods.
+                Note: the factory is invoked once before the fold loop to determine the result
+                model name, so callers can expect N+1 total invocations for N folds.
+                If ``model_factory`` is provided but the returned object has no ``model_name``
+                attribute, ``model_name`` is used as the fallback display name.
 
         Returns:
             WalkForwardResult with stitched returns, per-fold metrics, feature drift
@@ -89,6 +99,15 @@ class WalkForwardRunner:
         feature_importances: list[pd.Series] = []
         # Each entry: (test_start_str, list[float]) for stitching
         fold_period_returns: list[tuple[str, list[float]]] = []
+        ensemble_weights_per_fold: list[EnsembleWeights] = []
+
+        # Determine display name for result
+        if model_factory is not None:
+            _probe = model_factory()
+            result_model_name = getattr(_probe, "model_name", model_name)
+            del _probe
+        else:
+            result_model_name = model_name
 
         for i, fold in enumerate(folds):
             train_mask = (dates >= fold["train_start"]) & (dates <= fold["train_end"])
@@ -117,8 +136,24 @@ class WalkForwardRunner:
                 continue
 
             # Train model
-            model = ModelWrapper(model_name, self.config)
+            if model_factory is not None:
+                model = model_factory()
+            else:
+                model = ModelWrapper(model_name, self.config)
             model.train(X_train.values, y_train.values)
+
+            # Capture ensemble weights if model supports it
+            if hasattr(model, "get_weights"):
+                w = model.get_weights()
+                if w:  # non-empty means model is trained and ensemble
+                    ensemble_weights_per_fold.append(
+                        EnsembleWeights(
+                            model_weights=w,
+                            weighting_method=getattr(model, "_weighting", "unknown"),
+                            fold_id=i,
+                        )
+                    )
+
             is_preds = model.predict(X_train.values)
             oos_preds = model.predict(X_test.values)
 
@@ -233,7 +268,8 @@ class WalkForwardRunner:
             aggregate_metrics=aggregate_metrics,
             feature_importance_drift=feature_importance_drift,
             rolling_ic=rolling_ic,
-            model_name=model_name,
+            model_name=result_model_name,
+            ensemble_weights_per_fold=ensemble_weights_per_fold,
         )
 
     def generate_html_report(self, result: WalkForwardResult, output_path: str) -> str:

@@ -39,7 +39,7 @@ def setup(
 
 @app.command()
 def backtest(
-    model: str = typer.Option("LightGBM", "--model", "-m", help="Model name"),
+    model: str = typer.Option("LightGBM", "--model", "-m", help="Model name (LightGBM, Linear, CatBoost, XGBoost, Ensemble)"),
     topk: int = typer.Option(30, "--topk", "-k", help="Top K stocks to hold"),
     start: str = typer.Option("2020-01-01", "--start", help="Backtest start date"),
     end: str = typer.Option("2023-12-31", "--end", help="Backtest end date"),
@@ -50,7 +50,7 @@ def backtest(
     """Run walk-forward backtest with validation and benchmarks."""
     from src.core.backtester import WalkForwardBacktester
     from src.core.data_pipeline import DataPipeline
-    from src.core.model_zoo import ModelWrapper
+    from src.core.ensemble import create_model
     from src.utils.config import get_config
 
     config = get_config()
@@ -58,7 +58,7 @@ def backtest(
 
     pipeline = DataPipeline(config)
     backtester = WalkForwardBacktester(config)
-    model_wrapper = ModelWrapper(model, config)
+    model_wrapper = create_model(model, config)
 
     features, labels = pipeline.get_features(start, end)
     result = backtester.run(features, labels, model_wrapper, topk=topk)

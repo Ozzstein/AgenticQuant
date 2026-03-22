@@ -18,7 +18,7 @@ from rich.table import Table
 
 from src.core.backtester import WalkForwardBacktester
 from src.core.data_pipeline import DataPipeline
-from src.core.model_zoo import ModelWrapper
+from src.core.ensemble import create_model
 from src.utils.config import get_config
 from src.utils.schemas import BacktestMetrics, BacktestResult
 
@@ -210,7 +210,7 @@ def _run_pipeline(
     # --- 4. Train model on first 70% ---
     split = int(len(X) * 0.7)
     X_train, y_train = X.iloc[:split], y.iloc[:split]
-    wrapper = ModelWrapper(model_name, config)
+    wrapper = create_model(model_name, config)
     try:
         wrapper.train(X_train, y_train)
     except Exception as exc:
@@ -236,7 +236,7 @@ def _run_pipeline(
 
 @app.command()
 def run(
-    model: str = typer.Option("LightGBM", help="Model name (LightGBM, Linear, CatBoost, XGBoost)"),
+    model: str = typer.Option("LightGBM", help="Model name (LightGBM, Linear, CatBoost, XGBoost, Ensemble)"),
     topk: int = typer.Option(30, help="Top-K tickers to select per period"),
     start: str = typer.Option("2022-01-01", help="Start date (YYYY-MM-DD)"),
     end: str = typer.Option("2023-12-31", help="End date (YYYY-MM-DD)"),
@@ -305,6 +305,7 @@ def compare(
     topk: int = typer.Option(30, help="Top-K tickers to select per period"),
     start: str = typer.Option("2022-01-01", help="Start date (YYYY-MM-DD)"),
     end: str = typer.Option("2023-12-31", help="End date (YYYY-MM-DD)"),
+    ensemble: bool = typer.Option(False, "--ensemble", help="Include Ensemble in comparison"),
 ) -> None:
     """Compare multiple models side by side on the same dataset.
 
@@ -314,6 +315,8 @@ def compare(
             --topk 10 --start 2022-01-01 --end 2023-06-30
     """
     model_list = [m.strip() for m in models.split(",") if m.strip()]
+    if ensemble and "Ensemble" not in model_list:
+        model_list.append("Ensemble")
     if not model_list:
         logger.error("No models specified.")
         raise typer.Exit(code=1)

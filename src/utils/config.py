@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -111,6 +111,11 @@ class ModelConfig(BaseModel):
     embargo_days: int = 5
     transaction_cost_bps: float = 10.0
     retrain_frequency: str = "monthly"
+    ensemble_models: list[str] = Field(
+        default_factory=lambda: ["LightGBM", "XGBoost", "Linear"]
+    )
+    ensemble_method: Literal["ic_weighted", "equal", "custom"] = "ic_weighted"
+    ensemble_val_fraction: float = Field(default=0.15, gt=0.0, lt=1.0)
 
 
 class RiskConfig(BaseModel):
