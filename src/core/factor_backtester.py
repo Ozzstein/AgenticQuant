@@ -95,18 +95,18 @@ class FactorBacktester:
 
         # Step 2 + 3: Build factor values per ticker, then stack to (date, ticker) MultiIndex
         factor_series_list: list[pd.Series] = []
-        try:
-            for ticker, grp in df.groupby("ticker"):
-                grp = grp.sort_values("date").set_index("date")
-                ns = {
-                    "close": grp["close"],
-                    "open": grp["open"],
-                    "high": grp["high"],
-                    "low": grp["low"],
-                    "volume": grp["volume"].astype(float),
-                    "pd": pd,
-                    "np": np,
-                }
+        for ticker, grp in df.groupby("ticker"):
+            grp = grp.sort_values("date").set_index("date")
+            ns = {
+                "close": grp["close"],
+                "open": grp["open"],
+                "high": grp["high"],
+                "low": grp["low"],
+                "volume": grp["volume"].astype(float),
+                "pd": pd,
+                "np": np,
+            }
+            try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     fval = eval(factor.expression, {"__builtins__": {}}, ns)  # noqa: S307
@@ -114,12 +114,16 @@ class FactorBacktester:
                     fval = pd.Series(fval, index=grp.index)
                 fval.name = ticker
                 factor_series_list.append(fval)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("FactorBacktester: eval error for '{}': {}", factor.name, exc)
-            return BacktestValidationResult(factor_name=factor.name, passed=False, reason="eval_error")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "FactorBacktester: eval error for '{}' on ticker '{}': {}",
+                    factor.name, ticker, exc,
+                )
+                continue
 
         if not factor_series_list:
-            return BacktestValidationResult(factor_name=factor.name, passed=False, reason="no_data")
+            logger.warning("FactorBacktester: all tickers failed eval for '{}' — treating as eval_error.", factor.name)
+            return BacktestValidationResult(factor_name=factor.name, passed=False, reason="eval_error")
 
         factor_wide = pd.concat(factor_series_list, axis=1)  # dates × tickers
         features = factor_wide.stack().rename(factor.name).to_frame()
@@ -175,12 +179,18 @@ class FactorBacktester:
             val_result.verdict != ValidationVerdict.REJECTED
             and sharpe >= self.config.rd_agent.min_backtest_sharpe
         )
-        reason = "passed" if passed else (
-            "low_sharpe" if sharpe < self.config.rd_agent.min_backtest_sharpe
-            else "overfitting" if not checks.get("overfitting_signals", True)
-            else "look_ahead_bias" if not checks.get("look_ahead_bias", True)
-            else "backtest_rejected"
-        )
+        if passed:
+            reason = "passed"
+        elif val_result.verdict == ValidationVerdict.REJECTED:
+            # Determine most specific reason from validator checks
+            if not checks.get("overfitting_signals", True):
+                reason = "overfitting"
+            elif not checks.get("look_ahead_bias", True):
+                reason = "look_ahead_bias"
+            else:
+                reason = "backtest_rejected"
+        else:
+            reason = "low_sharpe"
 
         return BacktestValidationResult(
             factor_name=factor.name,

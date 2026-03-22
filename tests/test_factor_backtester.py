@@ -1,9 +1,9 @@
 """Tests for FactorBacktester and related schemas/config."""
 from __future__ import annotations
 
-import pytest
-from pydantic import BaseModel
+from unittest.mock import MagicMock, patch
 
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Task 1: Schema and config tests
@@ -53,10 +53,6 @@ def test_config_min_backtest_sharpe_default():
     assert cfg.min_backtest_sharpe == 0.5
 
 
-import pandas as pd
-from unittest.mock import MagicMock, patch
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers for FactorBacktester tests
 # ---------------------------------------------------------------------------
@@ -87,8 +83,11 @@ def _make_ohlcv(n_days: int = 100, n_tickers: int = 5) -> pd.DataFrame:
 def _make_bt_mocks(sharpe: float = 1.2, verdict_str: str = "APPROVED"):
     """Return (mock_wfbt_cls, mock_validator_cls) configured for a given outcome."""
     from src.utils.schemas import (
-        BacktestMetrics, BacktestResult, ValidationCheck,
-        ValidationResult, ValidationVerdict,
+        BacktestMetrics,
+        BacktestResult,
+        ValidationCheck,
+        ValidationResult,
+        ValidationVerdict,
     )
     metrics = BacktestMetrics(sharpe_ratio=sharpe, max_drawdown=-0.05)
     bt_result = BacktestResult(metrics=metrics)
@@ -239,7 +238,14 @@ def test_validate_batch_fetches_once():
 
 def test_validate_batch_mixed_results():
     """validate_batch() returns mixed pass/fail results for different factors."""
-    from src.utils.schemas import FactorDefinition, BacktestMetrics, BacktestResult, ValidationResult, ValidationVerdict, ValidationCheck
+    from src.utils.schemas import (
+        BacktestMetrics,
+        BacktestResult,
+        FactorDefinition,
+        ValidationCheck,
+        ValidationResult,
+        ValidationVerdict,
+    )
 
     # Good factor
     metrics_good = BacktestMetrics(sharpe_ratio=1.5, max_drawdown=-0.05)
@@ -251,10 +257,6 @@ def test_validate_batch_mixed_results():
     # Bad factor (low sharpe)
     metrics_bad = BacktestMetrics(sharpe_ratio=0.1, max_drawdown=-0.3)
     bt_bad = BacktestResult(metrics=metrics_bad)
-    val_bad = ValidationResult(
-        checks=[ValidationCheck(name="test", passed=True)],
-        verdict=ValidationVerdict.APPROVED,
-    )
 
     call_count = [0]
     def run_side_effect(*args, **kwargs):
