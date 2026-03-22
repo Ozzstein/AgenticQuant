@@ -171,6 +171,14 @@ class AlpacaConfig(BaseModel):
     timeout_seconds: int = 30
 
 
+class MemoryConfig(BaseModel):
+    """Agent memory persistence configuration."""
+
+    enabled: bool = True
+    max_history: int = 10
+    store_path: Path = PROJECT_ROOT / "data" / "agent_memory" / "analysis_log.jsonl"
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -196,6 +204,7 @@ class AppConfig(BaseSettings):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     macro_regime: MacroRegimeConfig = Field(default_factory=MacroRegimeConfig)
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     @field_validator("log_level")
     @classmethod
