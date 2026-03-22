@@ -23,6 +23,8 @@ from src.utils.schemas import (
 class PaperTrader:
     """Simulated paper trading engine.
 
+    Conforms to ``BaseBroker`` protocol (``src/execution/broker.py``).
+
     Supports market orders with slippage and per-share commission. Tracks
     FIFO average-cost positions, realized PnL, NAV history, and trade logs.
 
