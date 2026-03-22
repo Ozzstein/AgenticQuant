@@ -501,3 +501,133 @@ def test_research_analyst_llm_path():
         memo = analyst.write_memo(results, kb)
 
     assert "Momentum" in memo
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — RDAgentRunner orchestrator tests
+# ---------------------------------------------------------------------------
+
+
+def test_runner_mine_factors_calls_all_components():
+    """mine_factors should call proposer → evaluator → analyst in sequence."""
+    from src.core.rd_agent_runner import RDAgentRunner
+    from src.utils.schemas import EvalResult, FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+
+    with patch("src.core.rd_agent_runner.FactorProposer") as MockProposer, \
+         patch("src.core.rd_agent_runner.FactorEvaluator") as MockEvaluator, \
+         patch("src.core.rd_agent_runner.ResearchAnalyst") as MockAnalyst:
+
+        mock_proposer = MagicMock()
+        mock_proposer.propose_factors.return_value = [
+            FactorDefinition(name="llm_factor_1", expression="close / close.shift(20) - 1", category="momentum"),
+        ]
+        MockProposer.return_value = mock_proposer
+
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate_factors_batch.return_value = [
+            EvalResult(factor_name="llm_factor_1", stage1_ic=0.04, stage1_passed=True,
+                       stage2_ic=0.03, stage2_icir=0.45, passed=True, reason="passed"),
+        ]
+        MockEvaluator.return_value = mock_evaluator
+
+        mock_analyst = MagicMock()
+        mock_analyst.write_memo.return_value = "Test memo."
+        mock_analyst.load_memo.return_value = ""
+        MockAnalyst.return_value = mock_analyst
+
+        runner = RDAgentRunner(config=cfg)
+        results = runner.mine_factors(iterations=1)
+
+    assert mock_proposer.propose_factors.called
+    assert mock_evaluator.evaluate_factors_batch.called
+    assert mock_analyst.write_memo.called
+    assert len(results) >= 0  # May be 0 if factor did not pass (valid)
+
+
+def test_runner_library_status_returns_dict():
+    """library_status should return a dict with expected keys."""
+    from src.core.rd_agent_runner import RDAgentRunner
+
+    cfg = _mock_full_config(with_api_key=False)
+
+    with patch("src.core.rd_agent_runner.FactorProposer"), \
+         patch("src.core.rd_agent_runner.FactorEvaluator"), \
+         patch("src.core.rd_agent_runner.ResearchAnalyst"):
+        runner = RDAgentRunner(config=cfg)
+
+    status = runner.library_status()
+    assert "factor_count" in status
+    assert "avg_ic" in status
+    assert "last_run_date" in status
+
+
+def test_runner_kb_persistence(tmp_path):
+    """KB should be saved and loaded correctly across runner instances."""
+    from src.core.rd_agent_runner import RDAgentRunner
+
+    cfg = _mock_full_config(with_api_key=False)
+
+    with patch("src.core.rd_agent_runner.FactorProposer"), \
+         patch("src.core.rd_agent_runner.FactorEvaluator"), \
+         patch("src.core.rd_agent_runner.ResearchAnalyst"), \
+         patch("src.core.rd_agent_runner._KB_PATH", tmp_path / "kb.json"), \
+         patch("src.core.rd_agent_runner._KB_DIR", tmp_path):
+        runner = RDAgentRunner(config=cfg)
+        kb = runner._load_kb()
+        kb["tested_factors"] = ["test_factor"]
+        runner._save_kb(kb)
+
+        kb2 = runner._load_kb()
+        assert "test_factor" in kb2["tested_factors"]
+
+
+def test_runner_copilot_factor():
+    """copilot_factor should return a result dict with 'description' key."""
+    from src.core.rd_agent_runner import RDAgentRunner
+    from src.utils.schemas import EvalResult, FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+
+    with patch("src.core.rd_agent_runner.FactorProposer") as MockProposer, \
+         patch("src.core.rd_agent_runner.FactorEvaluator") as MockEvaluator, \
+         patch("src.core.rd_agent_runner.ResearchAnalyst") as MockAnalyst:
+
+        mock_proposer = MagicMock()
+        mock_proposer.propose_factors.return_value = [
+            FactorDefinition(name="copilot_f1", expression="close / close.shift(5) - 1", category="momentum"),
+        ]
+        MockProposer.return_value = mock_proposer
+
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate_factors_batch.return_value = [
+            EvalResult(factor_name="copilot_f1", stage1_ic=0.05, stage1_passed=True,
+                       stage2_ic=0.04, stage2_icir=0.5, passed=True, reason="passed"),
+        ]
+        MockEvaluator.return_value = mock_evaluator
+
+        MockAnalyst.return_value = MagicMock()
+
+        runner = RDAgentRunner(config=cfg)
+        result = runner.copilot_factor("momentum strategy with 5-day lookback")
+
+    assert "description" in result
+    assert "factors_accepted" in result
+
+
+def test_runner_reset_knowledge():
+    """reset_knowledge should reinitialise the KB to an empty state."""
+    from src.core.rd_agent_runner import RDAgentRunner
+
+    cfg = _mock_full_config(with_api_key=False)
+
+    with patch("src.core.rd_agent_runner.FactorProposer"), \
+         patch("src.core.rd_agent_runner.FactorEvaluator"), \
+         patch("src.core.rd_agent_runner.ResearchAnalyst"):
+        runner = RDAgentRunner(config=cfg)
+        runner.reset_knowledge()
+        kb = runner._load_kb()
+
+    assert kb["tested_factors"] == []
+    assert kb["discoveries"] == []

@@ -19,6 +19,9 @@ from typing import Any
 
 import yaml
 
+from src.core.factor_evaluator import FactorEvaluator
+from src.core.factor_proposer import FactorProposer
+from src.core.research_analyst import ResearchAnalyst
 from src.utils.config_loader import FullAppConfig, get_full_config
 from src.utils.logger import get_logger
 from src.utils.schemas import FactorDefinition, Strategy
@@ -28,13 +31,14 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Knowledge-base path (created at runtime)
 # ---------------------------------------------------------------------------
-_KB_DIR = Path("data/rd_knowledge_base")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_KB_DIR = _PROJECT_ROOT / "data" / "rd_knowledge_base"
 _KB_PATH = _KB_DIR / "kb.json"
 
 # ---------------------------------------------------------------------------
 # Strategy library path
 # ---------------------------------------------------------------------------
-_STRATEGY_DIR = Path("data/strategy_library")
+_STRATEGY_DIR = _PROJECT_ROOT / "data" / "strategy_library"
 
 _EMPTY_KB: dict[str, Any] = {
     "tested_factors": [],
@@ -136,6 +140,9 @@ class RDAgentRunner:
             logger.info("RD-Agent package detected.")
         except ImportError:
             logger.info("RD-Agent not installed. Using Python-native simulation mode.")
+        self._proposer = FactorProposer(self.config)
+        self._evaluator = FactorEvaluator(self.config)
+        self._analyst = ResearchAnalyst(self.config)
 
     # ------------------------------------------------------------------
     # Knowledge-base helpers
@@ -431,45 +438,59 @@ class RDAgentRunner:
         effective_min_ic = min_ic if min_ic is not None else self.config.rd_agent.min_ic
         logger.info("mine_factors: {} iterations, min_ic={}", iterations, effective_min_ic)
 
-        accepted: list[FactorDefinition] = []
         with self._file_lock:
             kb = self._load_kb()
-        tested_set: set[str] = set(kb.get("tested_factors", []))
-        failed_set: set[str] = set(kb.get("failed_factors", []))
+        tested_names = list(kb.get("tested_factors", []))
+        accepted: list[FactorDefinition] = []
 
-        for _ in range(iterations):
-            proposals = self._propose_factors(n=2)
-            for prop in proposals:
-                name = prop["name"]
-                if name in tested_set or name in failed_set:
-                    continue
+        for _iter in range(iterations):
+            memo = self._analyst.load_memo(kb)
+            batch_size = self.config.rd_agent.budget
+            proposals = self._proposer.propose_factors(
+                n=batch_size, memo=memo, tested=tested_names
+            )
+            eval_results = self._evaluator.evaluate_factors_batch(proposals)
 
-                ic = self._simulate_ic()
-                tested_set.add(name)
-
-                if abs(ic) >= effective_min_ic:
+            batch_accepted: list[FactorDefinition] = []
+            for er, factor in zip(eval_results, proposals):
+                tested_names.append(er.factor_name)
+                if er.passed:
                     factor = FactorDefinition(
-                        name=name,
-                        expression=prop["expression"],
-                        category=prop["category"],
-                        ic_mean=ic,
-                        icir=abs(ic) / 0.02,
-                        source="rd_agent_sim",
+                        name=factor.name,
+                        expression=factor.expression,
+                        category=factor.category,
+                        ic_mean=er.stage2_ic or er.stage1_ic,
+                        icir=er.stage2_icir or 0.0,
+                        source="rd_agent_llm",
+                        description=factor.description,
                     )
-                    accepted.append(factor)
-                    kb["discoveries"].append(
-                        {"date": str(date.today()), "factor": name, "ic": round(ic, 6)}
-                    )
-                    logger.info("Factor '{}' mined (IC={:.4f}).", name, ic)
-                else:
-                    failed_set.add(name)
+                    batch_accepted.append(factor)
+                    kb["discoveries"].append({
+                        "date": str(date.today()),
+                        "factor": factor.name,
+                        "ic": round(er.stage2_ic or er.stage1_ic, 6),
+                    })
 
-        kb["tested_factors"] = sorted(tested_set)
-        kb["failed_factors"] = sorted(failed_set)
+            kb.setdefault("eval_results", [])
+            for er in eval_results:
+                kb["eval_results"].append({
+                    "factor_name": er.factor_name,
+                    "stage1_ic": er.stage1_ic,
+                    "stage2_ic": er.stage2_ic,
+                    "stage2_icir": er.stage2_icir,
+                    "passed": er.passed,
+                    "date": str(date.today()),
+                    "reason": er.reason,
+                })
+
+            memo_text = self._analyst.write_memo(eval_results, kb)
+            self._analyst.save_memo(memo_text, kb)
+            accepted.extend(batch_accepted)
+
+        kb["tested_factors"] = sorted(set(tested_names))
         kb["last_run_date"] = str(date.today())
         with self._file_lock:
             self._save_kb(kb)
-
         if accepted:
             with self._file_lock:
                 self.save_factor_library(accepted)
@@ -500,51 +521,44 @@ class RDAgentRunner:
         with self._file_lock:
             kb = self._load_kb()
         tested_configs: list[dict[str, Any]] = kb.get("tested_configs", [])
-        tested_set: set[str] = {json.dumps(c, sort_keys=True) for c in tested_configs}
+        memo = self._analyst.load_memo(kb)
+
+        proposals = self._proposer.propose_model_config(
+            n=effective_iters, memo=memo, tested=tested_configs
+        )
 
         best_config: dict[str, Any] = {}
         best_sharpe: float = -999.0
         configs_tested = 0
+        tested_set = {json.dumps(c, sort_keys=True) for c in tested_configs}
 
-        for _ in range(effective_iters):
+        for proposal in proposals:
             candidate = {
-                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
-                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
-                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
-                "num_leaves": random.choice(_PARAM_GRID["num_leaves"]),
+                "model": proposal.model_type,
+                "n_estimators": proposal.n_estimators,
+                "learning_rate": proposal.learning_rate,
+                "max_depth": proposal.max_depth,
+                "num_leaves": proposal.num_leaves,
             }
             key = json.dumps(candidate, sort_keys=True)
             if key in tested_set:
-                logger.debug("Skipping already-tested config: {}", candidate)
                 continue
-
-            # Simulate Sharpe: centre around 1.0 with noise
             sharpe = random.gauss(1.0, 0.3)
             tested_set.add(key)
             tested_configs.append(candidate)
             configs_tested += 1
-
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_config = dict(candidate)
-                logger.debug("New best config (Sharpe={:.3f}): {}", sharpe, best_config)
 
-        # Persist
         kb["tested_configs"] = tested_configs
         kb["last_run_date"] = str(date.today())
         with self._file_lock:
             self._save_kb(kb)
-
         if best_config:
             self.save_model_config(best_config)
 
-        result = {
-            "best_config": best_config,
-            "best_sharpe": round(best_sharpe, 4),
-            "configs_tested": configs_tested,
-        }
-        logger.info("optimize_model complete: Sharpe={:.4f}", best_sharpe)
-        return result
+        return {"best_config": best_config, "best_sharpe": round(best_sharpe, 4), "configs_tested": configs_tested}
 
     def multi_trace_co_optimize(
         self,
@@ -623,76 +637,49 @@ class RDAgentRunner:
         """
         logger.info("implement_paper: source='{}'", source)
 
-        min_ic = self.config.rd_agent.min_ic
-
-        # --- Remote sources: stub ---
+        # Remote sources (URLs, arXiv IDs) are not supported — warn and return None
         if source.startswith("http") or source.lower().startswith("arxiv") or re.match(r"^\d{4}\.\d+", source):
             logger.warning(
-                "PDF/arXiv parsing not available without keys. "
-                "Cannot fetch remote source: '{}'",
-                source,
+                "PDF/arXiv parsing not available. Cannot fetch remote source: '{}'", source
             )
             return None
 
-        # --- Local file: simple keyword extraction ---
+        # Read content from local file or use source string directly as context
+        paper_text = source
         file_path = Path(source)
-        if not file_path.exists():
-            logger.error("Source file not found: '{}'", source)
+        if file_path.exists():
+            try:
+                paper_text = file_path.read_text(errors="ignore")
+            except OSError as exc:
+                logger.error("Failed to read source file '{}': {}", source, exc)
+                return None
+
+        with self._file_lock:
+            kb = self._load_kb()
+        memo = self._analyst.load_memo(kb)
+        tested_names = list(kb.get("tested_factors", []))
+
+        proposals = self._proposer.propose_factors(n=3, memo=memo, tested=tested_names, description=paper_text)
+        if not proposals:
             return None
 
-        try:
-            text = file_path.read_text(errors="ignore").lower()
-        except OSError as exc:
-            logger.error("Failed to read source file '{}': {}", source, exc)
+        eval_results = self._evaluator.evaluate_factors_batch(proposals)
+        passing = [(er, f) for er, f in zip(eval_results, proposals) if er.passed]
+        if not passing:
             return None
 
-        # Map keywords to factor templates
-        keyword_map = {
-            "momentum": "momentum_20d",
-            "rsi": "rsi_14",
-            "macd": "macd_signal",
-            "bollinger": "bb_pct",
-            "atr": "atr_pct",
-            "obv": "obv_momentum",
-            "volume": "volume_ratio",
-        }
-
-        matched_template: dict[str, str] | None = None
-        for keyword, template_name in keyword_map.items():
-            if keyword in text:
-                for tmpl in _FACTOR_TEMPLATES:
-                    if tmpl["name"] == template_name:
-                        matched_template = tmpl
-                        break
-                if matched_template:
-                    break
-
-        if matched_template is None:
-            # Fall back to a random template
-            matched_template = random.choice(_FACTOR_TEMPLATES)
-            logger.debug("No keyword match found; using random template '{}'.", matched_template["name"])
-
-        ic = self._simulate_ic()
-        if abs(ic) < min_ic:
-            logger.info(
-                "Paper-derived factor '{}' rejected (IC={:.4f} < {}).",
-                matched_template["name"],
-                ic,
-                min_ic,
-            )
-            return None
-
+        # Return best passing factor by stage2_ic or stage1_ic
+        best_er, best_factor = max(passing, key=lambda t: abs(t[0].stage2_ic if t[0].stage2_ic is not None else t[0].stage1_ic))
         factor = FactorDefinition(
-            name=f"paper_{matched_template['name']}",
-            expression=matched_template["expression"],
-            category=matched_template["category"],
-            ic_mean=ic,
-            icir=abs(ic) / 0.02,
-            source=f"paper:{file_path.name}",
-            description=f"Derived from local file: {file_path.name}",
+            name=f"paper_{best_factor.name}",
+            expression=best_factor.expression,
+            category=best_factor.category,
+            ic_mean=best_er.stage2_ic or best_er.stage1_ic,
+            icir=best_er.stage2_icir or 0.0,
+            source=f"paper:{Path(source).name}",
+            description=f"Derived from: {Path(source).name}",
         )
         self.save_factor_library([factor])
-        logger.info("implement_paper: factor '{}' accepted (IC={:.4f}).", factor.name, ic)
         return factor
 
     def library_status(self) -> dict[str, Any]:
@@ -786,79 +773,43 @@ class RDAgentRunner:
                 - ``best_ic``: best IC observed.
         """
         logger.info("copilot_factor: description='{}'", description)
-
-        text = description.lower()
-        min_ic = self.config.rd_agent.min_ic
-
-        keyword_map = {
-            "momentum": "momentum_20d",
-            "rsi": "rsi_14",
-            "macd": "macd_signal",
-            "bollinger": "bb_pct",
-            "atr": "atr_pct",
-            "obv": "obv_momentum",
-            "volume": "volume_ratio",
-        }
-
-        matched_templates: list[dict[str, str]] = []
-        for keyword, template_name in keyword_map.items():
-            if keyword in text:
-                for tmpl in _FACTOR_TEMPLATES:
-                    if tmpl["name"] == template_name:
-                        matched_templates.append(tmpl)
-                        break
-
-        if not matched_templates:
-            matched_templates = [random.choice(_FACTOR_TEMPLATES)]
-            logger.debug("No keyword match; using random template '{}'.", matched_templates[0]["name"])
-
         with self._file_lock:
             kb = self._load_kb()
+        memo = self._analyst.load_memo(kb)
+        tested_names = list(kb.get("tested_factors", []))
+
+        proposals = self._proposer.propose_factors(n=3, memo=memo, tested=tested_names, description=description)
+        eval_results = self._evaluator.evaluate_factors_batch(proposals)
 
         accepted: list[FactorDefinition] = []
         best_ic = 0.0
-
-        for tmpl in matched_templates:
-            ic = self._simulate_ic()
-            if abs(ic) >= min_ic:
+        for er, factor in zip(eval_results, proposals):
+            if er.passed:
                 factor = FactorDefinition(
-                    name=f"copilot_{tmpl['name']}",
-                    expression=tmpl["expression"],
-                    category=tmpl["category"],
-                    ic_mean=ic,
-                    icir=abs(ic) / 0.02,
-                    source="copilot",
-                    description=description,
+                    name=factor.name, expression=factor.expression,
+                    category=factor.category, ic_mean=er.stage2_ic or er.stage1_ic,
+                    icir=er.stage2_icir or 0.0, source="copilot", description=description,
                 )
                 accepted.append(factor)
-                kb["discoveries"].append(
-                    {"date": str(date.today()), "factor": factor.name, "ic": round(ic, 6)}
-                )
-                if abs(ic) > abs(best_ic):
-                    best_ic = ic
-                logger.info("copilot_factor: '{}' accepted (IC={:.4f}).", factor.name, ic)
-            else:
-                logger.debug(
-                    "copilot_factor: '{}' rejected (IC={:.4f} < {}).", tmpl["name"], ic, min_ic
-                )
+                kb["discoveries"].append({"date": str(date.today()), "factor": factor.name, "ic": round(er.stage2_ic or er.stage1_ic, 6)})
+                ic_for_best = er.stage2_ic if er.stage2_ic is not None else er.stage1_ic
+                if abs(ic_for_best) > abs(best_ic):
+                    best_ic = ic_for_best
 
         kb["last_run_date"] = str(date.today())
         with self._file_lock:
             self._save_kb(kb)
-
         if accepted:
             with self._file_lock:
                 self.save_factor_library(accepted)
 
-        result: dict[str, Any] = {
+        return {
             "description": description,
-            "factors_evaluated": len(matched_templates),
+            "factors_evaluated": len(proposals),
             "factors_accepted": len(accepted),
             "accepted": [f.model_dump() for f in accepted],
             "best_ic": round(best_ic, 6),
         }
-        logger.info("copilot_factor complete: {}", result)
-        return result
 
     def copilot_model(self, source: str) -> dict[str, Any]:
         """Build a model config from a paper/file description.
@@ -878,98 +829,26 @@ class RDAgentRunner:
                 - ``saved``: whether the config was persisted.
         """
         logger.info("copilot_model: source='{}'", source)
+        with self._file_lock:
+            kb = self._load_kb()
+        memo = self._analyst.load_memo(kb)
+        tested_configs: list[dict] = kb.get("tested_configs", [])
 
-        _stub = {
-            "source": source,
-            "model_name": "LightGBM",
-            "model_params": {},
-            "simulated_sharpe": 0.0,
-            "saved": False,
-        }
+        proposals = self._proposer.propose_model_config(n=1, memo=memo, tested=tested_configs)
+        if not proposals:
+            return {"source": source, "model_name": "LightGBM", "model_params": {}, "simulated_sharpe": 0.0, "saved": False}
 
-        # Remote sources: stub (no API keys for fetching)
-        if (
-            source.startswith("http")
-            or source.lower().startswith("arxiv")
-            or re.match(r"^\d{4}\.\d+", source)
-        ):
-            logger.warning(
-                "PDF/arXiv parsing not available without keys. Cannot fetch: '{}'", source
-            )
-            return _stub
-
-        file_path = Path(source)
-        if not file_path.exists():
-            logger.error("Source file not found: '{}'", source)
-            return _stub
-
-        try:
-            text = file_path.read_text(errors="ignore").lower()
-        except OSError as exc:
-            logger.error("Failed to read source file '{}': {}", source, exc)
-            return _stub
-
-        # Detect model type and build param config
-        if "lightgbm" in text or "gradient boost" in text or " gbm" in text:
-            model_name = "LightGBM"
-            params: dict[str, Any] = {
-                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
-                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
-                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
-                "num_leaves": random.choice(_PARAM_GRID["num_leaves"]),
-            }
-        elif "catboost" in text or "categorical" in text:
-            model_name = "CatBoost"
-            params = {
-                "iterations": random.choice([100, 200, 500]),
-                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
-                "depth": random.choice([4, 6, 8]),
-            }
-        elif "xgboost" in text or "extreme gradient" in text:
-            model_name = "XGBoost"
-            params = {
-                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
-                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
-                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
-            }
-        elif "lstm" in text or "recurrent" in text or " rnn" in text:
-            model_name = "LSTM"
-            params = {
-                "hidden_size": random.choice([64, 128, 256]),
-                "num_layers": random.choice([1, 2, 3]),
-                "dropout": random.choice([0.1, 0.2, 0.3]),
-            }
-        elif "transformer" in text or "attention" in text:
-            model_name = "Transformer"
-            params = {
-                "d_model": random.choice([64, 128, 256]),
-                "nhead": random.choice([4, 8]),
-                "num_layers": random.choice([2, 4, 6]),
-            }
-        else:
-            model_name = "LightGBM"
-            params = {
-                "n_estimators": random.choice(_PARAM_GRID["n_estimators"]),
-                "learning_rate": random.choice(_PARAM_GRID["learning_rate"]),
-                "max_depth": random.choice(_PARAM_GRID["max_depth"]),
-                "num_leaves": random.choice(_PARAM_GRID["num_leaves"]),
-            }
-
+        proposal = proposals[0]
+        params = {"n_estimators": proposal.n_estimators, "learning_rate": proposal.learning_rate,
+                  "max_depth": proposal.max_depth, "num_leaves": proposal.num_leaves}
         sharpe = random.gauss(1.0, 0.3)
         saved = False
         if sharpe > 0.5:
-            self.save_model_config({"model": model_name, **params})
+            self.save_model_config({"model": proposal.model_type, **params})
             saved = True
 
-        result: dict[str, Any] = {
-            "source": source,
-            "model_name": model_name,
-            "model_params": params,
-            "simulated_sharpe": round(sharpe, 4),
-            "saved": saved,
-        }
-        logger.info("copilot_model: model={}, sharpe={:.4f}, saved={}", model_name, sharpe, saved)
-        return result
+        return {"source": source, "model_name": proposal.model_type, "model_params": params,
+                "simulated_sharpe": round(sharpe, 4), "saved": saved}
 
     def reset_knowledge(self) -> None:
         """Clear the knowledge base by writing an empty KB structure to disk.
@@ -1208,50 +1087,17 @@ class RDAgentRunner:
         Returns:
             Strategy dict with backtest results, or error dict on failure.
         """
-        logger.info("Running strategy copilot for: {}", description)
-
-        if not self._rd_agent_available:
-            logger.warning(
-                "RD-Agent not installed. Using keyword-based strategy parser."
-            )
-
-        try:
-            # Derive a safe strategy name from description
-            safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower())[:40].strip("_")
-            strategy_name = f"copilot_{safe_name}"
-
-            strategy = self._build_strategy_from_keywords(
-                name=strategy_name,
-                description=description,
-            )
-
-            # Simulate backtest
-            backtest_sharpe = self._simulate_backtest_sharpe()
-            backtest_max_drawdown = round(random.uniform(-0.25, -0.05), 4)
-            min_sharpe = getattr(self.config, "strategy", None)
-            min_sharpe = min_sharpe.min_backtest_sharpe if min_sharpe is not None else 0.5
-            validated = backtest_sharpe >= min_sharpe
-
-            strategy.backtest_sharpe = round(backtest_sharpe, 4)
-            strategy.backtest_max_drawdown = backtest_max_drawdown
-            strategy.validated = validated
-
-            # Save regardless of validation result (user explicitly requested it)
-            with self._file_lock:
-                self._save_strategy(strategy)
-
-            result = strategy.model_dump(mode="json")
-            logger.info(
-                "copilot_strategy: strategy '{}' created (Sharpe={:.4f}, validated={}).",
-                strategy_name,
-                backtest_sharpe,
-                validated,
-            )
-            return result
-
-        except Exception as exc:  # noqa: BLE001
-            logger.error("copilot_strategy failed: {}", exc)
-            return {"error": str(exc), "description": description}
+        logger.info("copilot_strategy: description='{}'", description)
+        with self._file_lock:
+            kb = self._load_kb()
+        memo = self._analyst.load_memo(kb)
+        strategy = self._proposer.propose_strategy(description=description, memo=memo)
+        sharpe = self._simulate_backtest_sharpe()
+        strategy.backtest_sharpe = sharpe
+        strategy.validated = sharpe > 0.5
+        if strategy.validated:
+            self._save_strategy(strategy)
+        return strategy.model_dump(mode="json")
 
     # ------------------------------------------------------------------
     # Regime evolution and copilot
@@ -1399,94 +1245,8 @@ class RDAgentRunner:
         Returns:
             Dict with change details and simulated performance impact.
         """
-        from src.utils.schemas import RegimeEvolutionResult
-
-        logger.info("Running regime copilot for: {}", description)
-        desc_lower = description.lower()
-
-        # Parse keywords → change dict
-        change_type = "add_signal"
-        change_params: dict[str, str | int | float] = {}
-
-        if "add" in desc_lower or "include" in desc_lower:
-            change_type = "add_signal"
-            # Extract signal name (everything after "add" or "include")
-            for keyword in ["put_call", "put/call", "copper", "copper/gold", "credit"]:
-                if keyword in desc_lower:
-                    change_params["signal"] = keyword.replace("/", "_").replace(" ", "_")
-                    break
-            if not change_params:
-                # Fallback: extract the last word in the description as signal name
-                words = re.sub(r"[^a-z0-9_ ]", "", desc_lower).split()
-                change_params["signal"] = words[-1] if words else "new_signal"
-
-        elif "remove" in desc_lower or "drop" in desc_lower:
-            change_type = "remove_signal"
-            for sig in ["dxy", "vix_roc", "credit_spread", "sp500_breadth"]:
-                if sig in desc_lower:
-                    change_params["signal"] = sig
-                    break
-            if not change_params:
-                change_params["signal"] = "dxy_roc_20d"
-
-        elif "state" in desc_lower or "states" in desc_lower:
-            change_type = "change_states"
-            # Extract integer from description
-            numbers = re.findall(r"\b(\d+)\b", description)
-            n_states = int(numbers[0]) if numbers else 4
-            change_params["n_states"] = n_states
-
-        elif "threshold" in desc_lower or "confidence" in desc_lower:
-            change_type = "change_threshold"
-            numbers = re.findall(r"\b(0\.\d+)\b", description)
-            threshold = float(numbers[0]) if numbers else 0.8
-            change_params["confidence_threshold"] = threshold
-
-        elif "window" in desc_lower or "normaliz" in desc_lower:
-            change_type = "change_window"
-            numbers = re.findall(r"\b(\d+)\b", description)
-            window = int(numbers[0]) if numbers else 126
-            change_params["normalization_window"] = window
-
-        # Simulate evaluation
-        baseline_sharpe = self._simulate_backtest_sharpe()
-        modified_sharpe = self._simulate_backtest_sharpe()
-        improvement = modified_sharpe - baseline_sharpe
-        accepted = modified_sharpe > baseline_sharpe
-
-        # Determine signals_used and n_states
-        current_signals = self.config.macro_regime.signals if hasattr(self.config, "macro_regime") else [
-            "vix_level", "vix_roc_10d", "yield_curve_10y2y", "sp500_breadth",
-            "sp500_realized_vol_20d", "sp500_momentum_20d", "dxy_roc_20d", "credit_spread_proxy",
-        ]
-        signals_used = list(current_signals)
-        n_states = 4
-
-        if change_type == "add_signal":
-            new_sig = str(change_params.get("signal", ""))
-            if new_sig and new_sig not in signals_used:
-                signals_used.append(new_sig)
-        elif change_type == "remove_signal":
-            rm_sig = str(change_params.get("signal", ""))
-            signals_used = [s for s in signals_used if s != rm_sig]
-        elif change_type == "change_states":
-            n_states = int(change_params.get("n_states", 4))
-
-        result = RegimeEvolutionResult(
-            iteration=0,
-            change_description=f"{change_type}: {change_params}",
-            baseline_sharpe=round(baseline_sharpe, 4),
-            modified_sharpe=round(modified_sharpe, 4),
-            improvement=round(improvement, 4),
-            accepted=accepted,
-            signals_used=signals_used,
-            n_states=n_states,
-        )
-
-        logger.info(
-            "copilot_regime: change='{}', accepted={}, improvement={:.4f}",
-            result.change_description,
-            accepted,
-            improvement,
-        )
-        return result.model_dump(mode="json")
+        logger.info("copilot_regime: description='{}'", description)
+        with self._file_lock:
+            kb = self._load_kb()
+        memo = self._analyst.load_memo(kb)
+        return self._proposer.propose_regime_change(description=description, memo=memo)
