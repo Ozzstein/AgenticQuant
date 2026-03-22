@@ -291,3 +291,29 @@ class TestWeightsIntrospection:
         """get_weights() before train returns empty dict."""
         e = EnsembleModel(model_names=["Linear"], weighting="equal")
         assert e.get_weights() == {}
+
+
+# ---------------------------------------------------------------------------
+# Integration — WalkForwardBacktester
+# ---------------------------------------------------------------------------
+
+
+class TestBacktesterIntegration:
+    def test_ensemble_with_walk_forward_backtester(self):
+        """EnsembleModel works as drop-in for WalkForwardBacktester.run()."""
+        X, y = _make_data(n=300, p=5)
+        # Add a date index for the backtester
+        dates = pd.date_range("2022-01-01", periods=300, freq="B")
+        X.index = dates
+        y.index = dates
+
+        ensemble = EnsembleModel(
+            model_names=["Linear"],  # single model for speed
+            weighting="equal",
+        )
+
+        from src.core.backtester import WalkForwardBacktester
+        bt = WalkForwardBacktester()
+        result = bt.run(X, y, model=ensemble, topk=5)
+
+        assert result.metrics.sharpe_ratio is not None

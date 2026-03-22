@@ -50,7 +50,7 @@ def backtest(
     """Run walk-forward backtest with validation and benchmarks."""
     from src.core.backtester import WalkForwardBacktester
     from src.core.data_pipeline import DataPipeline
-    from src.core.model_zoo import ModelWrapper
+    from src.core.ensemble import create_model
     from src.utils.config import get_config
 
     config = get_config()
@@ -58,7 +58,7 @@ def backtest(
 
     pipeline = DataPipeline(config)
     backtester = WalkForwardBacktester(config)
-    model_wrapper = ModelWrapper(model, config)
+    model_wrapper = create_model(model, config)
 
     features, labels = pipeline.get_features(start, end)
     result = backtester.run(features, labels, model_wrapper, topk=topk)
