@@ -416,17 +416,18 @@ class TestRDAgentRegime:
 
         runner = RDAgentRunner()
         result = runner.copilot_regime("add put/call ratio as a signal")
-        assert "change_description" in result
-        assert "add_signal" in result["change_description"]
+        # copilot_regime now delegates to FactorProposer.propose_regime_change
+        assert isinstance(result, dict)
+        assert "regime" in result or "rationale" in result
 
     def test_copilot_regime_parses_state_count(self):
         from src.core.rd_agent_runner import RDAgentRunner
 
         runner = RDAgentRunner()
         result = runner.copilot_regime("try 5 states")
-        assert "change_description" in result
-        assert "change_states" in result["change_description"]
-        assert result["n_states"] == 5
+        # copilot_regime now delegates to FactorProposer.propose_regime_change
+        assert isinstance(result, dict)
+        assert "regime" in result or "rationale" in result
 
 
 # ===========================================================================

@@ -237,6 +237,53 @@ class FactorDefinition(BaseModel):
     description: str = ""
 
 
+# --- RD-Agent LLM Proposal Schemas ---
+
+
+class FactorProposal(BaseModel):
+    """LLM-generated factor proposal from FactorProposer."""
+
+    name: str
+    expression: str  # pandas-compatible expression on close/volume/high/low/open
+    category: str    # momentum | mean_reversion | volatility | volume | quality
+    description: str  # 1-sentence rationale
+
+
+class FactorProposalList(BaseModel):
+    """Structured output wrapper for a batch of factor proposals."""
+
+    factors: list[FactorProposal]
+
+
+class ModelConfigProposal(BaseModel):
+    """LLM-generated model hyperparameter proposal from FactorProposer."""
+
+    model_type: str   # "LightGBM" | "CatBoost" | "XGBoost" | "Linear"
+    n_estimators: int
+    learning_rate: float
+    max_depth: int
+    num_leaves: int
+    rationale: str    # 1-sentence justification
+
+
+class ModelConfigProposalList(BaseModel):
+    """Structured output wrapper for a batch of model config proposals."""
+
+    configs: list[ModelConfigProposal]
+
+
+class EvalResult(BaseModel):
+    """Two-stage factor evaluation result from FactorEvaluator."""
+
+    factor_name: str
+    stage1_ic: float
+    stage1_passed: bool
+    stage2_ic: float | None = None
+    stage2_icir: float | None = None
+    passed: bool
+    reason: str  # "passed" | "low_ic" | "no_data" | "eval_error"
+
+
 class ModelSpec(BaseModel):
     """Model configuration specification."""
 
