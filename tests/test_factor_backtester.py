@@ -445,3 +445,49 @@ def test_load_kb_error_recovery_does_not_mutate_empty_kb(tmp_path):
     finally:
         rdmod._KB_PATH = original_kb_path
         rdmod._KB_DIR = original_kb_dir
+
+
+# ---------------------------------------------------------------------------
+# Task 4: ResearchAnalyst format test
+# ---------------------------------------------------------------------------
+
+def test_research_analyst_memo_format_with_backtest():
+    """_format_results_table() includes bt_sharpe column when bt_results dict provided."""
+    from src.core.research_analyst import ResearchAnalyst
+    from src.utils.schemas import BacktestValidationResult, EvalResult
+
+    results = [
+        EvalResult(
+            factor_name="good_factor",
+            stage1_ic=0.05,
+            stage1_passed=True,
+            stage2_ic=0.04,
+            stage2_icir=0.6,
+            passed=True,
+            reason="passed",
+        ),
+        EvalResult(
+            factor_name="bad_factor",
+            stage1_ic=0.001,
+            stage1_passed=False,
+            passed=False,
+            reason="low_ic",
+        ),
+    ]
+    bt_results = {
+        "good_factor": BacktestValidationResult(
+            factor_name="good_factor",
+            passed=True,
+            sharpe=1.23,
+            reason="passed",
+        )
+    }
+
+    table = ResearchAnalyst._format_results_table(results, bt_results=bt_results)
+
+    # Column header
+    assert "bt_sharpe" in table, f"Expected 'bt_sharpe' column in table:\n{table}"
+    # Good factor has sharpe value
+    assert "1.2300" in table, f"Expected Sharpe '1.2300' in table:\n{table}"
+    # Bad factor (IC-failed, not in bt_results) has em-dash
+    assert "—" in table, f"Expected '—' for IC-failed factor:\n{table}"
