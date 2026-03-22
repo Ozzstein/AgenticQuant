@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import yaml
 from pydantic import BaseModel, Field
 
 # Re-export everything from src.utils.config so both import paths work.
@@ -31,6 +32,7 @@ class RDAgentConfig(BaseModel):
     factor_iterations: int = 50
     min_ic: float = 0.02
     min_icir: float = 0.3
+    min_backtest_sharpe: float = 0.5
     budget: int = 10
     model_iterations: int = 20
     schedule: str = "weekly"
@@ -45,10 +47,17 @@ class FullAppConfig(AppConfig):
 @lru_cache(maxsize=1)
 def get_full_config() -> FullAppConfig:
     """Get singleton FullAppConfig (extends AppConfig with RDAgentConfig)."""
-    # Reuse all loading logic from get_config()
     base = get_config()
-    # Build FullAppConfig from the base config's data
     data = base.model_dump()
+
+    # Re-read YAML to pick up rd_agent block — AppConfig drops unknown keys
+    yaml_path = PROJECT_ROOT / "config" / "settings.yaml"
+    if yaml_path.exists():
+        with open(yaml_path) as _f:
+            yaml_data: dict = yaml.safe_load(_f) or {}
+        if "rd_agent" in yaml_data:
+            data["rd_agent"] = yaml_data["rd_agent"]
+
     return FullAppConfig(**data)
 
 

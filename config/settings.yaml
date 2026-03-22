@@ -38,3 +38,6 @@ monitoring:
 strategy:
   selection_method: regime_based
   default_strategy: momentum_topk
+
+rd_agent:
+  min_backtest_sharpe: 0.5

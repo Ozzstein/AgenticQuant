@@ -211,6 +211,10 @@ def get_config() -> AppConfig:
     _load_dotenv(config_dir / ".env")
 
     yaml_data = _load_yaml_config(config_dir / "settings.yaml")
+    # Strip keys unknown to AppConfig so rd_agent (and any future FullAppConfig-only
+    # sections) do not cause extra-field validation errors.
+    known_fields = set(AppConfig.model_fields)
+    yaml_data = {k: v for k, v in yaml_data.items() if k in known_fields}
     return AppConfig(**yaml_data)
 
 
