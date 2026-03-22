@@ -159,6 +159,18 @@ class MacroRegimeConfig(BaseModel):
     ])
 
 
+class AlpacaConfig(BaseModel):
+    """Alpaca broker configuration."""
+
+    enabled: bool = False
+    api_key: str = ""
+    api_secret: str = ""
+    paper: bool = True         # True = paper-api.alpaca.markets; False = live (gated)
+    base_url: str = ""         # Override URL (empty = auto from paper flag)
+    max_retries: int = 3
+    timeout_seconds: int = 30
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -183,6 +195,7 @@ class AppConfig(BaseSettings):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     macro_regime: MacroRegimeConfig = Field(default_factory=MacroRegimeConfig)
+    alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
 
     @field_validator("log_level")
     @classmethod

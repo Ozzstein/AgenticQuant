@@ -8,6 +8,13 @@ import pytest
 
 from src.execution.broker import BaseBroker, compute_broker_metrics
 from src.execution.paper_trader import PaperTrader
+from src.utils.config import AlpacaConfig, AppConfig, reset_config
+from src.utils.exceptions import (
+    AlpacaConnectionError,
+    AlpacaError,
+    AlpacaOrderError,
+    ExecutionError,
+)
 
 
 class TestBaseBrokerProtocol:
@@ -116,3 +123,49 @@ class TestBaseBrokerProtocol:
         actual = trader.get_metrics()
 
         assert actual == expected, "PaperTrader.get_metrics() must delegate to compute_broker_metrics"
+
+
+class TestAlpacaConfig:
+    """Tests for AlpacaConfig model and its integration with AppConfig."""
+
+    def test_alpaca_config_defaults(self) -> None:
+        """AlpacaConfig() has the expected default values."""
+        cfg = AlpacaConfig()
+        assert cfg.enabled is False
+        assert cfg.paper is True
+        assert cfg.api_key == ""
+        assert cfg.max_retries == 3
+        assert cfg.timeout_seconds == 30
+
+    def test_alpaca_config_in_app_config(self) -> None:
+        """AppConfig().alpaca is an AlpacaConfig instance."""
+        app_cfg = AppConfig()
+        assert isinstance(app_cfg.alpaca, AlpacaConfig)
+
+    def test_alpaca_config_from_env(self, monkeypatch) -> None:
+        """Env vars AIQUANT_ALPACA__API_KEY and AIQUANT_ALPACA__ENABLED are picked up."""
+        monkeypatch.setenv("AIQUANT_ALPACA__API_KEY", "test123")
+        monkeypatch.setenv("AIQUANT_ALPACA__ENABLED", "true")
+        reset_config()
+        try:
+            app_cfg = AppConfig()
+            assert app_cfg.alpaca.api_key == "test123"
+            assert app_cfg.alpaca.enabled is True
+        finally:
+            reset_config()
+
+    def test_alpaca_exceptions_hierarchy(self) -> None:
+        """AlpacaError, AlpacaConnectionError, AlpacaOrderError all inherit from ExecutionError."""
+        assert issubclass(AlpacaError, ExecutionError)
+        assert issubclass(AlpacaConnectionError, AlpacaError)
+        assert issubclass(AlpacaConnectionError, ExecutionError)
+        assert issubclass(AlpacaOrderError, AlpacaError)
+        assert issubclass(AlpacaOrderError, ExecutionError)
+
+    def test_alpaca_config_from_yaml(self) -> None:
+        """AppConfig loads alpaca section from settings.yaml with enabled=False."""
+        # get_config() reads settings.yaml which sets alpaca.enabled: false
+        from src.utils.config import get_config
+        app_cfg = get_config()
+        assert app_cfg.alpaca.enabled is False
+        assert app_cfg.alpaca.paper is True

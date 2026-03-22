@@ -44,3 +44,7 @@ strategy:
 
 rd_agent:
   min_backtest_sharpe: 0.5
+
+alpaca:
+  enabled: false
+  paper: true

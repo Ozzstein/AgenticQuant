@@ -51,3 +51,15 @@ class RiskBreachError(ExecutionError):
 
 class OrderError(ExecutionError):
     """Order submission or lifecycle error."""
+
+
+class AlpacaError(ExecutionError):
+    """Base error for Alpaca operations."""
+
+
+class AlpacaConnectionError(AlpacaError):
+    """Alpaca API connection/auth failure."""
+
+
+class AlpacaOrderError(AlpacaError):
+    """Alpaca order submission or fill error."""
