@@ -213,7 +213,7 @@ def test_factor_proposer_llm_failure_falls_back():
         proposer._llm_propose_factors.retry.wait = wait_none()
         results = proposer.propose_factors(n=2, memo="", tested=[], description="")
 
-    assert len(results) >= 1
+    assert len(results) == 2
     assert all(isinstance(r, FactorDefinition) for r in results)
 
 

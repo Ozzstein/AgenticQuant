@@ -198,7 +198,14 @@ class FactorProposer:
             {"role": "user", "content": user_msg},
         ])
         # Deduplicate against tested list
-        return [p for p in result.factors if p.name not in tested]
+        filtered = [p for p in result.factors if p.name not in tested]
+        if len(filtered) < n:
+            logger.warning(
+                "FactorProposer: LLM returned {}/{} non-duplicate factors; supplementing with fallback.",
+                len(filtered),
+                n,
+            )
+        return filtered
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def _llm_propose_model_config(
