@@ -236,7 +236,7 @@ def _run_pipeline(
 
 @app.command()
 def run(
-    model: str = typer.Option("LightGBM", help="Model name (LightGBM, Linear, CatBoost, XGBoost)"),
+    model: str = typer.Option("LightGBM", help="Model name (LightGBM, Linear, CatBoost, XGBoost, Ensemble)"),
     topk: int = typer.Option(30, help="Top-K tickers to select per period"),
     start: str = typer.Option("2022-01-01", help="Start date (YYYY-MM-DD)"),
     end: str = typer.Option("2023-12-31", help="End date (YYYY-MM-DD)"),
@@ -315,7 +315,7 @@ def compare(
             --topk 10 --start 2022-01-01 --end 2023-06-30
     """
     model_list = [m.strip() for m in models.split(",") if m.strip()]
-    if ensemble:
+    if ensemble and "Ensemble" not in model_list:
         model_list.append("Ensemble")
     if not model_list:
         logger.error("No models specified.")
