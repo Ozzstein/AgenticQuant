@@ -118,7 +118,7 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
     from src.core.data_pipeline import DataPipeline
     from src.core.strategy_selector import StrategySelector
     from src.core.strategy_tracker import StrategyTracker
-    from src.execution.paper_trader import PaperTrader
+    from src.execution.broker import create_broker
     from src.execution.risk_controls import check_order
     from src.execution.signal_translator import signals_to_orders
     from src.utils.audit import AuditLogger
@@ -305,15 +305,10 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
         # ------------------------------------------------------------------
         # Step 7: Build portfolio and trader
         # ------------------------------------------------------------------
-        initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
-        paper_trader = PaperTrader(
-            initial_cash=initial_cash,
-            slippage_bps=5,
-            commission_per_share=0.005,
-        )
+        broker = create_broker(config)
 
         # Convert to Portfolio for signal_translator / risk_controls
-        portfolio = paper_trader.portfolio
+        portfolio = broker.portfolio
 
         # Capture portfolio state before trading
         audit.log_portfolio_state("before", portfolio)
@@ -341,7 +336,7 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
                 )
                 continue
             try:
-                filled = paper_trader.execute_order(order, market_prices)
+                filled = broker.execute_order(order, market_prices)
                 if filled is not None:
                     orders_placed += 1
                     fill_price = filled.fill_price or market_prices.get(order.ticker, 0.0)
@@ -369,8 +364,8 @@ def _run_pipeline_once(mode: str, strategy: str = "auto") -> dict:
         # ------------------------------------------------------------------
         # Step 10: Snapshot
         # ------------------------------------------------------------------
-        paper_trader.snapshot(market_prices)
-        final_portfolio = paper_trader.portfolio
+        broker.snapshot(market_prices)
+        final_portfolio = broker.portfolio
 
         # Capture portfolio state after trading
         audit.log_portfolio_state("after", final_portfolio)

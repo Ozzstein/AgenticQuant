@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 
 from src.utils.schemas import Order, OrderSide, Portfolio
+
+if TYPE_CHECKING:
+    from src.utils.config import AppConfig
 
 
 @runtime_checkable
@@ -161,3 +164,40 @@ def compute_broker_metrics(
         "avg_loss": avg_loss,
         "profit_factor": profit_factor,
     }
+
+
+def create_broker(config: AppConfig | None = None) -> BaseBroker:
+    """Create a broker based on config.
+
+    Returns AlpacaTrader if alpaca.enabled=True, else PaperTrader.
+    AlpacaTrader lazy-imports alpaca-py — users without it won't see an error
+    unless alpaca.enabled=True.
+
+    Args:
+        config: Application config. Uses get_config() singleton if None.
+
+    Returns:
+        A broker conforming to BaseBroker protocol.
+
+    Raises:
+        ImportError: If alpaca.enabled=True but alpaca-py is not installed.
+        AlpacaError: If live trading gate fails (paper=False without AIQUANT_ALPACA_LIVE=true).
+    """
+    from src.execution.paper_trader import PaperTrader
+    from src.utils.config import get_config
+
+    if config is None:
+        config = get_config()
+
+    if config.alpaca.enabled:
+        try:
+            from src.execution.alpaca_trader import AlpacaTrader
+        except ImportError as exc:
+            raise ImportError(
+                "alpaca-py is required for Alpaca trading. "
+                "Install with: pip install -e '.[alpaca]'"
+            ) from exc
+        return AlpacaTrader(config.alpaca)
+
+    initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
+    return PaperTrader(initial_cash=initial_cash, slippage_bps=5, commission_per_share=0.005)

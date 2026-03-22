@@ -114,22 +114,34 @@ def analyze(
 @app.command()
 def trade(
     action: str = typer.Argument("status", help="Action: status, run, reset"),
+    broker_type: str = typer.Option("auto", "--broker", "-b", help="Broker type: auto, paper, alpaca"),
 ):
-    """Paper trading operations."""
+    """Paper/live trading operations."""
+    from src.execution.broker import create_broker
     from src.execution.paper_trader import PaperTrader
     from src.utils.config import get_config
 
     config = get_config()
-    trader = PaperTrader(config)
+
+    if broker_type == "paper":
+        broker = PaperTrader(
+            initial_cash=config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0,
+            slippage_bps=5,
+            commission_per_share=0.005,
+        )
+    elif broker_type == "alpaca":
+        from src.execution.alpaca_trader import AlpacaTrader
+
+        broker = AlpacaTrader(config.alpaca)
+    else:  # auto
+        broker = create_broker(config)
 
     if action == "status":
-        portfolio = trader.get_portfolio()
+        portfolio = broker.portfolio
+        console.print(f"[green]Broker:[/green] {type(broker).__name__}")
         console.print(f"[green]NAV:[/green] ${portfolio.nav:,.2f}")
         console.print(f"[green]Cash:[/green] ${portfolio.cash:,.2f}")
         console.print(f"[green]Positions:[/green] {len(portfolio.positions)}")
-    elif action == "reset":
-        trader.reset()
-        console.print("[yellow]Paper portfolio reset.[/yellow]")
     else:
         console.print(f"[red]Unknown action: {action}[/red]")
 
