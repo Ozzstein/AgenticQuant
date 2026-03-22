@@ -6,9 +6,9 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 from loguru import logger
 
+from src.execution.broker import compute_broker_metrics
 from src.utils.exceptions import OrderError
 from src.utils.schemas import (
     AssetClass,
@@ -125,6 +125,9 @@ class PaperTrader:
     def get_metrics(self) -> dict:
         """Compute portfolio performance metrics from NAV history.
 
+        Delegates to ``compute_broker_metrics`` so that all broker
+        implementations share identical metric logic.
+
         Returns a dict with keys: ``total_return``, ``annualized_return``,
         ``sharpe``, ``sortino``, ``max_drawdown``, ``calmar``, ``volatility``,
         ``win_rate``, ``avg_win``, ``avg_loss``, ``profit_factor``.
@@ -134,80 +137,7 @@ class PaperTrader:
         Returns:
             Dictionary mapping metric name to float value.
         """
-        zeros: dict = {
-            "total_return": 0.0,
-            "annualized_return": 0.0,
-            "sharpe": 0.0,
-            "sortino": 0.0,
-            "max_drawdown": 0.0,
-            "calmar": 0.0,
-            "volatility": 0.0,
-            "win_rate": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "profit_factor": 0.0,
-        }
-        if len(self._nav_history) < 2:
-            return zeros
-
-        navs = np.array([nav for _, nav in self._nav_history], dtype=float)
-        returns = np.diff(navs) / navs[:-1]
-
-        total_return = float((navs[-1] - navs[0]) / navs[0])
-        n = max(len(returns), 1)
-        annualized_return = float((1.0 + total_return) ** (252.0 / n) - 1.0)
-
-        vol = float(np.std(returns, ddof=1) * np.sqrt(252)) if len(returns) > 1 else 0.0
-        rf = 0.04
-        sharpe = float((annualized_return - rf) / vol) if vol != 0.0 else 0.0
-
-        downside = returns[returns < 0]
-        if len(downside) > 1:
-            downside_vol = float(np.std(downside, ddof=1) * np.sqrt(252))
-        elif len(downside) == 1:
-            downside_vol = float(abs(downside[0]) * np.sqrt(252))
-        else:
-            downside_vol = 0.0
-        sortino = float((annualized_return - rf) / downside_vol) if downside_vol != 0.0 else 0.0
-
-        # Max drawdown
-        running_max = np.maximum.accumulate(navs)
-        drawdowns = (navs - running_max) / running_max
-        max_drawdown = float(np.min(drawdowns))
-
-        calmar = float(annualized_return / abs(max_drawdown)) if max_drawdown != 0.0 else 0.0
-
-        # Trade-level stats (sell trades only)
-        sell_pnls = [t["pnl"] for t in self._trade_log if t.get("side") == OrderSide.BUY.value
-                     # pnl is stored on sell trades; skip buys
-                     and False]
-        sell_pnls = [t["pnl"] for t in self._trade_log if t.get("side") == OrderSide.SELL.value]
-
-        if sell_pnls:
-            wins = [p for p in sell_pnls if p > 0]
-            losses = [p for p in sell_pnls if p <= 0]
-            win_rate = float(len(wins) / len(sell_pnls))
-            avg_win = float(np.mean(wins)) if wins else 0.0
-            avg_loss = float(np.mean(losses)) if losses else 0.0
-            gross_profit = sum(wins)
-            gross_loss = abs(sum(losses))
-            profit_factor = float(gross_profit / gross_loss) if gross_loss != 0.0 else 0.0
-        else:
-            win_rate = avg_win = avg_loss = profit_factor = 0.0
-
-        return {
-            "total_return": total_return,
-            "annualized_return": annualized_return,
-            "sharpe": sharpe,
-            "sortino": sortino,
-            "max_drawdown": max_drawdown,
-            "calmar": calmar,
-            "volatility": vol,
-            "win_rate": win_rate,
-            "avg_win": avg_win,
-            "avg_loss": avg_loss,
-            "profit_factor": profit_factor,
-        }
+        return compute_broker_metrics(self._nav_history, self._trade_log)
 
     def trade_log_to_csv(self, path: Path) -> None:
         """Write the trade log to a CSV file.

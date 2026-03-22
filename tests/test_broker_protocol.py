@@ -85,3 +85,34 @@ class TestBaseBrokerProtocol:
         assert result["max_drawdown"] == pytest.approx(0.0, abs=1e-9), (
             "Max drawdown should be 0 for monotonically growing NAV"
         )
+
+    def test_compute_broker_metrics_trade_stats(self) -> None:
+        """compute_broker_metrics correctly computes win_rate, avg_win, avg_loss, profit_factor."""
+        nav = [(datetime(2024, 1, i), 100_000.0 + i * 100) for i in range(1, 11)]
+        trade_log = [
+            {"side": "SELL", "pnl": 500.0},
+            {"side": "SELL", "pnl": -200.0},
+            {"side": "SELL", "pnl": 300.0},
+        ]
+        metrics = compute_broker_metrics(nav, trade_log)
+
+        assert metrics["win_rate"] == pytest.approx(2 / 3), (
+            "win_rate should be 2/3 with two wins and one loss"
+        )
+        assert metrics["avg_win"] > 0, "avg_win should be positive"
+        assert metrics["avg_loss"] < 0, "avg_loss should be negative"
+        assert metrics["profit_factor"] > 0, "profit_factor should be positive"
+
+    def test_get_metrics_delegates_to_compute_broker_metrics(self) -> None:
+        """PaperTrader.get_metrics() must return the same result as compute_broker_metrics."""
+        from src.execution.broker import compute_broker_metrics
+
+        trader = PaperTrader(initial_cash=100_000.0)
+        base = datetime(2024, 1, 1)
+        for i in range(5):
+            trader._nav_history.append((base + timedelta(days=i), 100_000.0 + i * 200.0))
+
+        expected = compute_broker_metrics(trader._nav_history, trader._trade_log)
+        actual = trader.get_metrics()
+
+        assert actual == expected, "PaperTrader.get_metrics() must delegate to compute_broker_metrics"
