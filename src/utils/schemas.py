@@ -235,6 +235,10 @@ class FactorDefinition(BaseModel):
     icir: float = 0.0
     source: str = "builtin"
     description: str = ""
+    # Backtest fields — populated only after FactorBacktester.validate() passes
+    backtest_sharpe: float | None = None
+    backtest_max_drawdown: float | None = None
+    validation_checks: dict[str, bool] | None = None
 
 
 # --- RD-Agent LLM Proposal Schemas ---
@@ -282,6 +286,18 @@ class EvalResult(BaseModel):
     stage2_icir: float | None = None
     passed: bool
     reason: str  # "passed" | "low_ic" | "no_data" | "eval_error"
+
+
+class BacktestValidationResult(BaseModel):
+    """Walk-forward backtest gate result from FactorBacktester."""
+
+    factor_name: str
+    passed: bool
+    sharpe: float | None = None
+    max_drawdown: float | None = None
+    checks: dict[str, bool] = Field(default_factory=dict)
+    reason: str = ""  # "passed" | "low_sharpe" | "overfitting" | "look_ahead_bias"
+                      # | "backtest_rejected" | "eval_error" | "no_data" | "backtest_error"
 
 
 class ModelSpec(BaseModel):

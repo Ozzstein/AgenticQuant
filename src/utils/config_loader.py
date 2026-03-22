@@ -31,6 +31,7 @@ class RDAgentConfig(BaseModel):
     factor_iterations: int = 50
     min_ic: float = 0.02
     min_icir: float = 0.3
+    min_backtest_sharpe: float = 0.5
     budget: int = 10
     model_iterations: int = 20
     schedule: str = "weekly"
