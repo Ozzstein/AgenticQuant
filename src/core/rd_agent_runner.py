@@ -8,6 +8,7 @@ parameters, and maintains a persistent knowledge base in
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import re
@@ -156,7 +157,7 @@ class RDAgentRunner:
             discoveries, last_run_date.
         """
         if not _KB_PATH.exists():
-            return dict(_EMPTY_KB)  # shallow copy of defaults
+            return copy.deepcopy(_EMPTY_KB)
         try:
             with _KB_PATH.open() as fh:
                 kb = json.load(fh)
@@ -447,7 +448,7 @@ class RDAgentRunner:
             memo = self._analyst.load_memo(kb)
             batch_size = self.config.rd_agent.budget
             proposals = self._proposer.propose_factors(
-                n=batch_size, memo=memo, tested=tested_names
+                n=batch_size, memo=memo, tested=tested_names, description=""
             )
             eval_results = self._evaluator.evaluate_factors_batch(proposals)
 
@@ -638,7 +639,9 @@ class RDAgentRunner:
         logger.info("implement_paper: source='{}'", source)
 
         # Remote sources (URLs, arXiv IDs) are not supported — warn and return None
-        if source.startswith("http") or source.lower().startswith("arxiv") or re.match(r"^\d{4}\.\d+", source):
+        if (source.startswith("http") or source.lower().startswith("arxiv")
+                or re.match(r"^\d{4}\.\d+", source)
+                or re.match(r"^[a-zA-Z\-]+/\d{7}", source)):
             logger.warning(
                 "PDF/arXiv parsing not available. Cannot fetch remote source: '{}'", source
             )
@@ -818,7 +821,7 @@ class RDAgentRunner:
         hyperparameter config, simulates a Sharpe ratio, and saves if above threshold.
 
         Args:
-            source: URL, arXiv ID, or local file path describing a model architecture.
+            source: Informational label for the config origin (logged only; not fetched).
 
         Returns:
             Dict with keys:
@@ -858,7 +861,7 @@ class RDAgentRunner:
         """
         _KB_DIR.mkdir(parents=True, exist_ok=True)
         with _KB_PATH.open("w") as fh:
-            json.dump(dict(_EMPTY_KB), fh, indent=2)
+            json.dump(copy.deepcopy(_EMPTY_KB), fh, indent=2)
         logger.info("Knowledge base reset. All prior discoveries cleared.")
 
     # ------------------------------------------------------------------

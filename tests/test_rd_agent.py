@@ -543,7 +543,8 @@ def test_runner_mine_factors_calls_all_components():
     assert mock_proposer.propose_factors.called
     assert mock_evaluator.evaluate_factors_batch.called
     assert mock_analyst.write_memo.called
-    assert len(results) >= 0  # May be 0 if factor did not pass (valid)
+    assert mock_analyst.save_memo.called
+    assert isinstance(results, list)  # Valid result is always a list (may be empty)
 
 
 def test_runner_library_status_returns_dict():
@@ -616,18 +617,27 @@ def test_runner_copilot_factor():
     assert "factors_accepted" in result
 
 
-def test_runner_reset_knowledge():
+def test_runner_reset_knowledge(tmp_path):
     """reset_knowledge should reinitialise the KB to an empty state."""
+    import src.core.rd_agent_runner as rdmod
     from src.core.rd_agent_runner import RDAgentRunner
 
-    cfg = _mock_full_config(with_api_key=False)
+    original_kb_path = rdmod._KB_PATH
+    original_kb_dir = rdmod._KB_DIR
+    rdmod._KB_PATH = tmp_path / "kb.json"
+    rdmod._KB_DIR = tmp_path
 
-    with patch("src.core.rd_agent_runner.FactorProposer"), \
-         patch("src.core.rd_agent_runner.FactorEvaluator"), \
-         patch("src.core.rd_agent_runner.ResearchAnalyst"):
-        runner = RDAgentRunner(config=cfg)
-        runner.reset_knowledge()
-        kb = runner._load_kb()
+    try:
+        cfg = _mock_full_config(with_api_key=False)
+        with patch("src.core.rd_agent_runner.FactorProposer"), \
+             patch("src.core.rd_agent_runner.FactorEvaluator"), \
+             patch("src.core.rd_agent_runner.ResearchAnalyst"):
+            runner = RDAgentRunner(config=cfg)
+            runner.reset_knowledge()
+            kb = runner._load_kb()
+    finally:
+        rdmod._KB_PATH = original_kb_path
+        rdmod._KB_DIR = original_kb_dir
 
     assert kb["tested_factors"] == []
     assert kb["discoveries"] == []

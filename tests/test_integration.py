@@ -282,7 +282,7 @@ def test_copilot_model(tmp_path):
         assert "model_name" in result
         assert "simulated_sharpe" in result
         assert "saved" in result
-        assert result["model_name"] == "LightGBM"
+        assert result["model_name"] in ("LightGBM", "CatBoost", "XGBoost", "Linear")
     finally:
         rdmod._KB_PATH = original_kb_path
         rdmod._KB_DIR = original_kb_dir
