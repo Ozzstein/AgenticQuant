@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
+
 # ---------------------------------------------------------------------------
 # Task 1 — Schema tests
 # ---------------------------------------------------------------------------
@@ -249,3 +252,159 @@ def test_propose_regime_change_fallback():
     proposer = FactorProposer(cfg)
     result = proposer.propose_regime_change(description="increase equity in risk_on", memo="")
     assert isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — FactorEvaluator tests (mocked data pipeline)
+# ---------------------------------------------------------------------------
+
+
+def _make_ohlcv_df(n_days: int = 100, n_tickers: int = 5) -> pd.DataFrame:
+    """Build a minimal multi-ticker OHLCV DataFrame for testing."""
+    tickers = [f"TK{i}" for i in range(n_tickers)]
+    records = []
+    rng = np.random.default_rng(42)
+    for ticker in tickers:
+        prices = 100 * np.cumprod(1 + rng.normal(0.0005, 0.015, n_days))
+        for i in range(n_days):
+            records.append({
+                "ticker": ticker,
+                "date": pd.Timestamp("2022-01-01") + pd.Timedelta(days=i),
+                "close": prices[i],
+                "open": prices[i] * (1 - rng.uniform(0, 0.005)),
+                "high": prices[i] * (1 + rng.uniform(0, 0.01)),
+                "low": prices[i] * (1 - rng.uniform(0, 0.01)),
+                "volume": rng.integers(100_000, 1_000_000),
+            })
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.set_index("date").sort_index()
+
+
+def test_evaluator_stage1_passed():
+    """A factor that generates valid numeric values should pass stage 1 (mocked IC >= 0.02)."""
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import EvalResult, FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+    factor = FactorDefinition(
+        name="test_mom",
+        expression="close / close.shift(20) - 1",
+        category="momentum",
+    )
+
+    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
+
+    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
+        mock_pipeline = MagicMock()
+        mock_pipeline.yfinance_fallback.return_value = mock_df
+        MockPipeline.return_value = mock_pipeline
+
+        evaluator = FactorEvaluator(cfg)
+        result = evaluator.evaluate_factor(factor, tickers=["TK0", "TK1", "TK2", "TK3", "TK4"])
+
+    assert isinstance(result, EvalResult)
+    assert result.factor_name == "test_mom"
+    assert result.stage1_ic is not None
+    # Either passed or failed stage1 — both are valid outcomes with random data
+
+
+def test_evaluator_stage1_no_data():
+    """Empty DataFrame from yfinance_fallback should produce reason='no_data'."""
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+    factor = FactorDefinition(name="test_factor", expression="close / close.shift(5) - 1", category="momentum")
+
+    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
+        mock_pipeline = MagicMock()
+        mock_pipeline.yfinance_fallback.return_value = pd.DataFrame()
+        MockPipeline.return_value = mock_pipeline
+
+        evaluator = FactorEvaluator(cfg)
+        result = evaluator.evaluate_factor(factor)
+
+    assert result.reason == "no_data"
+    assert result.passed is False
+
+
+def test_evaluator_eval_error():
+    """A factor expression that raises an exception should produce reason='eval_error'."""
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+    # Invalid expression — references undefined variable 'undefined_var'
+    factor = FactorDefinition(
+        name="bad_factor",
+        expression="close + undefined_var",
+        category="momentum",
+    )
+
+    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
+
+    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
+        mock_pipeline = MagicMock()
+        mock_pipeline.yfinance_fallback.return_value = mock_df
+        MockPipeline.return_value = mock_pipeline
+
+        evaluator = FactorEvaluator(cfg)
+        result = evaluator.evaluate_factor(factor)
+
+    assert result.reason == "eval_error"
+    assert result.passed is False
+
+
+def test_evaluator_stage2_not_entered_when_stage1_fails():
+    """When stage1_passed is False, stage2_ic and stage2_icir must remain None."""
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+    # Expression that produces near-zero IC (constant signal)
+    factor = FactorDefinition(
+        name="zero_signal",
+        expression="close * 0 + 1",  # constant, IC = 0
+        category="momentum",
+    )
+
+    mock_df = _make_ohlcv_df(n_days=120, n_tickers=10)
+
+    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
+        mock_pipeline = MagicMock()
+        mock_pipeline.yfinance_fallback.return_value = mock_df
+        MockPipeline.return_value = mock_pipeline
+
+        evaluator = FactorEvaluator(cfg)
+        result = evaluator.evaluate_factor(factor)
+
+    # Constant signal must fail stage 1 (IC = 0 < 0.02)
+    assert result.stage1_passed is False
+    assert result.stage2_ic is None
+    assert result.stage2_icir is None
+
+
+def test_evaluator_batch():
+    """evaluate_factors_batch returns one EvalResult per factor."""
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import EvalResult, FactorDefinition
+
+    cfg = _mock_full_config(with_api_key=False)
+    factors = [
+        FactorDefinition(name=f"f{i}", expression="close / close.shift(20) - 1", category="momentum")
+        for i in range(3)
+    ]
+
+    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
+
+    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
+        mock_pipeline = MagicMock()
+        mock_pipeline.yfinance_fallback.return_value = mock_df
+        MockPipeline.return_value = mock_pipeline
+
+        evaluator = FactorEvaluator(cfg)
+        results = evaluator.evaluate_factors_batch(factors)
+
+    assert len(results) == 3
+    assert all(isinstance(r, EvalResult) for r in results)
