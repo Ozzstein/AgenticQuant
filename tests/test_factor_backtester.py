@@ -491,3 +491,27 @@ def test_research_analyst_memo_format_with_backtest():
     assert "1.2300" in table, f"Expected Sharpe '1.2300' in table:\n{table}"
     # Bad factor (IC-failed, not in bt_results) has em-dash
     assert "—" in table, f"Expected '—' for IC-failed factor:\n{table}"
+
+
+def test_research_analyst_memo_format_without_backtest():
+    """_format_results_table() omits bt_sharpe column when bt_results not provided."""
+    from src.core.research_analyst import ResearchAnalyst
+    from src.utils.schemas import EvalResult
+
+    results = [
+        EvalResult(
+            factor_name="factor_a",
+            stage1_ic=0.03,
+            stage1_passed=True,
+            passed=True,
+            reason="passed",
+        ),
+    ]
+
+    table = ResearchAnalyst._format_results_table(results)
+
+    assert "bt_sharpe" not in table, f"bt_sharpe column should be absent:\n{table}"
+    # Standard columns must still be present
+    assert "stage1_IC" in table
+    assert "ICIR" in table
+    assert "passed" in table

@@ -12,7 +12,7 @@ from typing import Any
 from loguru import logger
 
 from src.utils.config_loader import FullAppConfig, get_full_config
-from src.utils.schemas import EvalResult
+from src.utils.schemas import BacktestValidationResult, EvalResult
 
 # Import at module level so patch("src.core.research_analyst.ChatAnthropic") works
 try:
@@ -55,7 +55,7 @@ class ResearchAnalyst:
         self,
         batch_results: list[EvalResult],
         kb: dict,
-        bt_results: dict | None = None,  # dict[str, BacktestValidationResult]
+        bt_results: dict[str, BacktestValidationResult] | None = None,
     ) -> str:
         """Synthesize batch evaluation results into a research memo.
 
@@ -107,7 +107,7 @@ class ResearchAnalyst:
         self,
         batch_results: list[EvalResult],
         kb: dict,
-        bt_results: dict | None = None,
+        bt_results: dict[str, BacktestValidationResult] | None = None,
     ) -> str:
         """Call Opus to generate a research memo from batch results."""
         prior_memo = self.load_memo(kb)
@@ -161,7 +161,7 @@ class ResearchAnalyst:
     @staticmethod
     def _format_results_table(
         results: list[EvalResult],
-        bt_results: dict | None = None,  # dict[str, BacktestValidationResult]
+        bt_results: dict[str, BacktestValidationResult] | None = None,
     ) -> str:
         """Format a list of EvalResult objects as a plain-text table.
 
@@ -181,7 +181,7 @@ class ResearchAnalyst:
             s2_ic = f"{r.stage2_ic:.4f}" if r.stage2_ic is not None else "—"
             s2_icir = f"{r.stage2_icir:.4f}" if r.stage2_icir is not None else "—"
             if has_bt:
-                bt = bt_results.get(r.factor_name)  # type: ignore[union-attr]
+                bt = bt_results.get(r.factor_name)
                 bt_sharpe_str = f"{bt.sharpe:.4f}" if (bt and bt.sharpe is not None) else "—"
                 lines.append(
                     f"{r.factor_name} | {r.stage1_ic:.4f} | {s2_ic} | {s2_icir}"
