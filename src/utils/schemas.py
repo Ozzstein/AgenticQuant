@@ -210,6 +210,15 @@ class BenchmarkComparison(BaseModel):
     excess_sharpe_vs_spy: float = 0.0
 
 
+class EnsembleWeights(BaseModel):
+    """Per-fold ensemble weight introspection."""
+
+    model_weights: dict[str, float] = Field(default_factory=dict)
+    weighting_method: str = "ic_weighted"
+    validation_ics: dict[str, float] = Field(default_factory=dict)
+    fold_id: int | None = None
+
+
 class WalkForwardResult(BaseModel):
     """Enhanced walk-forward result with feature drift and rolling IC."""
 
@@ -220,6 +229,7 @@ class WalkForwardResult(BaseModel):
     feature_importance_drift: list[float]  # rank corr between consecutive fold importances
     rolling_ic: list[float]  # per-fold IC (predictions vs realized returns)
     model_name: str
+    ensemble_weights_per_fold: list[EnsembleWeights] = Field(default_factory=list)
 
 
 # --- Factor Models ---

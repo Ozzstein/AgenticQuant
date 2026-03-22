@@ -25,6 +25,9 @@ models:
   walk_forward_months: 3
   embargo_days: 5
   transaction_cost_bps: 10.0
+  ensemble_models: ["LightGBM", "XGBoost", "Linear"]
+  ensemble_method: ic_weighted
+  ensemble_val_fraction: 0.15
 
 risk:
   max_position_weight: 10.0

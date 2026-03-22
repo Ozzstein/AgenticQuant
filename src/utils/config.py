@@ -111,6 +111,11 @@ class ModelConfig(BaseModel):
     embargo_days: int = 5
     transaction_cost_bps: float = 10.0
     retrain_frequency: str = "monthly"
+    ensemble_models: list[str] = Field(
+        default_factory=lambda: ["LightGBM", "XGBoost", "Linear"]
+    )
+    ensemble_method: str = "ic_weighted"
+    ensemble_val_fraction: float = 0.15
 
 
 class RiskConfig(BaseModel):
