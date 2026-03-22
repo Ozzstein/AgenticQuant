@@ -191,7 +191,7 @@ class TestCcxtTrader:
         mock_ex.fetch_order.return_value = _make_ccxt_order(status="open")  # never fills
 
         order = Order(ticker="BTC", side=OrderSide.BUY, quantity=0.01)
-        time_seq = [0.0, 100.0]  # immediately past timeout
+        time_seq = [0.0] + [100.0] * 10  # start at 0, then immediately past timeout on each check
         with patch("src.execution.ccxt_trader.time.sleep"), \
              patch("src.execution.ccxt_trader.time.time", side_effect=time_seq):
             result = trader.execute_order(order, {"BTC": 50_000.0})
