@@ -63,3 +63,15 @@ class AlpacaConnectionError(AlpacaError):
 
 class AlpacaOrderError(AlpacaError):
     """Alpaca order submission or fill error."""
+
+
+class CcxtError(ExecutionError):
+    """Base error for CCXT exchange operations."""
+
+
+class CcxtConnectionError(CcxtError):
+    """CCXT API connection or authentication failure."""
+
+
+class CcxtOrderError(CcxtError):
+    """CCXT order submission, fill, or cancellation error."""

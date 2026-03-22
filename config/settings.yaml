@@ -49,6 +49,13 @@ alpaca:
   enabled: false
   paper: true
 
+ccxt:
+  enabled: false
+  paper: true
+  exchange: binance
+  quote_currency: USDT
+  max_retries: 5  # non-default (class default is 3) — verified in test_ccxt_config_yaml_section
+
 memory:
   enabled: true
   max_history: 10

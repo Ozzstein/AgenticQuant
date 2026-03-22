@@ -171,6 +171,24 @@ class AlpacaConfig(BaseModel):
     timeout_seconds: int = 30
 
 
+class CcxtConfig(BaseModel):
+    """CCXT crypto exchange broker configuration.
+
+    Controls live crypto order execution via any CCXT-compatible exchange.
+    paper=True uses the exchange's sandbox/testnet API when available.
+    Live mode requires AIQUANT_CCXT_LIVE=true env var (double opt-in).
+    """
+
+    enabled: bool = False
+    exchange: str = "binance"        # Any valid ccxt exchange id (e.g. binance, kraken, coinbase)
+    api_key: str = ""
+    api_secret: str = ""
+    paper: bool = True               # True = sandbox/testnet; False = live (gated)
+    quote_currency: str = "USDT"     # Base quote currency for symbol formatting (BTC → BTC/USDT)
+    max_retries: int = 3
+    timeout_seconds: int = 30
+
+
 class MemoryConfig(BaseModel):
     """Agent memory persistence configuration."""
 
@@ -204,6 +222,7 @@ class AppConfig(BaseSettings):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     macro_regime: MacroRegimeConfig = Field(default_factory=MacroRegimeConfig)
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
+    ccxt: CcxtConfig = Field(default_factory=CcxtConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     @field_validator("log_level")

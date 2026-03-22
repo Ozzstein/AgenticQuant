@@ -305,3 +305,58 @@ class TestBrokerFactory:
                     result = mock_factory(None)
                     assert result is mock_broker
                     mock_factory.assert_called_once()
+
+
+class TestCcxtConfig:
+    """Tests for CcxtConfig model and AppConfig integration."""
+
+    def test_ccxt_config_defaults(self) -> None:
+        from src.utils.config import CcxtConfig
+        cfg = CcxtConfig()
+        assert cfg.enabled is False
+        assert cfg.exchange == "binance"
+        assert cfg.api_key == ""
+        assert cfg.api_secret == ""
+        assert cfg.paper is True
+        assert cfg.quote_currency == "USDT"
+        assert cfg.max_retries == 3
+        assert cfg.timeout_seconds == 30
+
+    def test_ccxt_config_in_app_config(self) -> None:
+        from src.utils.config import AppConfig, CcxtConfig
+        app = AppConfig()
+        assert isinstance(app.ccxt, CcxtConfig)
+        assert app.ccxt.enabled is False
+
+    def test_ccxt_config_env_override(self, monkeypatch) -> None:
+        monkeypatch.setenv("AIQUANT_CCXT__API_KEY", "test-key-123")
+        monkeypatch.setenv("AIQUANT_CCXT__EXCHANGE", "kraken")
+        from src.utils.config import AppConfig
+        app = AppConfig()
+        assert app.ccxt.api_key == "test-key-123"
+        assert app.ccxt.exchange == "kraken"
+
+    def test_ccxt_exceptions_hierarchy(self) -> None:
+        from src.utils.exceptions import (
+            AiQuantError,
+            CcxtConnectionError,
+            CcxtError,
+            CcxtOrderError,
+            ExecutionError,
+        )
+        assert issubclass(CcxtError, ExecutionError)
+        assert issubclass(CcxtError, AiQuantError)
+        assert issubclass(CcxtConnectionError, CcxtError)
+        assert issubclass(CcxtOrderError, CcxtError)
+
+    def test_ccxt_config_yaml_section(self) -> None:
+        # settings.yaml sets ccxt.max_retries: 5 (differs from class default of 3)
+        # so this test verifies YAML is actually loaded, not just defaults
+        from src.utils.config import get_config, reset_config
+        reset_config()
+        cfg = get_config()
+        assert hasattr(cfg, "ccxt")
+        assert cfg.ccxt.enabled is False
+        assert cfg.ccxt.paper is True
+        assert cfg.ccxt.max_retries == 5  # non-default value set in settings.yaml
+        reset_config()
