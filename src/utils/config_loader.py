@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import yaml
 from pydantic import BaseModel, Field
 
 # Re-export everything from src.utils.config so both import paths work.
@@ -46,8 +47,6 @@ class FullAppConfig(AppConfig):
 @lru_cache(maxsize=1)
 def get_full_config() -> FullAppConfig:
     """Get singleton FullAppConfig (extends AppConfig with RDAgentConfig)."""
-    import yaml
-
     base = get_config()
     data = base.model_dump()
 
