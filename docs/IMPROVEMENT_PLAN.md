@@ -45,9 +45,10 @@
   - `create_model()` factory, `model_factory` param in `WalkForwardRunner`
   - Merged: PR #9
 
-- [ ] **2D. Agent Memory / RAG**
+- [x] **2D. Agent Memory / RAG**
   - Persistent memory layer for LangGraph agents across analysis sessions
   - RAG over past analyses for improved reasoning
+  - Merged: PR #10
 
 ---
 
@@ -55,7 +56,7 @@
 
 > Live trading readiness.
 
-- [ ] **3A. Alpaca Live Trading Bridge**
+- [x] **3A. Alpaca Live Trading Bridge**
   - `AlpacaTrader` class alongside `PaperTrader` with same interface
   - Gate behind `AIQUANT_ALPACA_LIVE=true` config flag
 
@@ -143,7 +144,7 @@
 
 ```
 DONE  (Tier 1): Foundation hardening — critical bugs fixed
-NOW   (Tier 2): Intelligence upgrades — 2A and 2D remaining
-NEXT  (Tier 3): Execution — live trading readiness
+DONE  (Tier 2): Intelligence upgrades — all complete
+NOW   (Tier 3): Execution — live trading readiness
 LATER (Tier 4-6): Expansion — competitive moat
 ```
