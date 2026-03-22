@@ -55,6 +55,9 @@ dev = [
     "mypy>=1.5",
     "jupyterlab>=4.0",
 ]
+alpaca = [
+    "alpaca-py>=0.28",
+]
 qlib = [
     "pyqlib>=0.9",
 ]
