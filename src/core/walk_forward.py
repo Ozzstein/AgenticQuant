@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,7 @@ class WalkForwardRunner:
         walk_months: int = 3,
         embargo_days: int = 5,
         mode: str = "expanding",
+        model_factory: Callable[[], object] | None = None,
     ) -> WalkForwardResult:
         """Run enhanced walk-forward backtest with feature importance drift and rolling IC.
 
@@ -65,6 +67,9 @@ class WalkForwardRunner:
             walk_months: Length of each OOS window in months.
             embargo_days: Gap between train end and test start.
             mode: Walk-forward mode (currently only ``expanding`` is supported).
+            model_factory: Optional callable that returns a fresh model instance per fold.
+                When provided, overrides ``model_name``. The callable must return an object
+                with ``train(X, y)``, ``predict(X)``, and ``get_feature_importance()`` methods.
 
         Returns:
             WalkForwardResult with stitched returns, per-fold metrics, feature drift
@@ -89,6 +94,13 @@ class WalkForwardRunner:
         feature_importances: list[pd.Series] = []
         # Each entry: (test_start_str, list[float]) for stitching
         fold_period_returns: list[tuple[str, list[float]]] = []
+
+        # Determine display name for result
+        if model_factory is not None:
+            _probe = model_factory()
+            result_model_name = getattr(_probe, "model_name", model_name)
+        else:
+            result_model_name = model_name
 
         for i, fold in enumerate(folds):
             train_mask = (dates >= fold["train_start"]) & (dates <= fold["train_end"])
@@ -117,7 +129,10 @@ class WalkForwardRunner:
                 continue
 
             # Train model
-            model = ModelWrapper(model_name, self.config)
+            if model_factory is not None:
+                model = model_factory()
+            else:
+                model = ModelWrapper(model_name, self.config)
             model.train(X_train.values, y_train.values)
             is_preds = model.predict(X_train.values)
             oos_preds = model.predict(X_test.values)
@@ -233,7 +248,7 @@ class WalkForwardRunner:
             aggregate_metrics=aggregate_metrics,
             feature_importance_drift=feature_importance_drift,
             rolling_ic=rolling_ic,
-            model_name=model_name,
+            model_name=result_model_name,
         )
 
     def generate_html_report(self, result: WalkForwardResult, output_path: str) -> str:

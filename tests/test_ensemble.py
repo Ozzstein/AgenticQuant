@@ -317,3 +317,19 @@ class TestBacktesterIntegration:
         result = bt.run(X, y, model=ensemble, topk=5)
 
         assert result.metrics.sharpe_ratio is not None
+
+    def test_ensemble_with_walk_forward_runner(self):
+        """WalkForwardRunner works with model_factory for ensemble."""
+        X, y = _make_data(n=300, p=5)
+        dates = pd.date_range("2022-01-01", periods=300, freq="B")
+        X.index = dates
+        y.index = dates
+
+        from src.core.walk_forward import WalkForwardRunner
+
+        def ensemble_factory():
+            return EnsembleModel(model_names=["Linear"], weighting="equal")
+
+        runner = WalkForwardRunner()
+        result = runner.run(X, y, model_factory=ensemble_factory, topk=5)
+        assert result.model_name.startswith("Ensemble")
