@@ -169,9 +169,8 @@ def compute_broker_metrics(
 def create_broker(config: AppConfig | None = None) -> BaseBroker:
     """Create a broker based on config.
 
-    Returns AlpacaTrader if alpaca.enabled=True, else PaperTrader.
-    AlpacaTrader lazy-imports alpaca-py — users without it won't see an error
-    unless alpaca.enabled=True.
+    Priority: ccxt (if enabled) > alpaca (if enabled) > PaperTrader (default).
+    Only one broker should be enabled at a time.
 
     Args:
         config: Application config. Uses get_config() singleton if None.
@@ -181,13 +180,18 @@ def create_broker(config: AppConfig | None = None) -> BaseBroker:
 
     Raises:
         ImportError: If alpaca.enabled=True but alpaca-py is not installed.
-        AlpacaError: If live trading gate fails (paper=False without AIQUANT_ALPACA_LIVE=true).
+        CcxtError: If ccxt live gate fails.
+        AlpacaError: If alpaca live gate fails.
     """
     from src.execution.paper_trader import PaperTrader
     from src.utils.config import get_config
 
     if config is None:
         config = get_config()
+
+    if config.ccxt.enabled:
+        from src.execution.ccxt_trader import CcxtTrader
+        return CcxtTrader(config.ccxt)
 
     if config.alpaca.enabled:
         try:

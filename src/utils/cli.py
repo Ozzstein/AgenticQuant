@@ -114,7 +114,7 @@ def analyze(
 @app.command()
 def trade(
     action: str = typer.Argument("status", help="Action: status, run, reset"),
-    broker_type: str = typer.Option("auto", "--broker", "-b", help="Broker type: auto, paper, alpaca"),
+    broker_type: str = typer.Option("auto", "--broker", "-b", help="Broker type: auto, paper, alpaca, ccxt"),
 ):
     """Paper/live trading operations."""
     from src.execution.broker import create_broker
@@ -133,6 +133,10 @@ def trade(
         from src.execution.alpaca_trader import AlpacaTrader
 
         broker = AlpacaTrader(config.alpaca)
+    elif broker_type == "ccxt":
+        from src.execution.ccxt_trader import CcxtTrader
+
+        broker = CcxtTrader(config.ccxt)
     else:  # auto
         broker = create_broker(config)
 

@@ -362,3 +362,67 @@ class TestCcxtConfig:
             assert cfg.ccxt.max_retries == 5  # non-default value set in settings.yaml
         finally:
             reset_config()
+
+
+class TestCcxtFactory:
+    """Tests for create_broker() ccxt path and CLI ccxt flag."""
+
+    def test_factory_returns_ccxt_trader_when_enabled(self) -> None:
+        from src.execution.broker import create_broker
+        from src.execution.ccxt_trader import CcxtTrader
+        from src.utils.config import AppConfig, CcxtConfig
+        config = AppConfig(ccxt=CcxtConfig(enabled=True, api_key="k", api_secret="s", paper=True))
+        trader = create_broker(config)
+        assert isinstance(trader, CcxtTrader)
+
+    def test_factory_ccxt_takes_priority_over_alpaca(self) -> None:
+        # When both ccxt and alpaca are enabled, ccxt wins (checked first in factory)
+        from src.execution.broker import create_broker
+        from src.execution.ccxt_trader import CcxtTrader
+        from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+        config = AppConfig(
+            ccxt=CcxtConfig(enabled=True, paper=True),
+            alpaca=AlpacaConfig(enabled=True, paper=True),
+        )
+        broker = create_broker(config)
+        assert isinstance(broker, CcxtTrader)
+
+    def test_factory_alpaca_still_works_when_ccxt_disabled(self) -> None:
+        # With ccxt disabled, factory falls through to alpaca path
+        import sys
+        from unittest.mock import MagicMock, patch
+        from src.execution.broker import create_broker
+        from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+        mock_alpaca_module = MagicMock()
+        mock_alpaca_class = MagicMock()
+        mock_alpaca_module.AlpacaTrader = mock_alpaca_class
+        config = AppConfig(
+            ccxt=CcxtConfig(enabled=False),
+            alpaca=AlpacaConfig(enabled=True, paper=True),
+        )
+        with patch.dict(sys.modules, {"src.execution.alpaca_trader": mock_alpaca_module}):
+            broker = create_broker(config)
+        mock_alpaca_class.assert_called_once_with(config.alpaca)
+
+    def test_factory_paper_trader_when_both_disabled(self) -> None:
+        from src.execution.broker import create_broker
+        from src.execution.paper_trader import PaperTrader
+        from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+        config = AppConfig(ccxt=CcxtConfig(enabled=False), alpaca=AlpacaConfig(enabled=False))
+        broker = create_broker(config)
+        assert isinstance(broker, PaperTrader)
+
+    def test_cli_trade_ccxt_flag(self) -> None:
+        # Patch at the module where CcxtTrader is defined — CLI imports from there
+        from typer.testing import CliRunner
+        from unittest.mock import MagicMock, patch
+        from src.utils.cli import app
+        runner = CliRunner()
+        mock_trader = MagicMock()
+        mock_trader.portfolio.nav = 100_000.0
+        mock_trader.portfolio.cash = 100_000.0
+        mock_trader.portfolio.positions = {}
+        with patch("src.execution.ccxt_trader.CcxtTrader", return_value=mock_trader):
+            result = runner.invoke(app, ["trade", "status", "--broker", "ccxt"])
+        assert result.exit_code == 0
+        assert "NAV" in result.output or "100" in result.output
