@@ -354,9 +354,11 @@ class TestCcxtConfig:
         # so this test verifies YAML is actually loaded, not just defaults
         from src.utils.config import get_config, reset_config
         reset_config()
-        cfg = get_config()
-        assert hasattr(cfg, "ccxt")
-        assert cfg.ccxt.enabled is False
-        assert cfg.ccxt.paper is True
-        assert cfg.ccxt.max_retries == 5  # non-default value set in settings.yaml
-        reset_config()
+        try:
+            cfg = get_config()
+            assert hasattr(cfg, "ccxt")
+            assert cfg.ccxt.enabled is False
+            assert cfg.ccxt.paper is True
+            assert cfg.ccxt.max_retries == 5  # non-default value set in settings.yaml
+        finally:
+            reset_config()
