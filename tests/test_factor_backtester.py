@@ -435,7 +435,11 @@ def test_load_kb_error_recovery_does_not_mutate_empty_kb(tmp_path):
         (tmp_path / "kb.json").write_text("{invalid json}")
         from src.core.rd_agent_runner import RDAgentRunner
 
-        runner = RDAgentRunner()
+        with patch("src.core.rd_agent_runner.FactorProposer"), \
+             patch("src.core.rd_agent_runner.FactorEvaluator"), \
+             patch("src.core.rd_agent_runner.ResearchAnalyst"), \
+             patch("src.core.rd_agent_runner.FactorBacktester"):
+            runner = RDAgentRunner()
         kb = runner._load_kb()
         # Mutate the returned kb
         kb["backtest_failed"].append({"test": "mutation"})

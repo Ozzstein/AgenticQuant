@@ -157,7 +157,7 @@ class RDAgentRunner:
 
         Returns:
             KB dict with keys: tested_factors, failed_factors, tested_configs,
-            discoveries, last_run_date.
+            discoveries, backtest_failed, last_run_date.
         """
         if not _KB_PATH.exists():
             return copy.deepcopy(_EMPTY_KB)
@@ -477,8 +477,8 @@ class RDAgentRunner:
                 if bt_result.passed:
                     # Enrich with IC data + backtest data in one model_copy call.
                     factor = factor.model_copy(update={
-                        "ic_mean": er.stage2_ic or er.stage1_ic,
-                        "icir": er.stage2_icir or 0.0,
+                        "ic_mean": er.stage2_ic if er.stage2_ic is not None else er.stage1_ic,
+                        "icir": er.stage2_icir if er.stage2_icir is not None else 0.0,
                         "source": "rd_agent_llm",
                         "backtest_sharpe": bt_result.sharpe,
                         "backtest_max_drawdown": bt_result.max_drawdown,
