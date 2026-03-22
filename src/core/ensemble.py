@@ -106,7 +106,8 @@ class EnsembleModel:
             ModelError: If training fails for any sub-model.
         """
         X_df, y_s = self._to_df_series(X_train, y_train)
-        assert y_s is not None
+        if y_s is None:
+            raise ModelError("y_train must not be None.")
 
         n = len(X_df)
 
@@ -115,7 +116,8 @@ class EnsembleModel:
         elif self._weighting == "ic_weighted":
             weights = self._ic_weighted_train(X_df, y_s, n)
         elif self._weighting == "custom":
-            weights = self._normalise(self._custom_weights)
+            filtered = {k: v for k, v in self._custom_weights.items() if k in self._model_names}
+            weights = self._normalise(filtered)
         else:
             _logger.warning("Unknown weighting '{}'; falling back to equal.", self._weighting)
             weights = self._equal_weights()
@@ -284,6 +286,8 @@ class EnsembleModel:
             data: dict[str, Any] = {
                 "model_names": self._model_names,
                 "weighting": self._weighting,
+                "val_fraction": self._val_fraction,
+                "custom_weights": self._custom_weights,
                 "weights": self._weights,
                 "models": {name: w.model for name, w in self._models.items()},
             }
@@ -308,6 +312,8 @@ class EnsembleModel:
             data = joblib.load(str(path))
             self._model_names = data["model_names"]
             self._weighting = data["weighting"]
+            self._val_fraction = data.get("val_fraction", 0.15)
+            self._custom_weights = data.get("custom_weights", {})
             self._weights = data["weights"]
             self._models = {}
             for name, raw_model in data["models"].items():
