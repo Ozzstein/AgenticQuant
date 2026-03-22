@@ -81,3 +81,29 @@ def test_eval_result_schema_failed_stage1():
     assert er.stage1_passed is False
     assert er.stage2_ic is None
     assert er.stage2_icir is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — split_folds public function
+# ---------------------------------------------------------------------------
+
+def test_split_folds_is_public_module_function():
+    """split_folds must be importable as a module-level function."""
+    from src.core.backtester import split_folds
+    import pandas as pd
+
+    dates = pd.date_range("2022-01-01", periods=500, freq="B")
+    folds = split_folds(dates, "2022-01-01", walk_forward_months=6, embargo_days=5)
+    assert len(folds) >= 1
+    assert "train_start" in folds[0]
+    assert "test_end" in folds[0]
+
+
+def test_split_folds_returns_no_folds_for_short_data():
+    from src.core.backtester import split_folds
+    import pandas as pd
+
+    # Only ~5 months of data — too short for 2 folds of 6 months each
+    dates = pd.date_range("2022-01-01", periods=100, freq="B")
+    folds = split_folds(dates, "2022-01-01", walk_forward_months=6, embargo_days=5)
+    assert folds == []

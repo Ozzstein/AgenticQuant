@@ -26,6 +26,65 @@ logger = get_logger(__name__)
 _TRADING_DAYS = 252
 
 
+def split_folds(
+    dates: pd.DatetimeIndex,
+    train_start: str,
+    walk_forward_months: int,
+    embargo_days: int,
+) -> list[dict]:
+    """Split dates into expanding walk-forward folds.
+
+    Args:
+        dates: DatetimeIndex of all available trading dates.
+        train_start: ISO date string for the start of the first training window.
+        walk_forward_months: Length of each OOS window in months.
+        embargo_days: Gap between train end and test start.
+
+    Returns:
+        List of dicts with keys: train_start, train_end, test_start, test_end.
+    """
+    folds: list[dict] = []
+    unique_dates = dates.sort_values().unique()
+    total_months = (unique_dates[-1].year - unique_dates[0].year) * 12 + (
+        unique_dates[-1].month - unique_dates[0].month
+    )
+
+    if total_months < walk_forward_months * 2:
+        return []
+
+    current_test_start = unique_dates[0] + pd.DateOffset(months=walk_forward_months)
+
+    while True:
+        test_end = current_test_start + pd.DateOffset(months=walk_forward_months) - pd.Timedelta(days=1)
+        if test_end > unique_dates[-1]:
+            break
+
+        train_end_raw = current_test_start - pd.Timedelta(days=embargo_days + 1)
+        train_mask = unique_dates <= train_end_raw
+        if train_mask.sum() < 20:
+            current_test_start += pd.DateOffset(months=walk_forward_months)
+            continue
+
+        train_end = unique_dates[train_mask][-1]
+        test_mask = (unique_dates >= current_test_start) & (unique_dates <= test_end)
+        if test_mask.sum() < 1:
+            current_test_start += pd.DateOffset(months=walk_forward_months)
+            continue
+
+        actual_test_end = unique_dates[test_mask][-1]
+        folds.append(
+            {
+                "train_start": str(unique_dates[0].date()),
+                "train_end": str(train_end.date()),
+                "test_start": str(current_test_start.date()),
+                "test_end": str(actual_test_end.date()),
+            }
+        )
+        current_test_start += pd.DateOffset(months=walk_forward_months)
+
+    return folds
+
+
 class WalkForwardBacktester:
     """Walk-forward backtester operating on pandas DataFrames.
 
@@ -71,7 +130,7 @@ class WalkForwardBacktester:
 
         # Normalise index so we always work with a DatetimeIndex of dates
         dates = self._extract_dates(features)
-        folds = self._split_folds(dates, str(dates.min().date()), walk_forward_months, embargo_days)
+        folds = split_folds(dates, str(dates.min().date()), walk_forward_months, embargo_days)
 
         if not folds:
             raise BacktestError("No folds produced — dataset may be too small")
@@ -121,64 +180,6 @@ class WalkForwardBacktester:
             equity_curve=equity_curve.tolist(),
             timestamps=timestamps,
         )
-
-    # ------------------------------------------------------------------
-    # Fold splitting
-    # ------------------------------------------------------------------
-
-    def _split_folds(
-        self,
-        dates: pd.DatetimeIndex,
-        train_start: str,
-        walk_forward_months: int,
-        embargo_days: int,
-    ) -> list[dict]:
-        """Split dates into expanding walk-forward folds.
-
-        Returns:
-            List of dicts with keys: train_start, train_end, test_start, test_end.
-        """
-        folds: list[dict] = []
-        unique_dates = dates.sort_values().unique()
-        total_months = (unique_dates[-1].year - unique_dates[0].year) * 12 + (
-            unique_dates[-1].month - unique_dates[0].month
-        )
-
-        # Need at least one training window equal to walk_forward_months
-        if total_months < walk_forward_months * 2:
-            return []
-
-        current_test_start = unique_dates[0] + pd.DateOffset(months=walk_forward_months)
-
-        while True:
-            test_end = current_test_start + pd.DateOffset(months=walk_forward_months) - pd.Timedelta(days=1)
-            if test_end > unique_dates[-1]:
-                break
-
-            train_end_raw = current_test_start - pd.Timedelta(days=embargo_days + 1)
-            train_mask = unique_dates <= train_end_raw
-            if train_mask.sum() < 20:  # need at least 20 training days
-                current_test_start += pd.DateOffset(months=walk_forward_months)
-                continue
-
-            train_end = unique_dates[train_mask][-1]
-            test_mask = (unique_dates >= current_test_start) & (unique_dates <= test_end)
-            if test_mask.sum() < 1:
-                current_test_start += pd.DateOffset(months=walk_forward_months)
-                continue
-
-            actual_test_end = unique_dates[test_mask][-1]
-            folds.append(
-                {
-                    "train_start": str(unique_dates[0].date()),
-                    "train_end": str(train_end.date()),
-                    "test_start": str(current_test_start.date()),
-                    "test_end": str(actual_test_end.date()),
-                }
-            )
-            current_test_start += pd.DateOffset(months=walk_forward_months)
-
-        return folds
 
     # ------------------------------------------------------------------
     # Single fold execution

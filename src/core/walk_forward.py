@@ -77,7 +77,8 @@ class WalkForwardRunner:
             raise BacktestError("features and labels must not be empty")
 
         dates = WalkForwardBacktester._extract_dates(features)
-        folds = self._backtester._split_folds(
+        from src.core.backtester import split_folds
+        folds = split_folds(
             dates, str(dates.min().date()), walk_months, embargo_days
         )
 

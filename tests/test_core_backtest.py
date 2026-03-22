@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.core.backtester import BacktestValidator, WalkForwardBacktester
+from src.core.backtester import BacktestValidator, WalkForwardBacktester, split_folds
 from src.utils.schemas import (
     BacktestMetrics,
     BacktestResult,
@@ -169,10 +169,9 @@ class TestWalkForwardBacktester:
             bt.run(pd.DataFrame(), pd.Series(dtype=float), _make_model(), topk=5)
 
     def test_split_folds_returns_dicts(self, mock_config):
-        """_split_folds returns list of dicts with required keys."""
-        bt = WalkForwardBacktester(config=mock_config)
+        """split_folds returns list of dicts with required keys."""
         dates = pd.bdate_range("2020-01-01", periods=300)
-        folds = bt._split_folds(dates, "2020-01-01", 3, 5)
+        folds = split_folds(dates, "2020-01-01", 3, 5)
         assert isinstance(folds, list)
         for fold in folds:
             for key in ("train_start", "train_end", "test_start", "test_end"):
@@ -180,9 +179,8 @@ class TestWalkForwardBacktester:
 
     def test_split_folds_embargo_enforced(self, mock_config):
         """Train end is before test start in each fold."""
-        bt = WalkForwardBacktester(config=mock_config)
         dates = pd.bdate_range("2020-01-01", periods=400)
-        folds = bt._split_folds(dates, "2020-01-01", 3, 5)
+        folds = split_folds(dates, "2020-01-01", 3, 5)
         for fold in folds:
             assert fold["train_end"] < fold["test_start"]
 
