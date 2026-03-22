@@ -95,7 +95,7 @@ class FactorBacktester:
    labels = combined["_label"]
    ```
 6. If fewer than 50 rows after alignment → return `BacktestValidationResult(passed=False, reason="no_data")`
-7. `model = ModelWrapper(model_name="Linear")` (imported from `src.core.model_zoo`)
+7. `model = ModelWrapper(model_name="Linear", config=self.config)` (imported from `src.core.model_zoo`; pass `self.config` to avoid falling back to the global singleton, which breaks config-injection in tests)
 8. `bt_result = WalkForwardBacktester(self.config).run(features, labels, model, topk=_BT_TOPK, walk_forward_months=_BT_WALK_FORWARD_MONTHS, embargo_days=_BT_EMBARGO_DAYS)`
    Note: `WalkForwardBacktester.__init__` accepts `AppConfig`; passing `FullAppConfig` works because `FullAppConfig` extends `AppConfig`.
 9. `val_result = BacktestValidator().validate(bt_result)`  → `ValidationResult`
@@ -166,7 +166,7 @@ min_backtest_sharpe: float = 0.5
 
 Note: `StrategyConfig` in `src/utils/config.py` also has a `min_backtest_sharpe: float = 0.5` field — that governs the strategy copilot flow and is distinct. The new field in `RDAgentConfig` governs the factor discovery gate.
 
-Also add to `config/settings.yaml` under `rd_agent:`:
+Also add to `config/settings.yaml` — `settings.yaml` has **no `rd_agent:` section** today; add the entire block as a new top-level section:
 ```yaml
 rd_agent:
   min_backtest_sharpe: 0.5
@@ -204,8 +204,12 @@ for (er, factor), bt_result in zip(ic_passed_pairs, bt_results):
     tested_names.append(er.factor_name)  # mark as tested regardless of bt outcome
     bt_results_by_name[factor.name] = bt_result
     if bt_result.passed:
-        # Enrich FactorDefinition using Pydantic v2 model_copy
+        # Enrich FactorDefinition with IC data + backtest data via Pydantic v2 model_copy.
+        # proposals[i] has ic_mean=0.0/icir=0.0 defaults — model_copy populates real values.
         factor = factor.model_copy(update={
+            "ic_mean": er.stage2_ic or er.stage1_ic,
+            "icir": er.stage2_icir or 0.0,
+            "source": "rd_agent_llm",
             "backtest_sharpe": bt_result.sharpe,
             "backtest_max_drawdown": bt_result.max_drawdown,
             "validation_checks": bt_result.checks,
@@ -225,16 +229,17 @@ for (er, factor), bt_result in zip(ic_passed_pairs, bt_results):
             "reason": bt_result.reason,
         })
 
-# Preserve existing eval_results tracking for all tested factors (both IC-pass and IC-fail)
+# Preserve existing eval_results tracking for all tested factors (both IC-pass and IC-fail).
+# Use "factor_name" key to match the existing KB schema (do NOT rename to "factor").
 kb.setdefault("eval_results", [])
 for er in eval_results:
     kb["eval_results"].append({
-        "date": str(date.today()),
-        "factor": er.factor_name,
+        "factor_name": er.factor_name,  # existing key — must not change
         "stage1_ic": er.stage1_ic,
         "stage2_ic": er.stage2_ic,
         "stage2_icir": er.stage2_icir,
         "passed": er.passed,
+        "date": str(date.today()),
         "reason": er.reason,
     })
 ```
@@ -271,7 +276,7 @@ def write_memo(
             return self._llm_write_memo(batch_results, kb, bt_results=bt_results)
         except Exception as exc:
             ...
-    return self._fallback_memo(batch_results)
+    return self._fallback_memo(batch_results)  # fallback intentionally omits bt_sharpe column
 
 # _llm_write_memo() — passes bt_results down to _format_results_table
 def _llm_write_memo(
@@ -315,9 +320,9 @@ memo = self._analyst.write_memo(eval_results, kb, bt_results=bt_results_by_name)
 8. `test_validate_batch_mixed_results` — some pass, some fail
 9. `test_backtest_validation_result_schema` — Pydantic fields present; `checks` default is `{}` not shared
 10. `test_factor_definition_backtest_fields` — new fields default to `None`; existing fields unchanged
-11. `test_mine_factors_backtest_gate` — only double-gated factors in `save_factor_library`
-12. `test_mine_factors_backtest_failed_logged` — IC-pass/bt-fail logged to `kb["backtest_failed"]`
-13. `test_mine_factors_discoveries_include_sharpe` — discovery entry has `"sharpe"` key
+11. `test_mine_factors_backtest_gate` — only double-gated factors in `save_factor_library`; mock `_evaluator.evaluate_factors_batch` and `_backtester.validate_batch` on the `RDAgentRunner` instance (not via `DataPipeline` patch)
+12. `test_mine_factors_backtest_failed_logged` — IC-pass/bt-fail logged to `kb["backtest_failed"]`; same mock strategy as test 11
+13. `test_mine_factors_discoveries_include_sharpe` — discovery entry has `"sharpe"` key; same mock strategy as test 11
 14. `test_research_analyst_memo_format_with_backtest` — table has `bt_sharpe` column when dict provided
 15. `test_config_min_backtest_sharpe_default` — `RDAgentConfig().min_backtest_sharpe == 0.5`
 
