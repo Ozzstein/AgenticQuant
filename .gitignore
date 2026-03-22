@@ -23,6 +23,7 @@ logs/
 *.log
 data/audit/
 data/pipeline_state/
+data/agent_memory/
 
 # Claude Code
 .claude/worktrees/

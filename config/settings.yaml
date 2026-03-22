@@ -48,3 +48,7 @@ rd_agent:
 alpaca:
   enabled: false
   paper: true
+
+memory:
+  enabled: true
+  max_history: 10

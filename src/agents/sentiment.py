@@ -29,6 +29,7 @@ except ImportError:
         market_context: str
         macro_regime: str
         macro_confidence: float
+        memory_context: str
         agent_reports: Annotated[dict, _merge_reports]
         debate_round: int
         debate_transcript: Annotated[list, operator.add]
@@ -141,6 +142,10 @@ def sentiment_node(
         "confidence (0-100), detailed reasoning, and key data_points as a dict "
         "(e.g. sentiment_score, fear_greed_level, news_tone, analyst_momentum)."
     )
+
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
 
     structured_llm = llm.with_structured_output(AgentReport)
 

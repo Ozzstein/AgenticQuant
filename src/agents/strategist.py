@@ -21,6 +21,7 @@ except ImportError:
         market_context: str
         macro_regime: str
         macro_confidence: float
+        memory_context: str
         agent_reports: Annotated[dict, _merge_reports]
         debate_round: int
         debate_transcript: Annotated[list, operator.add]
@@ -119,6 +120,10 @@ def strategist_node(state: TradingDeskState, llm: BaseChatModel | None = None) -
         "Synthesize a final investment decision. "
         "If risk_veto is True, you MUST recommend HOLD or SELL."
     )
+
+    memory_ctx = state.get("memory_context", "")
+    if memory_ctx:
+        human_msg += f"\n\nPrior analysis history for {ticker}:\n{memory_ctx}"
 
     structured_llm = llm.with_structured_output(AnalysisResult)
 
