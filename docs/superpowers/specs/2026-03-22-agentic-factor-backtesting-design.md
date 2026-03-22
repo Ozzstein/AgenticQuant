@@ -87,7 +87,17 @@ class FactorBacktester:
    factor_wide = pd.concat(factor_series_list, axis=1)  # dates × tickers
    features = factor_wide.stack().rename(factor.name).to_frame()
    ```
-4. Build labels with same MultiIndex: next-day returns per (date, ticker)
+4. Build labels: `(date, ticker)` MultiIndex Series (date at level 0) of next-day returns per ticker:
+   ```python
+   returns_by_ticker: list[pd.Series] = []
+   for ticker, grp in df.groupby("ticker"):
+       grp = grp.sort_values("date").set_index("date")
+       ret = grp["close"].pct_change().shift(-1)
+       ret.name = ticker
+       returns_by_ticker.append(ret)
+   returns_wide = pd.concat(returns_by_ticker, axis=1)  # dates × tickers
+   labels = returns_wide.stack()  # (date, ticker) MultiIndex Series, date at level 0
+   ```
 5. Align features and labels and drop NaN rows **jointly** (not independently, to preserve index alignment):
    ```python
    combined = features.join(labels.rename("_label"), how="inner").dropna()
@@ -96,8 +106,8 @@ class FactorBacktester:
    ```
 6. If fewer than 50 rows after alignment → return `BacktestValidationResult(passed=False, reason="no_data")`
 7. `model = ModelWrapper(model_name="Linear", config=self.config)` (imported from `src.core.model_zoo`; pass `self.config` to avoid falling back to the global singleton, which breaks config-injection in tests)
-8. `bt_result = WalkForwardBacktester(self.config).run(features, labels, model, topk=_BT_TOPK, walk_forward_months=_BT_WALK_FORWARD_MONTHS, embargo_days=_BT_EMBARGO_DAYS)`
-   Note: `WalkForwardBacktester.__init__` accepts `AppConfig`; passing `FullAppConfig` works because `FullAppConfig` extends `AppConfig`.
+8. `bt_result = WalkForwardBacktester(self.config).run(features, labels, model, topk=_BT_TOPK, walk_forward_months=_BT_WALK_FORWARD_MONTHS, embargo_days=_BT_EMBARGO_DAYS)`  # type: ignore[arg-type]
+   Note: `WalkForwardBacktester.__init__` is typed as `AppConfig`; passing `FullAppConfig` works at runtime (subclass) but mypy will flag it — add `# type: ignore[arg-type]` on the instantiation line.
 9. `val_result = BacktestValidator().validate(bt_result)`  → `ValidationResult`
 10. Build `checks` dict from validation result:
     ```python
@@ -134,6 +144,8 @@ _BT_EMBARGO_DAYS = 5           # same as _STAGE2_EMBARGO_DAYS
 ```
 
 Note: These constants intentionally mirror `FactorEvaluator`'s Stage 2 constants. If either file's lookback is tuned, the other must also be updated. A future improvement could centralize them in `RDAgentConfig`.
+
+Note on fold count: 500 calendar days (~350 trading days, ~17 months) with `_BT_WALK_FORWARD_MONTHS=6` yields roughly 2–3 OOS folds. The `statistical_significance` check in `BacktestValidator` requires ≥252 stitched OOS trading days; 2 folds × ~130 trading days = ~260 days, which barely passes. Data gaps or short universes may produce `verdict=CAUTION` (which still passes the gate) rather than `APPROVED`. This is expected behaviour.
 
 ### 2. Schema changes: `src/utils/schemas.py`
 
@@ -176,7 +188,7 @@ rd_agent:
 
 **`__init__`:** Add `self._backtester = FactorBacktester(self.config)` (after existing `_proposer`, `_evaluator`, `_analyst`).
 
-**`_EMPTY_KB`:** Add `"backtest_failed": []` to the constant for backward-compat initialization.
+**`_EMPTY_KB`:** Add `"backtest_failed": []` to the constant for backward-compat initialization. Wherever `_EMPTY_KB` is used, always use `copy.deepcopy(_EMPTY_KB)` (never `dict(_EMPTY_KB)`) to avoid shared list mutation — this is already done in `_load_kb()` and `reset_knowledge()` after a prior fix; verify those remain deepcopy.
 
 **`mine_factors()` loop** — replace the existing `for er, factor in zip(eval_results, proposals)` block with a three-stage flow:
 
@@ -259,6 +271,14 @@ def _format_results_table(
 When `bt_results` is provided, add a `bt_sharpe` column after `ICIR`:
 ```
 name | stage1_IC | stage2_IC | ICIR | bt_sharpe | passed
+```
+
+For factors absent from `bt_results` (IC-failed factors were never backtested), render `bt_sharpe` as `"—"`:
+```python
+bt_sharpe_str = "—"
+if bt_results is not None:
+    bt = bt_results.get(r.factor_name)
+    bt_sharpe_str = f"{bt.sharpe:.4f}" if (bt and bt.sharpe is not None) else "—"
 ```
 
 **Full updated call chain** for passing backtest results:
