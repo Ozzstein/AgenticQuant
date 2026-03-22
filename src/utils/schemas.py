@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -214,7 +215,7 @@ class EnsembleWeights(BaseModel):
     """Per-fold ensemble weight introspection."""
 
     model_weights: dict[str, float] = Field(default_factory=dict)
-    weighting_method: str = "ic_weighted"
+    weighting_method: Literal["ic_weighted", "equal", "custom"] = "ic_weighted"
     validation_ics: dict[str, float] = Field(default_factory=dict)
     fold_id: int | None = None
 
