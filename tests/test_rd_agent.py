@@ -89,8 +89,9 @@ def test_eval_result_schema_failed_stage1():
 
 def test_split_folds_is_public_module_function():
     """split_folds must be importable as a module-level function."""
-    from src.core.backtester import split_folds
     import pandas as pd
+
+    from src.core.backtester import split_folds
 
     dates = pd.date_range("2022-01-01", periods=500, freq="B")
     folds = split_folds(dates, "2022-01-01", walk_forward_months=6, embargo_days=5)
@@ -100,8 +101,9 @@ def test_split_folds_is_public_module_function():
 
 
 def test_split_folds_returns_no_folds_for_short_data():
-    from src.core.backtester import split_folds
     import pandas as pd
+
+    from src.core.backtester import split_folds
 
     # Only ~5 months of data — too short for 2 folds of 6 months each
     dates = pd.date_range("2022-01-01", periods=100, freq="B")
