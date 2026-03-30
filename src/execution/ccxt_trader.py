@@ -14,6 +14,7 @@ import ccxt
 from loguru import logger
 
 from src.execution.broker import compute_broker_metrics
+from src.execution.order_manager import ContingentOrderSimulator
 from src.utils.config import CcxtConfig
 from src.utils.exceptions import CcxtConnectionError, CcxtError, CcxtOrderError
 from src.utils.schemas import (
@@ -61,6 +62,7 @@ class CcxtTrader:
             config.exchange,
             config.paper,
         )
+        self._contingent = ContingentOrderSimulator()
 
     # ------------------------------------------------------------------
     # BaseBroker protocol methods
@@ -99,6 +101,21 @@ class CcxtTrader:
                     "commission": 0.0,
                     "pnl": 0.0,  # realized P&L computed post-trade
                 })
+                if filled.side == OrderSide.BUY and (
+                    order.take_profit_price is not None
+                    or order.stop_loss_price is not None
+                    or order.trail_percent is not None
+                ):
+                    self._contingent.register(
+                        ticker=order.ticker,
+                        quantity=filled.quantity,
+                        entry_price=filled.fill_price,
+                        take_profit_price=order.take_profit_price,
+                        stop_loss_price=order.stop_loss_price,
+                        trail_percent=order.trail_percent,
+                    )
+                elif filled.side == OrderSide.SELL:
+                    self._contingent.cancel(order.ticker)
             return filled
         except (CcxtOrderError, CcxtConnectionError):
             raise
@@ -114,6 +131,13 @@ class CcxtTrader:
         Args:
             market_prices: Ticker → price mapping used when exchange prices unavailable.
         """
+        # Clean stale entries, ratchet trailing stops, execute triggers
+        self._contingent.cleanup_stale(set(self._portfolio.positions.keys()))
+        self._contingent.update_trailing_peaks(market_prices)
+        triggered = self._contingent.evaluate(market_prices)
+        for contingent_order in triggered:
+            self.execute_order(contingent_order, market_prices)
+
         self._sync_balance(market_prices)
         nav = self._portfolio.nav
         self._nav_history.append((datetime.now(), nav))
@@ -251,9 +275,13 @@ class CcxtTrader:
         side = "buy" if order.side == OrderSide.BUY else "sell"
         price = order.limit_price if order.order_type == OrderType.LIMIT else None
 
+        params: dict = {}
+        if order.order_type == OrderType.LIMIT:
+            params["timeInForce"] = order.time_in_force.value
+
         for attempt in range(self._config.max_retries):
             try:
-                return ex.create_order(symbol, order_type, side, order.quantity, price)
+                return ex.create_order(symbol, order_type, side, order.quantity, price, params)
             except Exception as exc:
                 if attempt == self._config.max_retries - 1:
                     raise CcxtConnectionError(
