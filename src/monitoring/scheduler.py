@@ -7,6 +7,11 @@ from pathlib import Path
 
 from loguru import logger
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ImportError:  # pragma: no cover
+    BackgroundScheduler = None  # type: ignore[assignment,misc]
+
 
 class PipelineScheduler:
     """Wraps the daily pipeline with APScheduler scheduling.
@@ -20,16 +25,16 @@ class PipelineScheduler:
     def __init__(self, config=None) -> None:
         from src.utils.config import get_config
 
-        self.config = config or get_config()
+        self._config = config or get_config()
+        self.config = self._config  # backward-compat alias
         self._scheduler = None
+        self._intraday_job_id: str | None = None
         self._lock_file = Path("outputs/.pipeline.lock")
         self._lock_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            from apscheduler.schedulers.background import BackgroundScheduler
-
+        if BackgroundScheduler is not None:
             self._scheduler = BackgroundScheduler()
             logger.info("APScheduler initialized.")
-        except ImportError:
+        else:
             logger.warning("APScheduler not installed — scheduler will run manually only.")
 
     def run_once(self) -> dict:
@@ -107,8 +112,42 @@ class PipelineScheduler:
             "Pipeline scheduled daily at {} {}", time_str, self.config.monitoring.schedule_timezone
         )
 
+    def start_intraday(self, runner, interval_minutes: int | None = None) -> None:
+        """Schedule IntradayRunner to execute on a fixed interval.
+
+        Args:
+            runner: IntradayRunner instance whose run() method will be called.
+            interval_minutes: Override interval in minutes. Defaults to
+                config.intraday.interval_minutes.
+        """
+        if self._scheduler is None:
+            logger.warning("APScheduler not available — cannot schedule intraday runs.")
+            return
+        minutes = interval_minutes if interval_minutes is not None else self._config.intraday.interval_minutes
+        job = self._scheduler.add_job(
+            runner.run,
+            trigger="interval",
+            minutes=minutes,
+            id="intraday_runner",
+            replace_existing=True,
+        )
+        self._intraday_job_id = job.id
+        logger.info("Intraday pipeline scheduled every {} minutes.", minutes)
+
+    def stop_intraday(self) -> None:
+        """Remove the intraday job from the scheduler without affecting the daily job."""
+        if self._scheduler is None or self._intraday_job_id is None:
+            return
+        try:
+            self._scheduler.remove_job(self._intraday_job_id)
+            logger.info("Intraday pipeline job removed.")
+        except Exception:
+            pass
+        self._intraday_job_id = None
+
     def stop(self) -> None:
-        """Stop the scheduler."""
+        """Stop the scheduler and all jobs."""
+        self.stop_intraday()
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown()
             logger.info("PipelineScheduler stopped.")
