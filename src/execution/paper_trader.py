@@ -9,12 +9,14 @@ from pathlib import Path
 from loguru import logger
 
 from src.execution.broker import compute_broker_metrics
+from src.execution.order_manager import ContingentOrderSimulator
 from src.utils.exceptions import OrderError
 from src.utils.schemas import (
     AssetClass,
     Order,
     OrderSide,
     OrderStatus,
+    OrderType,
     Portfolio,
     Position,
 )
@@ -57,6 +59,7 @@ class PaperTrader:
             commission_per_share,
             min_commission,
         )
+        self._contingent = ContingentOrderSimulator()
 
     # ------------------------------------------------------------------
     # Public API
@@ -88,6 +91,19 @@ class PaperTrader:
         qty = order.quantity
         slip = self._slippage_bps / 10_000.0
 
+        # STOP orders: sell only when price has fallen to or through the stop level
+        if order.order_type == OrderType.STOP:
+            if raw_price > order.stop_loss_price:
+                logger.warning(
+                    "STOP REJECTED {} — price {:.4f} above stop {:.4f}",
+                    ticker,
+                    raw_price,
+                    order.stop_loss_price,
+                )
+                order.status = OrderStatus.REJECTED
+                return None
+            return self._execute_sell(order, raw_price, qty, slip)
+
         if order.side == OrderSide.BUY:
             return self._execute_buy(order, raw_price, qty, slip)
         return self._execute_sell(order, raw_price, qty, slip)
@@ -103,6 +119,13 @@ class PaperTrader:
         Args:
             market_prices: Mapping of ticker → current market price.
         """
+        # Clean stale entries, ratchet trailing stops, execute triggers
+        self._contingent.cleanup_stale(set(self._positions.keys()))
+        self._contingent.update_trailing_peaks(market_prices)
+        triggered = self._contingent.evaluate(market_prices)
+        for contingent_order in triggered:
+            self.execute_order(contingent_order, market_prices)
+
         total_pos_value = 0.0
         for ticker, pos in self._positions.items():
             price = market_prices.get(ticker, pos.current_price)
@@ -248,6 +271,21 @@ class PaperTrader:
         order.fill_price = fill_price
         order.status = OrderStatus.FILLED
 
+        # Register contingent legs if bracket or trailing stop fields are set
+        if (
+            order.take_profit_price is not None
+            or order.stop_loss_price is not None
+            or order.trail_percent is not None
+        ):
+            self._contingent.register(
+                ticker=ticker,
+                quantity=qty,
+                entry_price=fill_price,
+                take_profit_price=order.take_profit_price,
+                stop_loss_price=order.stop_loss_price,
+                trail_percent=order.trail_percent,
+            )
+
         # Trade log
         self._trade_log.append(
             {
@@ -306,6 +344,9 @@ class PaperTrader:
         # Finalise order
         order.fill_price = fill_price
         order.status = OrderStatus.FILLED
+
+        # Remove contingent entry for this ticker (no-op if already triggered)
+        self._contingent.cancel(ticker)
 
         # Trade log
         self._trade_log.append(
