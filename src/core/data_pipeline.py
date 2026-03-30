@@ -256,13 +256,20 @@ class DataPipeline:
         tickers: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
+        interval: str = "1d",
+        period: str | None = None,
     ) -> pd.DataFrame:
         """Fetch OHLCV data from yfinance when Qlib data is unavailable.
 
         Args:
-            tickers: Ticker symbols. Defaults to a small benchmark set.
-            start:   Start date string. Defaults to config test_start.
-            end:     End date string. Defaults to config test_end.
+            tickers:  Ticker symbols. Defaults to a small benchmark set.
+            start:    Start date string. Defaults to config test_start.
+            end:      End date string. Defaults to config test_end.
+            interval: yfinance interval string (e.g. ``"1d"``, ``"1h"``, ``"4h"``).
+                      Intraday intervals (< ``"1d"``) are limited to the last 60 days
+                      by the yfinance API.
+            period:   yfinance period shorthand (e.g. ``"2d"``, ``"5d"``). When set,
+                      takes precedence over ``start``/``end``.
 
         Returns:
             Standardised DataFrame with columns: open, high, low, close, volume, ticker.
@@ -270,12 +277,22 @@ class DataPipeline:
         import yfinance as yf  # noqa: PLC0415
 
         tickers = tickers or ["SPY", "QQQ", "IWM"]
-        start = start or self.config.qlib.test_start
-        end = end or self.config.qlib.test_end
 
-        logger.info("yfinance download: tickers={}, start={}, end={}", tickers, start, end)
+        logger.info(
+            "yfinance download: tickers={}, interval={}, start={}, end={}, period={}",
+            tickers,
+            interval,
+            start,
+            end,
+            period,
+        )
 
-        raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+        if period is not None:
+            raw = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+        else:
+            start = start or self.config.qlib.test_start
+            end = end or self.config.qlib.test_end
+            raw = yf.download(tickers, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
 
         if raw.empty:
             logger.warning("yfinance returned empty DataFrame.")
