@@ -144,7 +144,7 @@ class TestCcxtTrader:
         assert result is not None
         assert result.status == OrderStatus.FILLED
         assert result.fill_price == pytest.approx(50_000.0)
-        mock_ex.create_order.assert_called_once_with("BTC/USDT", "market", "buy", 0.01, None)
+        mock_ex.create_order.assert_called_once_with("BTC/USDT", "market", "buy", 0.01, None, {})
 
     # 6 — Execute market sell order
     def test_execute_market_sell_order(self) -> None:
@@ -159,7 +159,7 @@ class TestCcxtTrader:
         assert result is not None
         assert result.status == OrderStatus.FILLED
         assert result.fill_price == pytest.approx(51_000.0)
-        mock_ex.create_order.assert_called_once_with("BTC/USDT", "market", "sell", 0.01, None)
+        mock_ex.create_order.assert_called_once_with("BTC/USDT", "market", "sell", 0.01, None, {})
 
     # 7 — Execute limit order uses limit price
     def test_execute_limit_order(self) -> None:
@@ -172,7 +172,9 @@ class TestCcxtTrader:
                       order_type=OrderType.LIMIT, limit_price=49_500.0)
         trader.execute_order(order, {"ETH": 50_000.0})
 
-        mock_ex.create_order.assert_called_once_with("ETH/USDT", "limit", "buy", 0.1, 49_500.0)
+        mock_ex.create_order.assert_called_once_with(
+            "ETH/USDT", "limit", "buy", 0.1, 49_500.0, {"timeInForce": "GTC"}
+        )
 
     # 8 — Rejected order returns None
     def test_execute_order_rejected(self) -> None:
