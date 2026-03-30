@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # --- Enums ---
 
@@ -33,6 +33,8 @@ class OrderSide(str, Enum):
 class OrderType(str, Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    STOP = "STOP"                    # market sell when price hits stop_loss_price
+    TRAILING_STOP = "TRAILING_STOP"  # stop ratchets up with peak price
 
 
 class OrderStatus(str, Enum):
@@ -40,6 +42,13 @@ class OrderStatus(str, Enum):
     FILLED = "FILLED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
+
+
+class TimeInForce(str, Enum):
+    GTC = "GTC"   # good-till-cancelled (default)
+    DAY = "DAY"   # expires at end of trading day
+    IOC = "IOC"   # immediate-or-cancel
+    FOK = "FOK"   # fill-or-kill
 
 
 class SignalDirection(str, Enum):
@@ -109,6 +118,23 @@ class Order(BaseModel):
     status: OrderStatus = OrderStatus.PENDING
     fill_price: float | None = None
     timestamp: datetime = Field(default_factory=datetime.now)
+    time_in_force: TimeInForce = TimeInForce.GTC
+    take_profit_price: float | None = None
+    stop_loss_price: float | None = None
+    trail_percent: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_advanced_fields(self) -> "Order":
+        """Validate advanced order field constraints."""
+        if self.order_type == OrderType.STOP and self.stop_loss_price is None:
+            raise ValueError("STOP orders require stop_loss_price")
+        if self.order_type == OrderType.TRAILING_STOP:
+            if self.trail_percent is None or self.trail_percent <= 0:
+                raise ValueError("TRAILING_STOP orders require trail_percent > 0")
+        if self.take_profit_price is not None and self.stop_loss_price is not None:
+            if self.take_profit_price <= self.stop_loss_price:
+                raise ValueError("take_profit_price must be greater than stop_loss_price")
+        return self
 
 
 class Position(BaseModel):
