@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from loguru import logger
 
 from src.utils.config import AppConfig
-from src.utils.schemas import IntradayRunResult, OrderSide, Signal, SignalDirection
+from src.utils.schemas import IntradayRunResult, Signal, SignalDirection
 
 
 _TIMEFRAME_MAP: dict[int, str] = {
@@ -161,27 +159,31 @@ class IntradayRunner:
         prices: dict[str, float] = {}
         cfg = self._config.intraday
 
+        # Lazily instantiate pipelines once — not inside the per-ticker loop.
+        crypto_pipeline = None
+        equity_pipeline = None
+
         for ticker in universe:
             try:
                 if "/" in ticker or cfg.crypto_only:
-                    # Crypto: use CryptoPipeline
-                    from src.core.crypto_pipeline import CryptoPipeline  # noqa: PLC0415
+                    if crypto_pipeline is None:
+                        from src.core.crypto_pipeline import CryptoPipeline  # noqa: PLC0415
 
-                    pipeline = CryptoPipeline(self._config)
+                        crypto_pipeline = CryptoPipeline(self._config)
                     symbol = (
                         ticker
                         if "/" in ticker
                         else f"{ticker}/{self._config.crypto.quote_currency}"
                     )
-                    df = pipeline.fetch_ohlcv(symbol, timeframe=timeframe, limit=2)
+                    df = crypto_pipeline.fetch_ohlcv(symbol, timeframe=timeframe, limit=2)
                     if not df.empty:
                         prices[ticker] = float(df["close"].iloc[-1])
                 else:
-                    # Equity: yfinance with interval
-                    from src.core.data_pipeline import DataPipeline  # noqa: PLC0415
+                    if equity_pipeline is None:
+                        from src.core.data_pipeline import DataPipeline  # noqa: PLC0415
 
-                    pipeline = DataPipeline(self._config)
-                    df = pipeline.yfinance_fallback([ticker], interval=timeframe, period="2d")
+                        equity_pipeline = DataPipeline(self._config)
+                    df = equity_pipeline.yfinance_fallback([ticker], interval=timeframe, period="2d")
                     if not df.empty:
                         close_col = (
                             ("Close", ticker) if ("Close", ticker) in df.columns else "Close"

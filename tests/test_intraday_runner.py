@@ -5,21 +5,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
 from src.core.intraday_runner import IntradayRunner, _minutes_to_timeframe
 from src.utils.config import AppConfig
 from src.utils.schemas import IntradayRunResult, SignalDirection
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_config(**intraday_kwargs) -> AppConfig:
-    """Return an AppConfig with optional intraday overrides."""
-    return AppConfig(intraday=intraday_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +139,6 @@ def test_top_n_respected():
     config = AppConfig()
     runner = IntradayRunner(config)
 
-    tickers = {f"T{i}": float(i) for i in range(10)}
     scores = {f"T{i}": float(i) / 9 for i in range(10)}
 
     signals = runner._build_signals(scores, top_n=3)
