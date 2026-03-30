@@ -25,6 +25,7 @@ from src.utils.schemas import (
     OrderType,
     Portfolio,
     Position,
+    TimeInForce,
 )
 
 
@@ -203,6 +204,24 @@ class AlpacaTrader:
             )
         return self._client
 
+    def _map_tif(self, tif: TimeInForce):
+        """Map our TimeInForce enum to Alpaca's TimeInForce enum.
+
+        Args:
+            tif: Our TimeInForce value.
+
+        Returns:
+            Corresponding alpaca.trading.enums.TimeInForce value.
+        """
+        from alpaca.trading.enums import TimeInForce as AlpacaTIF
+
+        return {
+            TimeInForce.GTC: AlpacaTIF.GTC,
+            TimeInForce.DAY: AlpacaTIF.DAY,
+            TimeInForce.IOC: AlpacaTIF.IOC,
+            TimeInForce.FOK: AlpacaTIF.FOK,
+        }[tif]
+
     def _submit_order(self, order: Order):
         """Map our Order to an Alpaca request and submit with retries.
 
@@ -216,28 +235,76 @@ class AlpacaTrader:
             AlpacaConnectionError: After exhausting all retry attempts.
         """
         from alpaca.trading.enums import OrderSide as AlpacaOrderSide
-        from alpaca.trading.enums import TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        from alpaca.trading.requests import (
+            LimitOrderRequest,
+            MarketOrderRequest,
+            StopLossRequest,
+            TakeProfitRequest,
+            TrailingStopOrderRequest,
+        )
 
         client = self._get_client()
         side = AlpacaOrderSide.BUY if order.side == OrderSide.BUY else AlpacaOrderSide.SELL
+        tif = self._map_tif(order.time_in_force)
 
         for attempt in range(self._config.max_retries):
             try:
-                if order.order_type == OrderType.LIMIT and order.limit_price is not None:
+                # 1. Trailing stop
+                if order.order_type == OrderType.TRAILING_STOP:
+                    req = TrailingStopOrderRequest(
+                        symbol=order.ticker,
+                        qty=order.quantity,
+                        side=side,
+                        time_in_force=tif,
+                        trail_percent=order.trail_percent,
+                    )
+                # 2. Bracket (both TP and SL)
+                elif order.take_profit_price is not None and order.stop_loss_price is not None:
+                    req = MarketOrderRequest(
+                        symbol=order.ticker,
+                        qty=order.quantity,
+                        side=side,
+                        time_in_force=tif,
+                        order_class="bracket",
+                        take_profit=TakeProfitRequest(limit_price=order.take_profit_price),
+                        stop_loss=StopLossRequest(stop_price=order.stop_loss_price),
+                    )
+                # 3. SL only
+                elif order.stop_loss_price is not None:
+                    req = MarketOrderRequest(
+                        symbol=order.ticker,
+                        qty=order.quantity,
+                        side=side,
+                        time_in_force=tif,
+                        order_class="oto",
+                        stop_loss=StopLossRequest(stop_price=order.stop_loss_price),
+                    )
+                # 4. TP only
+                elif order.take_profit_price is not None:
+                    req = MarketOrderRequest(
+                        symbol=order.ticker,
+                        qty=order.quantity,
+                        side=side,
+                        time_in_force=tif,
+                        order_class="oto",
+                        take_profit=TakeProfitRequest(limit_price=order.take_profit_price),
+                    )
+                # 5. Limit order
+                elif order.order_type == OrderType.LIMIT and order.limit_price is not None:
                     req = LimitOrderRequest(
                         symbol=order.ticker,
                         qty=order.quantity,
                         side=side,
-                        time_in_force=TimeInForce.DAY,
+                        time_in_force=tif,
                         limit_price=order.limit_price,
                     )
+                # 6. Plain market order
                 else:
                     req = MarketOrderRequest(
                         symbol=order.ticker,
                         qty=order.quantity,
                         side=side,
-                        time_in_force=TimeInForce.DAY,
+                        time_in_force=tif,
                     )
                 return client.submit_order(order_data=req)
             except Exception as exc:
@@ -246,7 +313,7 @@ class AlpacaTrader:
                         f"Submit order failed after {self._config.max_retries} retries: {exc}"
                     ) from exc
                 time.sleep(2**attempt)
-        return None  # unreachable but satisfies type checkers
+        return None
 
     def _wait_for_fill(self, alpaca_order_id: str, timeout: int) -> Order | None:
         """Poll Alpaca until the order is filled or the timeout expires.
