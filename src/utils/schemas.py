@@ -369,8 +369,6 @@ class RebalanceFrequency(str, Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
-    HOURLY_4 = "4h"
-    HOURLY_1 = "1h"
 
 
 class SelectionMethod(str, Enum):
@@ -408,20 +406,6 @@ class StrategyAllocation(BaseModel):
     selection_method: SelectionMethod = SelectionMethod.REGIME_BASED
     regime: MacroRegime = MacroRegime.NEUTRAL
     timestamp: datetime = Field(default_factory=datetime.now)
-
-
-class IntradayRunResult(BaseModel):
-    """Result of one intraday pipeline execution cycle."""
-
-    timestamp: datetime = Field(default_factory=datetime.now)
-    universe: list[str]
-    timeframe: str
-    signals_generated: int
-    orders_placed: int
-    orders_rejected: int
-    nav: float
-    status: str  # "completed" | "skipped" | "failed"
-    error: str | None = None
 
 
 class StrategyPerformance(BaseModel):
