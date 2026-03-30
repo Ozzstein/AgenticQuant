@@ -68,7 +68,7 @@
   - Bracket orders (take-profit + stop-loss)
   - Trailing stops, time-in-force options
 
-- [ ] **3D. Intraday Scheduling**
+- [x] **3D. Intraday Scheduling**
   - Sub-daily pipeline runs for crypto and momentum strategies
   - Configurable scheduling per strategy
 
