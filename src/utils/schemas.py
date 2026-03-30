@@ -364,6 +364,8 @@ class SizingMethod(str, Enum):
 
 
 class RebalanceFrequency(str, Enum):
+    HOURLY_4 = "4h"
+    HOURLY_1 = "1h"
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
@@ -475,3 +477,17 @@ class RegimeEvolutionResult(BaseModel):
     accepted: bool
     signals_used: list[str] = Field(default_factory=list)
     n_states: int = 4
+
+
+class IntradayRunResult(BaseModel):
+    """Result of one intraday pipeline execution cycle."""
+
+    timestamp: datetime = Field(default_factory=datetime.now)
+    universe: list[str]
+    timeframe: str
+    signals_generated: int
+    orders_placed: int
+    orders_rejected: int
+    nav: float
+    status: Literal["completed", "skipped", "failed"]
+    error: str | None = None

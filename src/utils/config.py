@@ -197,6 +197,16 @@ class MemoryConfig(BaseModel):
     store_path: Path = PROJECT_ROOT / "data" / "agent_memory" / "analysis_log.jsonl"
 
 
+class IntradayConfig(BaseModel):
+    """Configuration for sub-daily intraday pipeline runs."""
+
+    enabled: bool = False
+    interval_minutes: int = 240
+    crypto_only: bool = True
+    universe: list[str] = Field(default_factory=list)
+    top_n: int = 5
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -224,6 +234,7 @@ class AppConfig(BaseSettings):
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
     ccxt: CcxtConfig = Field(default_factory=CcxtConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    intraday: IntradayConfig = Field(default_factory=IntradayConfig)
 
     @field_validator("log_level")
     @classmethod
