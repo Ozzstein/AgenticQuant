@@ -189,16 +189,6 @@ class CcxtConfig(BaseModel):
     timeout_seconds: int = 30
 
 
-class IntradayConfig(BaseModel):
-    """Configuration for sub-daily intraday pipeline runs."""
-
-    enabled: bool = False
-    interval_minutes: int = 240
-    crypto_only: bool = True
-    universe: list[str] = Field(default_factory=list)
-    top_n: int = 5
-
-
 class MemoryConfig(BaseModel):
     """Agent memory persistence configuration."""
 
