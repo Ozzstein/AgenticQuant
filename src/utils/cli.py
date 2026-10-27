@@ -10,6 +10,7 @@ from rich.console import Console
 from scripts.run_agents import analyze as analyze_command
 from scripts.run_agents import app as agents_app
 from scripts.run_backtest import app as backtest_app
+from scripts.run_operations import app as operations_app
 from scripts.run_rd_agent import app as rdagent_app
 
 app = typer.Typer(
@@ -48,6 +49,7 @@ app.add_typer(backtest_app, name="backtest")
 
 
 app.add_typer(agents_app, name="agents")
+app.add_typer(operations_app, name="operations")
 app.command("analyze")(analyze_command)
 
 

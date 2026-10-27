@@ -38,7 +38,10 @@ def portfolio_view(path: str | Path, account_id: str) -> dict:
                 'snapshot':history[-1].model_dump(mode='json') if history else None,
                 'history':[s.model_dump(mode='json') for s in history],
                 'fills':[f.model_dump(mode='json') for f in ledger.fills(account_id)],
-                'pending':ledger.pending(account_id),'reconciliation':reconciliation}
+                'pending':[{key:value.model_dump(mode='json') if hasattr(value,'model_dump') else
+                            str(value) if isinstance(value,Decimal) else value
+                            for key,value in order.items()} for order in ledger.pending(account_id)],
+                'reconciliation':reconciliation}
     finally:
         ledger.close()
 

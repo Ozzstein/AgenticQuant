@@ -1,6 +1,8 @@
 """Tests for FactorBacktester and related schemas/config."""
 from __future__ import annotations
 
+from tests.test_research_copilot import research_env  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Task 1: Schema and config tests
 # ---------------------------------------------------------------------------
@@ -49,116 +51,42 @@ def test_config_min_backtest_sharpe_default():
     assert cfg.min_backtest_sharpe == 0.5
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers for FactorBacktester tests
-# ---------------------------------------------------------------------------
+# The public memo wrapper now reads only immutable recorded development results.
 
 
-
-
-
-# ---------------------------------------------------------------------------
-# Task 2: FactorBacktester tests
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Task 3: RDAgentRunner wiring tests
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Task 4: ResearchAnalyst format test
-# ---------------------------------------------------------------------------
-
-def test_research_analyst_memo_format_with_backtest():
-    """_format_results_table() includes bt_sharpe column when bt_results dict provided."""
+def analyst(env, calls):
     from src.core.research_analyst import ResearchAnalyst
-    from src.utils.schemas import BacktestValidationResult, EvalResult
-
-    results = [
-        EvalResult(
-            factor_name="good_factor",
-            stage1_ic=0.05,
-            stage1_passed=True,
-            stage2_ic=0.04,
-            stage2_icir=0.6,
-            passed=True,
-            reason="passed",
-        ),
-        EvalResult(
-            factor_name="bad_factor",
-            stage1_ic=0.001,
-            stage1_passed=False,
-            passed=False,
-            reason="low_ic",
-        ),
-    ]
-    bt_results = {
-        "good_factor": BacktestValidationResult(
-            factor_name="good_factor",
-            passed=True,
-            sharpe=1.23,
-            reason="passed",
-        )
-    }
-
-    table = ResearchAnalyst._format_results_table(results, bt_results=bt_results)
-
-    # Column header
-    assert "bt_sharpe" in table, f"Expected 'bt_sharpe' column in table:\n{table}"
-    # Good factor has sharpe value
-    assert "1.2300" in table, f"Expected Sharpe '1.2300' in table:\n{table}"
-    # Bad factor (IC-failed, not in bt_results) has em-dash
-    assert "—" in table, f"Expected '—' for IC-failed factor:\n{table}"
+    from tests.test_research_copilot import ProviderFixture
+    return ResearchAnalyst(env.config, registry=env.registry, evidence_store=env.store,
+        code_hash=env.code_hash, environment_hash=env.environment_hash,
+        llm_factory=lambda purpose, model: ProviderFixture(purpose, model, calls))
 
 
-def test_research_analyst_memo_format_without_backtest():
-    """_format_results_table() omits bt_sharpe column when bt_results not provided."""
-    from src.core.research_analyst import ResearchAnalyst
-    from src.utils.schemas import EvalResult
+def test_research_analyst_memo_uses_recorded_development_result(research_env):  # noqa: F811
+    import json
 
-    results = [
-        EvalResult(
-            factor_name="factor_a",
-            stage1_ic=0.03,
-            stage1_passed=True,
-            passed=True,
-            reason="passed",
-        ),
-    ]
+    from tests.test_research_copilot import development_fixture
+    env = research_env
+    trial, outcome = development_fixture(env)
+    calls = []
+    result = analyst(env, calls).write_memo(context=env.context, development_trial_ids=(trial.trial_id,))
+    assert result.status == 'available'
+    assert result.memo.development_trial_ids == (trial.trial_id,)
+    # Preserve failure and undefined performance instead of a fabricated table cell.
+    source = json.loads(calls[0]['sources'][0]['text'])
+    assert source == outcome.model_dump(mode='json')
+    assert source['status'] == 'failed' and source['sharpe'] is None
 
-    table = ResearchAnalyst._format_results_table(results)
 
-    assert "bt_sharpe" not in table, f"bt_sharpe column should be absent:\n{table}"
-    # Standard columns must still be present
-    assert "stage1_IC" in table
-    assert "ICIR" in table
-    assert "passed" in table
+def test_research_analyst_without_backtest_is_explicit_source_hypothesis(research_env):  # noqa: F811
+    env = research_env
+    calls = []
+    result = analyst(env, calls).write_memo(context=env.context, sources=(env.source,))
+    assert result.status == 'available'
+    assert not result.memo.development_trial_ids
+    assert 'Hypothesis (unvalidated)' in result.memo.text
+    assert env.source.record.evidence_id in result.memo.text
+    assert calls[0]['sources'][0]['text'] == env.source.text
 
 # Actual performance/reliability cases are covered by test_research_evaluation;
 # the legacy mocked APPROVED/CAUTION shortcut no longer has approval authority.
