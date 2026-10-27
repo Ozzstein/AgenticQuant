@@ -80,6 +80,77 @@ def current_terms(ledger, account, action_id):
     return chain[-1]
 
 
+def _has_table(ledger, name):
+    return (
+        ledger.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def admitted_terms(ledger, account, *, as_of):
+    as_of = _utc(as_of)
+    ledger.spec(account)
+    if not _has_table(ledger, "dividend_terms"):
+        return ()
+    result = []
+    for row in ledger.db.execute(
+        "SELECT DISTINCT action FROM dividend_terms WHERE account=? ORDER BY action", (account,)
+    ):
+        eligible = []
+        for terms in terms_history(ledger, account, row[0]):
+            admission = json.loads(
+                ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?",
+                    (account, "dividend-admission:" + terms.content_hash()),
+                ).fetchone()[0]
+            )
+            if datetime.fromisoformat(admission["as_of"]) <= as_of:
+                eligible.append(terms)
+        if eligible:
+            result.append(eligible[-1])
+    return tuple(sorted(result, key=lambda term: (term.entitlement_at, term.action_id)))
+
+
+def recorded_entitlements(ledger, account, *, as_of):
+    as_of = _utc(as_of)
+    ledger.reconcile(account)
+    if not _has_table(ledger, "dividend_entitlements"):
+        return ()
+    result = [
+        DividendEntitlement.model_validate_json(row[0])
+        for row in ledger.db.execute(
+            "SELECT payload FROM dividend_entitlements WHERE account=?", (account,)
+        )
+    ]
+    return tuple(
+        sorted(
+            (value for value in result if value.at <= as_of),
+            key=lambda value: (value.at, value.action_id),
+        )
+    )
+
+
+def recorded_payments(ledger, account, *, as_of):
+    as_of = _utc(as_of)
+    ledger.reconcile(account)
+    if not _has_table(ledger, "dividend_payments"):
+        return ()
+    result = [
+        DividendPayment.model_validate_json(row[0])
+        for row in ledger.db.execute(
+            "SELECT payload FROM dividend_payments WHERE account=?", (account,)
+        )
+    ]
+    return tuple(
+        sorted(
+            (value for value in result if value.available_at <= as_of),
+            key=lambda value: (value.available_at, value.payment_id),
+        )
+    )
+
+
 def register_terms(ledger, account, terms: CashDividend, *, as_of):
     terms = CashDividend.model_validate(terms.model_dump())
     as_of = _utc(as_of)

@@ -21,6 +21,7 @@ from src.domain.portfolio import (
     AccountFee,
     AccountSpec,
     ActionCoverage,
+    CashDividend,
     CorporateAction,
     DividendEntitlement,
     DividendPayment,
@@ -133,6 +134,23 @@ class PortfolioLedger:
 
     def close(self):
         self.db.close()
+
+    @contextmanager
+    def _reading(self):
+        """One consistent read view, including a caller's uncommitted transaction."""
+        with self._lock:
+            outer = not self.db.in_transaction
+            if outer:
+                self.db.execute("BEGIN")
+            try:
+                yield
+            except BaseException:
+                if outer:
+                    self.db.execute("ROLLBACK")
+                raise
+            else:
+                if outer:
+                    self.db.execute("COMMIT")
 
     def create_account(self, spec: AccountSpec):
         with self.atomic():
@@ -610,6 +628,27 @@ class PortfolioLedger:
         from src.execution.dividends import register_terms
 
         return register_terms(self, account, terms, as_of=as_of)
+
+    def cash_dividends(self, account, *, as_of) -> tuple[CashDividend, ...]:
+        """Latest actual admitted terms per action, available by the requested cutoff."""
+        from src.execution.dividends import admitted_terms
+
+        with self._reading():
+            return admitted_terms(self, account, as_of=as_of)
+
+    def dividend_entitlements(self, account, *, as_of) -> tuple[DividendEntitlement, ...]:
+        """Original durable ownership entries, independently reconciled before return."""
+        from src.execution.dividends import recorded_entitlements
+
+        with self._reading():
+            return recorded_entitlements(self, account, as_of=as_of)
+
+    def dividend_payments(self, account, *, as_of) -> tuple[DividendPayment, ...]:
+        """Original payment receipts and clocks; later observation cannot replace them."""
+        from src.execution.dividends import recorded_payments
+
+        with self._reading():
+            return recorded_payments(self, account, as_of=as_of)
 
     def record_action_coverage(self, account, coverage: ActionCoverage, *, as_of):
         """Retain actual coverage/gaps; recording is not proof of completeness."""
