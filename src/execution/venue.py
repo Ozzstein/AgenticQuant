@@ -11,7 +11,7 @@ import json
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import Field, model_validator
 
@@ -29,12 +29,16 @@ from src.domain.portfolio import (
     FillPolicy,
     InstrumentRisk,
     OpeningEvent,
+    OpeningSourceIdentity,
     OrderIntent,
     Positive,
     RiskPolicy,
 )
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.simulator import PaperExecution
+
+if TYPE_CHECKING:
+    from src.execution.opening_sources import OpeningSourceBinding
 
 D = Decimal
 
@@ -884,6 +888,39 @@ class PaperVenue:
             raise LedgerError("persisted observed opening receipt identity changed")
         return receipt
 
+    def unbound_opening_receipts(self, instrument: Instrument) -> tuple[ObservedOpenReceipt, ...]:
+        from src.execution.opening_sources import unbound_receipts
+
+        return tuple(
+            ObservedOpenReceipt.model_validate(r)
+            for r in unbound_receipts(self.ledger, self.account_id, instrument)
+        )
+
+    def opening_source_binding(self, event_id: str) -> OpeningSourceBinding | None:
+        from src.execution.opening_sources import event_binding
+
+        return event_binding(self.ledger, self.account_id, event_id)
+
+    def bind_opening_source(
+        self,
+        identity: OpeningSourceIdentity,
+        *,
+        event_id: str,
+        evidence_id: str,
+        evidence_hash: str,
+    ) -> OpeningSourceBinding:
+        """Bind externally verified native bytes to an existing exact receipt."""
+        from src.execution.opening_sources import bind
+
+        return bind(
+            self.ledger,
+            self.account_id,
+            identity,
+            event_id=event_id,
+            evidence_id=evidence_id,
+            evidence_hash=evidence_hash,
+        )
+
     def settle_open(
         self,
         event: OpeningEvent | ExecutionBar,
@@ -894,6 +931,7 @@ class PaperVenue:
         as_of,
         evidence_id,
         evidence_hash,
+        source_identity: OpeningSourceIdentity | None = None,
     ):
         """Settle a documented opening print for previously accepted paper orders.
 
@@ -908,6 +946,18 @@ class PaperVenue:
             event = OpeningEvent.model_validate(event.model_dump())
         else:
             raise TypeError("settlement requires an OpeningEvent or ExecutionBar")
+        if source_identity is not None:
+            source_identity = OpeningSourceIdentity.model_validate(source_identity.model_dump())
+        from src.execution.opening_sources import (
+            consumed_event,
+            require_identity,
+            require_new_event_source,
+            require_same_opening,
+            source_binding,
+        )
+
+        if source_identity is not None:
+            require_identity(event, source_identity)
         receipt = ObservedOpenReceipt(
             account_id=self.account_id,
             event_id=event.event_id,
@@ -958,14 +1008,34 @@ class PaperVenue:
                 ).fetchone()
                 if consumed is None:
                     raise LedgerError("observed receipt has no committed opening consumption")
+                if source_identity is not None:
+                    self.bind_opening_source(
+                        source_identity,
+                        event_id=event.event_id,
+                        evidence_id=evidence_id,
+                        evidence_hash=evidence_hash,
+                    )
                 if completed_bar is not None:
                     return self.engine.open_bar(completed_bar, {})
                 return self.engine.open_event(event, {})
-            if self.ledger.db.execute(
-                "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
-                (self.account_id, event.opened_at.isoformat()),
-            ).fetchone():
+            first = (
+                source_binding(self.ledger, self.account_id, source_identity)
+                if source_identity is not None
+                else None
+            )
+            if first is not None:
+                require_same_opening(
+                    consumed_event(self.ledger, self.account_id, first.consumed_event_id), event
+                )
+            if (
+                first is None
+                and self.ledger.db.execute(
+                    "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
+                    (self.account_id, event.opened_at.isoformat()),
+                ).fetchone()
+            ):
                 raise LedgerError("observed opening print conflicts with published NAV")
+            require_new_event_source(self.ledger, self.account_id, event, source_identity)
             accepted = self.accepted_intent_ids_before(event.opened_at)
             expected = {
                 state["intent"].intent_id
@@ -990,13 +1060,38 @@ class PaperVenue:
                 if any(value.as_of > event.opened_at for value in metadata.values()):
                     raise LedgerError("opening settlement cannot use future risk metadata")
             self.ledger.record_event(self.account_id, key, receipt.model_dump_json())
+            if first is not None:
+                # A source-authenticated alias only records its own receipt. The
+                # original print already consumed capacity, including any unused
+                # remainder. No mark or fill is replayed behind a later NAV.
+                self.ledger.record_event(
+                    self.account_id, "opening-event:" + event.event_id, event.model_dump_json()
+                )
+                self.bind_opening_source(
+                    source_identity,
+                    event_id=event.event_id,
+                    evidence_id=evidence_id,
+                    evidence_hash=evidence_hash,
+                )
+                if completed_bar is not None:
+                    self.engine.open_bar(completed_bar, {})
+                return []
             execute = self.engine.open_bar if completed_bar is not None else self.engine.open_event
-            return execute(
+            fills = execute(
                 completed_bar if completed_bar is not None else event,
                 {},
                 eligible_intent_ids=expected,
                 intent_metadata=metadata_by_intent,
+                source_identity=source_identity,
             )
+            if source_identity is not None:
+                self.bind_opening_source(
+                    source_identity,
+                    event_id=event.event_id,
+                    evidence_id=evidence_id,
+                    evidence_hash=evidence_hash,
+                )
+            return fills
 
     def advance_close(self, bar):
         return self.engine.close_bar(bar)

@@ -8,7 +8,7 @@ weekdays. The simulator executes only at observed session/bar opens.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from typing import Annotated, Literal
 
@@ -696,3 +696,38 @@ class OpeningEvent(VersionedContract):
             tradable=bar.tradable,
             price_convention=bar.price_convention,
         )
+
+
+class OpeningSourceIdentity(VersionedContract):
+    """Native print identity across capture/feed versions, authenticated externally."""
+
+    provider: Literal["alpaca", "kraken", "binance"]
+    instrument: Instrument
+    trade_id: Annotated[str, Field(strict=True, min_length=1)]
+    wire_timestamp: Annotated[str, Field(strict=True, min_length=1)]
+
+    @model_validator(mode="after")
+    def exact_native_identity(self):
+        value = self.wire_timestamp
+        digits = value[1:] if value.startswith("-") else value
+        if not digits.isascii() or not digits.isdecimal() or str(int(value)) != value:
+            raise ValueError("wire timestamp requires canonical UTC unix-nanosecond integer text")
+        native = self.trade_id
+        if self.provider == "alpaca":
+            parts = native.split(":")
+            if len(parts) != 2 or not parts[0] or not parts[0].isascii() or not parts[0].isalnum():
+                raise ValueError("Alpaca trade ID requires its exact exchange:id identity")
+            native = parts[1]
+        if not native.isascii() or not native.isdecimal() or str(int(native)) != native:
+            raise ValueError("native trade ID requires canonical integer text")
+        self.projected_opened_at()  # Reject timestamps outside the actual datetime range.
+        return self
+
+    def projected_opened_at(self) -> datetime:
+        """Exact declared ceil-microsecond-1 projection, never an identity inference."""
+        try:
+            return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
+                microseconds=(int(self.wire_timestamp) + 999) // 1000
+            )
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("native print timestamp is outside the supported clock range") from exc

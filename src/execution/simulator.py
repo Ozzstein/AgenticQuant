@@ -11,6 +11,7 @@ from src.domain.portfolio import (
     FillPolicy,
     InstrumentRisk,
     OpeningEvent,
+    OpeningSourceIdentity,
     OrderIntent,
     PriceMark,
     RiskPolicy,
@@ -68,6 +69,7 @@ class PaperExecution:
         *,
         eligible_intent_ids: set[str] | None = None,
         intent_metadata: dict[str, dict[str, InstrumentRisk]] | None = None,
+        source_identity: OpeningSourceIdentity | None = None,
     ) -> list[Fill]:
         """Historical completed-bar adapter over the one opening-fill primitive."""
         bar = ExecutionBar.model_validate(bar.model_dump())
@@ -89,6 +91,7 @@ class PaperExecution:
                 metadata,
                 eligible_intent_ids=eligible_intent_ids,
                 intent_metadata=intent_metadata,
+                source_identity=source_identity,
             )
             self.ledger.record_event(self.account_id, "open:" + bar.event_id, bar.model_dump_json())
             return fills
@@ -100,6 +103,7 @@ class PaperExecution:
         *,
         eligible_intent_ids: set[str] | None = None,
         intent_metadata: dict[str, dict[str, InstrumentRisk]] | None = None,
+        source_identity: OpeningSourceIdentity | None = None,
     ) -> list[Fill]:
         """At the open, fill market/marketable-limit/triggered-stop orders only.
 
@@ -128,6 +132,14 @@ class PaperExecution:
                 self.account_id, "opening-event:" + event.event_id, event.model_dump_json()
             ):
                 return []
+            from src.execution.opening_sources import require_new_event_source, source_binding
+
+            require_new_event_source(self.ledger, self.account_id, event, source_identity)
+            if (
+                source_identity is not None
+                and source_binding(self.ledger, self.account_id, source_identity) is not None
+            ):
+                raise LedgerError("native opening alias must settle through its observed receipt")
             self.ledger.mark(
                 self.account_id,
                 [
