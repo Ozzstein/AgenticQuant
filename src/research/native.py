@@ -366,6 +366,16 @@ class NativeSupervisor:
                                                document_manifest=documents,inherited_exposures=tuple(inherited))
 
     def run(self, request: NativeRequest, *, gateway_token_path: str | Path, registry) -> dict:
+        from src.research.native_recovery import (
+            _artifacts,
+            _budget_receipt,
+            _load_launch,
+            _publish_result,
+            _result,
+            bind_container,
+            native_run_lock,
+            record_launch,
+        )
         from src.research.registry import ResearchRegistry
         if not isinstance(registry,ResearchRegistry):
             raise ValueError('native execution requires the authoritative research registry')
@@ -387,8 +397,19 @@ class NativeSupervisor:
         command = self.command(request,work,token,frozen_root=self.root/'.inputs'/request.run_id)
         started = time.monotonic()
         state, code = 'failed',None
+        primary_error = None
         with (work/'stdout.log').open('wb') as stdout, (work/'stderr.log').open('wb') as stderr:
-            process = subprocess.Popen(command,stdout=stdout,stderr=stderr)
+            with native_run_lock(registry,request.run_id):
+                record_launch(self,request,registry,gateway_token_path=token,
+                              preflight=evidence,exposure=exposure)
+                if command[:2] != ['docker','run']:
+                    raise ValueError('native launch requires the fixed Docker command')
+                container_id = self._docker('create',*command[2:]).strip()
+                if not re.fullmatch(r'[0-9a-f]{64}',container_id):
+                    raise ValueError('Docker create did not return one exact container ID')
+                bind_container(self,registry,request.run_id,container_id)
+                process = subprocess.Popen(['docker','start','--attach',container_id],
+                                           stdout=stdout,stderr=stderr)
             try:
                 while process.poll() is None:
                     if time.monotonic()-started > request.max_seconds:
@@ -401,40 +422,66 @@ class NativeSupervisor:
                 else:
                     code = process.returncode
                     state = {0:'discovery_complete',124:'timeout',125:'output_limit',130:'interrupted'}.get(code,'failed')
-            except BaseException:
+            except BaseException as exc:
+                primary_error = exc
                 state = 'interrupted'
                 raise
             finally:
-                cleanup_error = None
-                if process.poll() is None:
-                    try:
-                        self._docker('rm','--force','quantagent-rd-'+request.run_id)
-                        process.wait(timeout=30)
-                    except (RuntimeError,subprocess.TimeoutExpired) as exc:
-                        cleanup_error = str(exc)
-                        state = 'cleanup_failed'
-                        process.kill()
-                        process.wait(timeout=10)
-                code = process.returncode
-                final_receipt, audit_error = None, None
                 try:
-                    final_receipt = self.gateway_receipt(request, token)
-                    self.verify_receipt(request, final_receipt, now=datetime.now(timezone.utc), final=True)
-                except Exception as exc:
-                    audit_error = type(exc).__name__
-                    if state == 'discovery_complete':
+                    cleanup_error = None
+                    if process.poll() is None:
+                        try:
+                            self._docker('rm','--force',container_id)
+                            process.wait(timeout=30)
+                        except Exception as exc:
+                            cleanup_error = type(exc).__name__
+                            state = 'cleanup_failed'
+                            try:
+                                process.kill()
+                                process.wait(timeout=10)
+                            except Exception as kill_error:
+                                cleanup_error += ':'+type(kill_error).__name__
+                    code = process.returncode
+                    final_receipt, audit_error = None, None
+                    try:
+                        final_receipt = _budget_receipt(request,self.gateway_receipt(request,token),
+                                                        datetime.now(timezone.utc))
+                        if any(Decimal(str(v)) != 0 for v in final_receipt['uncertain'].values()):
+                            audit_error = 'uncertain_usage_retained'
+                    except Exception as exc:
+                        audit_error = type(exc).__name__
+                    if audit_error and state == 'discovery_complete':
                         state = 'audit_unavailable'
-                files = {}
-                for path in work.rglob('*'):
-                    if path.is_file() and not path.is_symlink():
-                        with path.open('rb') as handle:
-                            files[str(path.relative_to(work))] = hashlib.file_digest(handle,'sha256').hexdigest()
-                result = {'status':state,'returncode':code,'run_id':request.run_id,
-                          'elapsed_seconds':time.monotonic()-started,'request_hash':request.content_hash(),
-                          'upstream_revision':UPSTREAM_REVISION,'files':files,'activation':'quarantined',
-                          'discovery_exposure_hash':exposure.content_hash(),'internal_search_trials':None,
-                          'cleanup_error':cleanup_error,'gateway_final_receipt':final_receipt,
-                          'gateway_audit_error':audit_error}
-                (work/'result.json').write_text(json.dumps(result,indent=2))
-                registry.record_native_result(result)
+                    # The original attached process and recovery share one
+                    # authority. Neither may replace the other's publication.
+                    with native_run_lock(registry,request.run_id):
+                        retained = _result(registry,request.run_id)
+                        if retained is not None:
+                            result = retained
+                        else:
+                            files, artifact_error = {}, None
+                            if code == 0 and cleanup_error is None:
+                                try:
+                                    artifacts = _artifacts(work,request)
+                                    if _artifacts(work,request) != artifacts:
+                                        raise ValueError('native outputs changed during finalization')
+                                    _load_launch(self,registry,request,exposure)
+                                    files = {f['path']:f['sha256'] for f in artifacts['files']}
+                                except Exception as exc:
+                                    artifact_error = type(exc).__name__
+                                    if state == 'discovery_complete':
+                                        state = 'artifacts_unavailable'
+                            result = {'status':state,'returncode':code,'run_id':request.run_id,
+                                      'elapsed_seconds':time.monotonic()-started,'request_hash':request.content_hash(),
+                                      'upstream_revision':UPSTREAM_REVISION,'files':files,'activation':'quarantined',
+                                      'discovery_exposure_hash':exposure.content_hash(),'internal_search_trials':None,
+                                      'cleanup_error':cleanup_error,'gateway_final_receipt':final_receipt,
+                                      'gateway_audit_error':audit_error,'artifact_error':artifact_error,
+                                      'container_id':container_id}
+                            registry.record_native_result(result)
+                        _publish_result(work,result)
+                except BaseException as final_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note('Native finalization also failed: '+type(final_error).__name__)
         return result

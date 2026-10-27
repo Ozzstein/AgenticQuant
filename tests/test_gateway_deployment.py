@@ -345,41 +345,23 @@ def test_native_manifest_mounts_are_read_only(tmp_path):
 def test_native_result_requires_actual_final_budget_receipt(
     monkeypatch, tmp_path, private_key, changed_model
 ):
+    from tests.native_launch_fixtures import install_native_boundary
     from tests.test_native_discovery_exposure import mounted_request
     request, _ = mounted_request(tmp_path)
     registry = ResearchRegistry(tmp_path / "registry.db")
     supervisor = NativeSupervisor(tmp_path / "jobs")
-    monkeypatch.setattr(supervisor, "preflight", lambda *a, **k: {"fixture": "offline-admission"})
-    monkeypatch.setattr(
-        supervisor,
-        "command",
-        lambda *a, **k: [sys.executable, "-c", 'print("fixture-native-child")'],
-    )
-    receipt = dict(
-        run_id=request.run_id,
-        config_hash=request.gateway_config_hash,
-        ready=False,
-        provider_configured=True,
-        streaming=False,
-        expires_at=datetime.now(timezone.utc).isoformat(),
-        models={
-            scope: dict(provider="openai", model=model.removeprefix("openai/"))
-            for scope, model in [
-                ("chat", request.chat_model),
-                ("embedding", request.embedding_model),
-            ]
-        },
-        limits=request.gateway_limits.model_dump(mode="json", exclude={"schema_version"}),
-        day_limits=request.gateway_day_limits.model_dump(mode="json", exclude={"schema_version"}),
-        admission_available={"chat": False, "embedding": False},
-        observed_models=["wrong"] if changed_model else [],
-        actual={"tokens": 30, "cost_usd": "0.00004"},
-    )
-    monkeypatch.setattr(supervisor, "gateway_receipt", lambda *a, **k: receipt)
+    boundary = install_native_boundary(monkeypatch, supervisor, request, registry)
+    boundary.token = private_key
+    def after_start():
+        boundary.budget['ready'] = False
+        boundary.budget['observed_models'] = ['wrong'] if changed_model else []
+    boundary.start_hook = after_start
     result = supervisor.run(request, gateway_token_path=private_key, registry=registry)
     assert result["status"] == ("audit_unavailable" if changed_model else "discovery_complete")
     saved = json.loads((supervisor.root / request.run_id / "result.json").read_text())
-    assert saved["gateway_final_receipt"] == receipt
+    assert (saved['gateway_final_receipt'] is None) == changed_model
+    if not changed_model:
+        assert saved['gateway_final_receipt']['actual'] == boundary.budget['actual']
     assert saved["activation"] == "quarantined"
     assert saved["discovery_exposure_hash"] == registry.discovery_exposure("native:" + request.run_id).content_hash()
     assert saved["internal_search_trials"] is None

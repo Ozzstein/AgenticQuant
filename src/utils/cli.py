@@ -69,6 +69,13 @@ def decision(ctx: typer.Context):
     raise typer.Exit(main(ctx.args))
 
 
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, add_help_option=False)
+def lean(ctx: typer.Context):
+    """Prepare or verify the canonical LEAN outbox project and runtime."""
+    from src.execution.lean_bridge import main
+    raise typer.Exit(main(ctx.args))
+
+
 @app.command()
 def trade(
     action: Literal["status", "run", "dispatch-pending"] = typer.Argument("status"),

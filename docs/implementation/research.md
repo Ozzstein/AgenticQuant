@@ -176,7 +176,8 @@ Legacy input JSON omits all new fields and preserves its original identity. Such
 runs remain executable diagnostics; missing income authority cannot certify them.
 The current native Alpaca parser still proves gaps only. Neither synthetic ledger
 tests nor source-shaped complete flags admit a positive historical income source.
-The callback strategy adapter's OOS forwarding is a separate integration step.
+The callback strategy adapter forwards `income_replay_kwargs(start=...)` after
+computing its actual OOS start; it uses the same canonical filter and ledger math.
 Coordinator checks: 30 offline research/input/actual-ledger/source/operating-income
 tests passed in 33.68s, including exact 8,880 NAV and separately retained fee/tax
 postings in the synthetic arithmetic fixture. No genuine historical source or
@@ -191,3 +192,38 @@ All canonical walk-forward callers pass actual feature-specification and data-sn
 `rd-agent copilot propose --request ... --registry ... --evidence ... --code ... --environment ... --output ...` exposes typed source-grounded factor/model/strategy/regime/text-question proposals. `paper_evidence_ids` selects full-document reading with complete chunk coverage. `rd-agent copilot memo` reads only verified recorded development outcomes. Exact execution-code/environment artifacts are archived before generation; generated candidates remain quarantined. Missing credentials/pricing/sources yields an archived unavailable outcome and exit 2, not a template candidate or placeholder memo. Late generation cannot be reused under an earlier research cutoff.
 
 Additional coordinator checks: 53 research/source-proof/ensemble/copilot-CLI/public-wrapper tests passed; 56 copilot and CLI tests passed; independently reconstructed strategy and paired-regime tests passed, including fold and return substitution rejection. No authenticated provider calls or statistical profitability acceptance are claimed.
+
+## Original native launch and recovery
+
+The supervisor archives its exact request, admission, frozen file inventory and
+mounts before `docker create`. It independently inspects the created, never-started
+container, binds its original ID/image/network/isolation to the registry, and only
+then calls `docker start --attach <original-id>`. Create/bind/start and final result
+publication use the same protected per-run kernel lock as orphan recovery. No
+generated process is allowed before the immutable container binding exists.
+
+`aiquant rd-agent native-recover --run-id ID --registry DB --workdir ROOT` inspects
+that authority without starting or repeating the search. `--stop` requests a stop
+of only the verified original container. Missing AutoRemove containers retain an
+unknown exit unless an authoritative result already exists; an identically named
+replacement cannot be adopted. Output is limited to run identity, sequence/time,
+observation/action/reason, cost state, retained exposure, quarantine and event hash.
+It does not disclose launch paths, tokens, logs, registry blobs or artifact contents.
+
+Original completion and recovered completion both require measured, internally
+consistent gateway counters with zero uncertain reservations, an actual successful
+watchdog record, unchanged admitted sources and bounded stable output hashes.
+Exit code zero alone does not certify completion. Original publication records
+registry authority before its local file projection; projection failure can be
+recovered without replacing the result. A winning recovery publication is retained
+by the original runner. Cleanup/finalization failures cannot replace an existing
+primary exception. All output remains quarantined and native internal trial
+multiplicity remains unknown.
+
+Root verification: 139 offline lifecycle, recovery, mount, exposure, registry and
+gateway tests passed in 54.26 seconds. They use actual bundles/SQLite/locks and
+synthetic Docker/HTTP boundaries. Docker remains unavailable here, so no native
+workload or container-isolation acceptance is claimed. The registered numeric
+callback and income-input regression separately passed 7 cases in 31.13 seconds,
+including actual fitted folds and changed-cost ledgers; it does not establish a
+sufficient positive income source.

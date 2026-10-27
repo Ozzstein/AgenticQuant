@@ -115,6 +115,23 @@ def library_status(registry: Path=typer.Option(...,exists=True)):
     typer.echo(json.dumps(ResearchRegistry(registry).status(),indent=2))
 
 
+@app.command('native-recover')
+def native_recover(run_id: str=typer.Option(...),registry: Path=typer.Option(...,exists=True,dir_okay=False),
+                   workdir: Path=typer.Option(...,exists=True,file_okay=False),
+                   stop: bool=typer.Option(False,'--stop')):
+    """Inspect original native authority; --stop requests an exact bound container stop."""
+    from src.research.native_recovery import NativeRecoveryService
+    try:
+        event=NativeRecoveryService(NativeSupervisor(workdir),ResearchRegistry(registry)).reconcile(run_id,stop=stop)
+        public=event.model_dump(mode='json',include={
+            'run_id','sequence','observed_at','observation','action','reason','cost_state',
+            'exposure_retained','activation','internal_search_trials'})
+        public['event_hash']=event.content_hash()
+        typer.echo(json.dumps(public,indent=2))
+    except Exception as exc:
+        fail(exc)
+
+
 def _native_command(name):
     def execute(request: Path=typer.Option(...,exists=True,dir_okay=False),
                 gateway_token_file: Path=typer.Option(...,exists=True,dir_okay=False),workdir: Path=typer.Option(...),

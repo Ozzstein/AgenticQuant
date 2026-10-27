@@ -68,17 +68,19 @@ def test_full_mounted_bundle_cannot_touch_existing_holdout(tmp_path):
 
 
 def test_failed_launch_still_exposes_all_rows_and_forbids_resubmission(tmp_path, monkeypatch):
+    from tests.native_launch_fixtures import install_native_boundary
     req, snapshot = mounted_request(tmp_path)
     registry = ResearchRegistry(tmp_path / "registry.db")
     supervisor = NativeSupervisor(tmp_path / "jobs")
-    monkeypatch.setattr(supervisor, "preflight", lambda *a, **k: {"boundary": "offline"})
-    monkeypatch.setattr(
-        supervisor, "command", lambda *a, **k: [str(tmp_path / "missing-executable")]
-    )
+    boundary = install_native_boundary(monkeypatch, supervisor, req, registry)
+    boundary.token = tmp_path / "unused-token"
+    boundary.create_error = FileNotFoundError("fixture unavailable Docker create")
     with pytest.raises(FileNotFoundError):
         supervisor.run(req, gateway_token_path=tmp_path / "unused-token", registry=registry)
     reopened = ResearchRegistry(registry.path)
     exposure = reopened.discovery_exposure("native:" + req.run_id)
+    assert reopened.native_launch(req.run_id) is not None
+    assert reopened.native_container(req.run_id) is None
     assert exposure.starts_at == min(bar.opened_at for bar in snapshot.bars)
     assert exposure.ends_at == snapshot.context.as_of + timedelta(microseconds=1)
     assert exposure.internal_trials is None
