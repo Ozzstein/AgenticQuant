@@ -506,3 +506,74 @@ def test_purchase_plan_cannot_spend_same_sleeve_cash_twice(tmp_path):
     assert not ledger.pending("backtest:test")
     assert book.snapshot(T)["alpha"].portfolio.cash == 5000
     ledger.close()
+
+
+@pytest.mark.parametrize("blended", [False, True])
+def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, blended):
+    import pandas as pd
+
+    from src.domain.common import RunContext
+    from src.execution.routing import target_from_blended_frame, target_from_strategy_frame
+
+    ledger, book = setup(tmp_path / "decision-lag.sqlite3")
+    decision = T + timedelta(minutes=15)
+    context = RunContext(
+        run_id="cycle",
+        mode="paper",
+        as_of=decision,
+        account_id="backtest:test",
+        config_hash="a" * 64,
+        code_version="test",
+        data_snapshot_ids=("fixture",),
+    )
+    snapshot = ledger.snapshot("backtest:test", decision, 86400, persist=False)
+    output = pd.DataFrame(
+        {"target_weight": [0.2], "action": ["BUY"], "reason": ["fixture"], "score": [0.3]},
+        index=[A.instrument_id],
+    )
+    output.attrs.update(
+        strategy="alpha",
+        strategy_hash="a" * 64,
+        context=context.model_dump(mode="json"),
+        signal_at=T.isoformat(),
+        data_snapshot_hash="fixture",
+        universe_version="fixture",
+        model_hash="b" * 64,
+    )
+    if blended:
+        snapshot = snapshot.model_copy(update={"sleeves": book.snapshot(decision)})
+        beta = output.copy(deep=True)
+        beta.attrs = {**output.attrs, "strategy": "beta", "strategy_hash": "c" * 64}
+        outputs = {"alpha": output, "beta": beta}
+        frame = pd.DataFrame({"target_weight": [0.2]}, index=[A.instrument_id])
+        frame.attrs.update(
+            context=context.model_dump(mode="json"),
+            signal_at=T.isoformat(),
+            allocations={"alpha": 0.5, "beta": 0.5},
+            data_snapshot_hash="fixture",
+            universe_version="fixture",
+            strategy_hashes={k: v.attrs["strategy_hash"] for k, v in outputs.items()},
+            model_artifact_hashes={k: v.attrs["model_hash"] for k, v in outputs.items()},
+            sleeve_provenance={k: dict(v.attrs) for k, v in outputs.items()},
+            contributions={k: {A.instrument_id: 0.1} for k in outputs},
+            vetoed=(),
+        )
+
+        def adapt():
+            return target_from_blended_frame(
+                frame, context, [A], target_id="cycle", current_snapshot=snapshot, outputs=outputs
+            )
+    else:
+        frame = output
+
+        def adapt():
+            return target_from_strategy_frame(
+                frame, context, [A], target_id="cycle", current_snapshot=snapshot
+            )
+
+    assert adapt().decision_at == decision
+    for invalid in (decision + timedelta(seconds=1), decision.replace(tzinfo=None)):
+        frame.attrs["signal_at"] = invalid.isoformat()
+        with pytest.raises(LedgerError, match="causal context"):
+            adapt()
+    ledger.close()

@@ -153,7 +153,8 @@ def target_from_blended_frame(frame, context, instruments, *, target_id, current
     if (
         required - attrs.keys()
         or attrs["context"] != context.model_dump(mode="json")
-        or pd.Timestamp(attrs["signal_at"]) != context.as_of
+        or pd.Timestamp(attrs["signal_at"]).tzinfo is None
+        or not pd.Timestamp(attrs["signal_at"]) <= context.as_of
     ):
         raise LedgerError(
             "blended target requires exact causal context and complete sleeve provenance"
@@ -293,7 +294,8 @@ def target_from_strategy_frame(frame, context, instruments, *, target_id, curren
     if (
         required - attrs.keys()
         or attrs["context"] != context.model_dump(mode="json")
-        or pd.Timestamp(attrs["signal_at"]) != context.as_of
+        or pd.Timestamp(attrs["signal_at"]).tzinfo is None
+        or not pd.Timestamp(attrs["signal_at"]) <= context.as_of
     ):
         raise LedgerError("strategy frame requires exact causal context and provenance")
     if (
