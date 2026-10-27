@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -60,6 +61,8 @@ class NativeRequest(VersionedContract):
     memory_mb: int = Field(default=8192, ge=512, le=65536)
     cpus: int = Field(default=2, ge=1, le=32)
     max_output_bytes: int = Field(default=1024*1024*1024, ge=1024)
+    max_source_bytes: int = Field(default=128*1024*1024, ge=1, le=1024*1024*1024)
+    max_source_files: int = Field(default=100, ge=1, le=1000)
     document: str | None = None
     ui_source_run: str | None = None
     ui_port: int = Field(default=19899, ge=1024, le=65535)
@@ -103,8 +106,23 @@ class NativeRequest(VersionedContract):
 
 class NativeSupervisor:
     def __init__(self, root: str | Path):
-        self.root = Path(root).resolve()
+        from src.research.native_mounts import canonical_path
+        self.root = canonical_path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def reserve_mounts(self, request, registry, *, control_paths=()):
+        from src.research.native_mounts import NativeMountAuthority
+        from src.research.registry import ResearchRegistry
+        if not isinstance(registry,ResearchRegistry):
+            raise ValueError('native execution requires the authoritative research registry')
+        protected=[registry.path,Path(str(registry.path)+'-wal'),Path(str(registry.path)+'-shm'),
+                   *map(Path,control_paths)]
+        inputs=[self.root/'.inputs'/request.run_id,Path(request.scenario.provider_uri)]
+        if request.document:
+            inputs.append(Path(request.document))
+        return NativeMountAuthority().reserve(
+            {'request_hash':request.content_hash(),'registry':str(registry.path.resolve()),
+             'run_id':request.run_id},writable=self.root/request.run_id,inputs=tuple(inputs),controls=tuple(protected))
 
     @staticmethod
     def _docker(*args, timeout=30):
@@ -170,8 +188,11 @@ class NativeSupervisor:
         if set(receipt.get('observed_models',[]))-allowed or receipt.get('blocked'):
             raise ValueError('gateway reported a model substitution or fault')
 
-    def command(self, request: NativeRequest, work: Path, token: Path) -> list[str]:
-        for path in (work,token,Path(request.scenario.provider_uri).resolve()):
+    def command(self, request: NativeRequest, work: Path, token: Path, *, frozen_root: Path | None=None) -> list[str]:
+        data_root=frozen_root/'qlib' if frozen_root is not None else Path(request.scenario.provider_uri).resolve()
+        if (request.document or request.knowledge or request.command=='ui') and frozen_root is None:
+            raise ValueError('native sources require authoritative frozen admission before command construction')
+        for path in (work,token,data_root):
             if ',' in str(path):
                 raise ValueError('Docker mount paths cannot contain comma separators')
         command = ['docker','run','--rm','--name','quantagent-rd-'+request.run_id,
@@ -182,90 +203,180 @@ class NativeSupervisor:
                    '--user',f'{os.getuid()}:{os.getgid()}', '--network',request.network,
                    '--tmpfs','/tmp:rw,nosuid,nodev,size=512m',
                    '--mount',f'type=bind,src={work},dst=/work',
-                   '--mount',f'type=bind,src={Path(request.scenario.provider_uri).resolve()},dst=/data/qlib,readonly',
+                   '--mount',f'type=bind,src={data_root},dst=/data/qlib,readonly',
                    '--mount',f'type=bind,src={token.resolve()},dst=/run/gateway-token,readonly']
         for name in ('request.json','scenario.json','admission.json'):
             command += ['--mount',f'type=bind,src={work/name},dst=/work/{name},readonly']
         if request.knowledge:
-            directory=work/'knowledge-input'
-            directory.mkdir()
-            for reference in request.knowledge:
-                payload=self.knowledge_bytes(reference)
-                with (directory/(reference.artifact+'.pkl')).open('xb') as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+            directory=frozen_root/'knowledge'
             command += ['--mount',f'type=bind,src={directory},dst=/work/knowledge-input,readonly']
         if request.document:
-            source = Path(request.document).resolve()
-            if not source.exists() or ',' in str(source):
-                raise ValueError('native source document does not exist or has an invalid mount path')
-            # Mount only a staged copy of the selected source, never its host parent.
-            destination = work/'sources'
-            destination.mkdir()
-            import shutil
-            if source.is_dir():
-                for path in source.iterdir():
-                    if path.is_symlink() or not path.is_file():
-                        raise ValueError('report source directory must contain ordinary files only')
-                    shutil.copyfile(path,destination/path.name)
-            else:
-                shutil.copyfile(source,destination/source.name)
-            command += ['--mount',f'type=bind,src={destination},dst=/sources,readonly']
+            command += ['--mount',f'type=bind,src={frozen_root}/sources,dst=/sources,readonly']
         if request.command == 'ui':
-            source_run = self.root/request.ui_source_run
-            result = json.loads((source_run/'result.json').read_text())
-            if result['run_id'] != request.ui_source_run:
-                raise ValueError('native UI source identity mismatch')
-            import shutil
-            for name, digest in result['files'].items():
-                if not name.startswith('log/'):
-                    continue
-                source = source_run/name
-                if source.is_symlink() or not source.resolve().is_relative_to(source_run.resolve()):
-                    raise ValueError('UI source path escaped its recorded run')
-                with source.open('rb') as handle:
-                    if hashlib.file_digest(handle,'sha256').hexdigest() != digest:
-                        raise ValueError('UI source log bytes changed')
-                destination = work/name
-                destination.parent.mkdir(parents=True,exist_ok=True)
-                shutil.copyfile(source,destination)
+            command += ['--mount',f'type=bind,src={frozen_root}/log,dst=/work/log,readonly']
             command += ['--publish',f'127.0.0.1:{request.ui_port}:19899']
         return [*command,request.image]
 
-    def knowledge_bytes(self, reference: NativeKnowledgeRef) -> bytes:
-        """Verify exact prior bytes; pickle deserialization is container-only."""
-        root=self.root/reference.source_run
+    @staticmethod
+    def _ordinary_bytes(path: Path, limit: int) -> bytes:
+        if any(p.is_symlink() for p in (path,*path.parents)):
+            raise ValueError('native source must not use symbolic links')
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as handle:
+            info=os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_size>limit:
+                raise ValueError('native source exceeds ordinary bounded file contract')
+            raw=handle.read(limit+1)
+        if len(raw)>limit:
+            raise ValueError('native source exceeds byte allowance')
+        return raw
+
+    def _prior_run(self, run_id, registry, *, seen=frozenset()):
+        if run_id in seen:
+            raise ValueError('native inherited source lineage contains a cycle')
+        exposure=registry.discovery_exposure('native:'+run_id)
+        authority=registry.native_result(run_id)
+        root=self.root/run_id
         result_path=root/'result.json'
-        if root.is_symlink() or result_path.is_symlink():
-            raise ValueError('native source run must be an ordinary owned output directory')
-        raw=result_path.read_bytes()
-        if hashlib.sha256(raw).hexdigest()!=reference.source_result_hash:
-            raise ValueError('native knowledge source result changed')
+        raw=self._ordinary_bytes(result_path,16*1024*1024)
         result=json.loads(raw)
+        if result!=authority or result.get('discovery_exposure_hash')!=exposure.content_hash():
+            raise ValueError('native source result differs from authoritative registry completion')
         request_path=root/'request.json'
-        if request_path.is_symlink() or hashlib.sha256(request_path.read_bytes()).hexdigest()!=result['files'].get('request.json'):
+        request_raw=self._ordinary_bytes(request_path,16*1024*1024)
+        if hashlib.sha256(request_raw).hexdigest()!=result['files'].get('request.json'):
             raise ValueError('native knowledge source request changed')
-        payload=json.loads(request_path.read_bytes())
+        payload=json.loads(request_raw)
         payload.pop('native_args',None)
         request=NativeRequest.model_validate(payload)
-        if (result.get('run_id')!=reference.source_run or result.get('status')!='discovery_complete'
+        if (result.get('run_id')!=run_id or result.get('status')!='discovery_complete'
                 or result.get('request_hash')!=request.content_hash()
+                or exposure.request_hash!=request.content_hash()
                 or result.get('upstream_revision')!=UPSTREAM_REVISION
                 or result.get('gateway_audit_error') or not result.get('gateway_final_receipt')):
             raise ValueError('native knowledge requires a complete audited source run')
+        expected=[]
+        for parent in request.knowledge:
+            _,_,prior,parent_raw=self._prior_run(parent.source_run,registry,seen=seen|{run_id})
+            if hashlib.sha256(parent_raw).hexdigest()!=parent.source_result_hash:
+                raise ValueError('native inherited knowledge result changed')
+            expected.append(prior.content_hash())
+        if request.ui_source_run:
+            expected.append(self._prior_run(request.ui_source_run,registry,seen=seen|{run_id})[2].content_hash())
+        if tuple(sorted(expected))!=exposure.inherited_exposures:
+            raise ValueError('native source exposure lineage differs from admitted sources')
+        return request,result,exposure,raw
+
+    def knowledge_bytes(self, reference: NativeKnowledgeRef, *, registry) -> bytes:
+        """Verify authoritative prior admission/completion; never deserialize pickle."""
+        _,result,_,raw=self._prior_run(reference.source_run,registry)
+        if hashlib.sha256(raw).hexdigest()!=reference.source_result_hash:
+            raise ValueError('native knowledge source result changed')
+        root=self.root/reference.source_run
         name='knowledge/'+reference.artifact+'.pkl'
         path=root/name
         if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
             raise ValueError('native knowledge artifact is absent or escaped its run')
-        data=path.read_bytes()
+        data=self._ordinary_bytes(path,1024*1024*1024)
         if hashlib.sha256(data).hexdigest()!=reference.artifact_hash or result['files'].get(name)!=reference.artifact_hash:
             raise ValueError('native knowledge artifact bytes changed')
         return data
 
-    def run(self, request: NativeRequest, *, gateway_token_path: str | Path) -> dict:
+    def admit_discovery(self, request: NativeRequest, registry):
+        from src.research.registry import ResearchRegistry
+        if not isinstance(registry,ResearchRegistry):
+            raise ValueError('native execution requires the authoritative research registry')
+        self.reserve_mounts(request,registry)
+        root=Path(request.scenario.provider_uri).absolute()
+        actual=set()
+        if any(path.is_symlink() for path in (root,*root.parents)):
+            raise ValueError('native data mount must not be a symlink')
+        for path in root.rglob('*'):
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise ValueError('native data mount contains unsupported links or special files')
+            if path.is_file():
+                if path.stat().st_nlink!=1:
+                    raise ValueError('native data file must not be a hardlink')
+                actual.add(str(path.relative_to(root)))
+        manifest=verify_bundle(request.scenario)
+        if actual != {*manifest['files'],'manifest.json'}:
+            raise ValueError('native data mount contains unrecorded or missing files')
+        # Hashes alone could bind binaries with observations absent from the
+        # declared snapshot. Rebuild the real format and compare every file.
+        from src.data.qlib_us import export_bundle
+        from src.domain.market import MarketSnapshot
+        from src.research.registry import RegistryError
+        frozen=self.root/'.inputs'/request.run_id
+        if frozen.exists():
+            raise RegistryError('native discovery already admitted or staged; reconcile original run')
+        if any(p.is_symlink() for p in (frozen,*frozen.parents)):
+            raise ValueError('native frozen input path must not use symbolic links')
+        frozen.mkdir(parents=True,mode=0o700)
+        rebuilt=export_bundle(MarketSnapshot.model_validate(manifest['snapshot']),frozen/'qlib')
+        rebuilt.pop('bundle_hash')
+        if rebuilt != manifest:
+            raise ValueError('native bundle bytes differ from the declared exposure snapshot')
+        documents=None
+        if request.document:
+            source=Path(request.document).absolute()
+            if any(p.is_symlink() for p in (source,*source.parents)):
+                raise ValueError('native source document must not use symbolic links')
+            paths=sorted(source.iterdir()) if source.is_dir() else [source]
+            if not paths or len(paths)>request.max_source_files:
+                raise ValueError('native source file allowance exceeded or source empty')
+            (frozen/'sources').mkdir()
+            documents={'scope':'unbounded','files':{}}
+            remaining=request.max_source_bytes
+            for path in paths:
+                data=self._ordinary_bytes(path,remaining)
+                remaining-=len(data)
+                key=registry.archive(data)
+                documents['files'][path.name]={'sha256':key,'bytes':len(data)}
+                (frozen/'sources'/path.name).write_bytes(data)
+        inherited=[]
+        if request.knowledge:
+            (frozen/'knowledge').mkdir()
+            for reference in request.knowledge:
+                data=self.knowledge_bytes(reference,registry=registry)
+                inherited.append(registry.discovery_exposure('native:'+reference.source_run))
+                (frozen/'knowledge'/(reference.artifact+'.pkl')).write_bytes(data)
+        if request.command=='ui':
+            _,result,prior,_=self._prior_run(request.ui_source_run,registry)
+            inherited.append(prior)
+            (frozen/'log').mkdir()
+            remaining=request.max_source_bytes
+            names=[name for name in result['files'] if name.startswith('log/')]
+            if not names or len(names)>request.max_source_files:
+                raise ValueError('native UI source logs empty or exceed file allowance')
+            for name in names:
+                source=self.root/request.ui_source_run/name
+                if not source.resolve().is_relative_to((self.root/request.ui_source_run).resolve()):
+                    raise ValueError('native UI source log escapes predecessor run')
+                data=self._ordinary_bytes(source,remaining)
+                remaining-=len(data)
+                if hashlib.sha256(data).hexdigest()!=result['files'][name]:
+                    raise ValueError('native UI source log bytes changed')
+                target=frozen/name
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_bytes(data)
+        for path in sorted(frozen.rglob('*'),reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        frozen.chmod(0o555)
+        return registry.admit_native_discovery(request,manifest,at=datetime.now(timezone.utc),
+                                               document_manifest=documents,inherited_exposures=tuple(inherited))
+
+    def run(self, request: NativeRequest, *, gateway_token_path: str | Path, registry) -> dict:
+        from src.research.registry import ResearchRegistry
+        if not isinstance(registry,ResearchRegistry):
+            raise ValueError('native execution requires the authoritative research registry')
         token = Path(gateway_token_path).absolute()
+        self.reserve_mounts(request,registry,control_paths=(token,))
         evidence = self.preflight(request,gateway_token_path=token)
+        # All mounted rows are available to generated code regardless of Qlib's
+        # configured split/universe. Reserve that exposure before any process.
+        exposure=self.admit_discovery(request,registry)
+        evidence={**evidence,'discovery_exposure':exposure.model_dump(mode='json'),
+                  'discovery_exposure_hash':exposure.content_hash()}
         work = self.root/request.run_id
         work.mkdir()  # Run identities and discovery output directories are immutable.
         scenario = {**request.scenario.model_dump(mode='json'),'provider_uri':'/data/qlib'}
@@ -273,7 +384,7 @@ class NativeSupervisor:
         runtime = {**request.model_dump(mode='json'),'native_args':request.native_args()}
         (work/'request.json').write_text(json.dumps(runtime,indent=2))
         (work/'admission.json').write_text(json.dumps(evidence,indent=2))
-        command = self.command(request,work,token)
+        command = self.command(request,work,token,frozen_root=self.root/'.inputs'/request.run_id)
         started = time.monotonic()
         state, code = 'failed',None
         with (work/'stdout.log').open('wb') as stdout, (work/'stderr.log').open('wb') as stderr:
@@ -321,7 +432,9 @@ class NativeSupervisor:
                 result = {'status':state,'returncode':code,'run_id':request.run_id,
                           'elapsed_seconds':time.monotonic()-started,'request_hash':request.content_hash(),
                           'upstream_revision':UPSTREAM_REVISION,'files':files,'activation':'quarantined',
+                          'discovery_exposure_hash':exposure.content_hash(),'internal_search_trials':None,
                           'cleanup_error':cleanup_error,'gateway_final_receipt':final_receipt,
                           'gateway_audit_error':audit_error}
                 (work/'result.json').write_text(json.dumps(result,indent=2))
+                registry.record_native_result(result)
         return result

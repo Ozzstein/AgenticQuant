@@ -22,7 +22,8 @@ class RDAgentRunner(ResearchRunner):
                          EvidenceStore(evidence_path or root/'evidence.sqlite3'),config)
 
     def native(self, request: NativeRequest, *, gateway_token_path: str | Path, output_dir: str | Path):
-        return NativeSupervisor(output_dir).run(request,gateway_token_path=gateway_token_path)
+        return NativeSupervisor(output_dir).run(request,gateway_token_path=gateway_token_path,
+                                                registry=self.registry)
 
     def run_factor_search(self, *, trial_ids: list[str], output_dir: str | Path):
         return self._registered_search(trial_ids,output_dir,{'factor','semantic_question'})

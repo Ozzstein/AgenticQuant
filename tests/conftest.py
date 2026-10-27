@@ -34,6 +34,8 @@ def _isolated_output_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("AIQUANT_OUTPUT_DIR", str(tmp_path / "outputs"))
     monkeypatch.setenv("AIQUANT_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("AIQUANT_PAPER_LEDGER_PATH", str(tmp_path / "paper.sqlite3"))
+    from src.research import native_mounts
+    monkeypatch.setattr(native_mounts,"_authority_path",lambda: tmp_path/'host-control/native-mounts.sqlite3')
 
 
 @pytest.fixture

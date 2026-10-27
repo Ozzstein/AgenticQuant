@@ -69,6 +69,7 @@ def private_secret(path: Path) -> str:
         info = os.fstat(handle.fileno())
         if (
             not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) & 0o077
         ):
@@ -106,6 +107,8 @@ def _disjoint(left: Path, right: Path):
 class GatewayDeploymentManager:
     def __init__(self, root: str | Path):
         path = Path(root).absolute()
+        from src.research.native_mounts import NativeMountAuthority
+        NativeMountAuthority().protect(path)
         _private_directory(path)
         self.root = path.resolve()
         self.operations = OperationsStore(self.root / "lifecycle.sqlite3")
@@ -180,6 +183,8 @@ class GatewayDeploymentManager:
         return value
 
     def start(self, spec: GatewayDeployment, *, provider_key_path: str | Path) -> dict:
+        from src.research.native_mounts import NativeMountAuthority
+        NativeMountAuthority().protect(Path(provider_key_path))
         key = private_secret(Path(provider_key_path))
         if spec.config.expires_at <= datetime.now(timezone.utc):
             raise ValueError("gateway configuration has expired")
@@ -336,7 +341,7 @@ class GatewayDeploymentManager:
             return receipt
 
     def run_native(
-        self, spec: GatewayDeployment, request: NativeRequest, *, provider_key_path, workdir
+        self, spec: GatewayDeployment, request: NativeRequest, *, provider_key_path, workdir, registry=None
     ) -> dict:
         if (
             request.run_id != spec.config.run_id
@@ -353,14 +358,20 @@ class GatewayDeploymentManager:
             raise ValueError(
                 "native work/data/document mounts must be disjoint from private gateway state"
             )
+        from src.research.registry import ResearchRegistry
+        if not isinstance(registry, ResearchRegistry):
+            raise ValueError("native execution requires the authoritative research registry")
+        supervisor=NativeSupervisor(workdir)
+        supervisor.reserve_mounts(request,registry,control_paths=(self.root,Path(provider_key_path),
+                                                                  self.root/spec.config.run_id/'bearer'))
         failure = None
         try:
             receipt = self.start(spec, provider_key_path=provider_key_path)
             NativeSupervisor.verify_receipt(
                 request, receipt["receipt"], now=datetime.now(timezone.utc)
             )
-            return NativeSupervisor(workdir).run(
-                request, gateway_token_path=self.root / spec.config.run_id / "bearer"
+            return supervisor.run(
+                request, gateway_token_path=self.root / spec.config.run_id / "bearer",registry=registry
             )
         except BaseException as exc:
             failure = exc

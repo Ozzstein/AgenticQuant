@@ -112,6 +112,11 @@ def test_receipt_enforces_models_caps_scope_expiry_and_faults():
 
 def test_exact_native_knowledge_bytes_are_staged_without_host_deserialization(tmp_path):
     import pickle
+
+    from src.research.registry import ResearchRegistry
+    from tests.test_native_discovery_exposure import mounted_request
+    registry=ResearchRegistry(tmp_path/'research.db')
+    mounted,_=mounted_request(tmp_path)
     marker=tmp_path/'must-not-execute'
     class Untrusted:
         def __reduce__(self):
@@ -121,23 +126,28 @@ def test_exact_native_knowledge_bytes_are_staged_without_host_deserialization(tm
     source=supervisor.root/'prior'
     (source/'knowledge').mkdir(parents=True)
     (source/'knowledge'/'factor.pkl').write_bytes(payload)
-    previous=request().model_copy(update={'run_id':'prior'})
+    previous=mounted.model_copy(update={'run_id':'prior'})
+    exposure=supervisor.admit_discovery(previous,registry)
     (source/'request.json').write_text(previous.model_dump_json())
     def h(raw):
         return hashlib.sha256(raw).hexdigest()
     result=dict(run_id='prior',status='discovery_complete',request_hash=previous.content_hash(),
+        discovery_exposure_hash=exposure.content_hash(),internal_search_trials=None,activation='quarantined',
         upstream_revision='484776c211e4fbbeef03e0ec00d6bbee7362a4f4',gateway_audit_error=None,
         gateway_final_receipt={'fixture':'offline'},files={'knowledge/factor.pkl':h(payload),
         'request.json':h((source/'request.json').read_bytes())})
     (source/'result.json').write_text(json.dumps(result))
+    registry.record_native_result(result)
     ref=NativeKnowledgeRef(source_run='prior',source_result_hash=h((source/'result.json').read_bytes()),
                            artifact='factor',artifact_hash=h(payload))
-    req=request().model_copy(update={'knowledge':(ref,)})
+    req=mounted.model_copy(update={'knowledge':(ref,)})
     work=supervisor.root/'next'
     work.mkdir()
-    command=supervisor.command(req,work,tmp_path/'bearer')
-    assert (work/'knowledge-input'/'factor.pkl').read_bytes()==payload and not marker.exists()
-    assert f'type=bind,src={work}/knowledge-input,dst=/work/knowledge-input,readonly' in command
+    supervisor.admit_discovery(req,registry)
+    frozen=supervisor.root/'.inputs'/req.run_id
+    command=supervisor.command(req,work,tmp_path/'bearer',frozen_root=frozen)
+    assert (frozen/'knowledge'/'factor.pkl').read_bytes()==payload and not marker.exists()
+    assert f'type=bind,src={frozen}/knowledge,dst=/work/knowledge-input,readonly' in command
     (source/'knowledge'/'factor.pkl').write_bytes(b'tampered')
     with pytest.raises(ValueError,match='bytes changed'):
-        supervisor.knowledge_bytes(ref)
+        supervisor.knowledge_bytes(ref,registry=registry)

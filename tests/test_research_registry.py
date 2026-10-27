@@ -23,13 +23,14 @@ def registry(tmp_path):
     return ResearchRegistry(tmp_path / "research.sqlite3")
 
 
-def admitted(registry, key="one", *, synthetic=False, family="family", p_value=0.001):
+def admitted(registry, key="one", *, synthetic=False, family="family", p_value=0.001,
+             origin="custom", parent_ids=()):
     code, environment, dataset, split, inputs = [registry.archive(v.encode()) for v in
                                                 ("code", "environment", "dataset", "split", key)]
     payload = ("candidate " + key).encode()
-    candidate = Candidate(candidate_id=key, kind="factor", origin="custom", payload_hash=content_hash(payload),
+    candidate = Candidate(candidate_id=key, kind="factor", origin=origin, payload_hash=content_hash(payload),
                           code_hash=code, environment_hash=environment, source_evidence_hashes=(dataset,),
-                          created_at=T, synthetic=synthetic)
+                          created_at=T, synthetic=synthetic, parent_ids=parent_ids)
     registry.quarantine(candidate, payload)
     policy = PromotionPolicy()
     registry.archive_contract(policy)

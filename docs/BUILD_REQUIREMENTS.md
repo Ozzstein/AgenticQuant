@@ -20,7 +20,7 @@ enabled. This register supersedes the bootstrap table.
 | B2 US equity/Qlib | partial | `data/qlib_us.py`; actual US binary bundle/Alpha158/Ridge local execution | Historical universes, delistings, corporate actions and genuine benchmarks |
 | B3 crypto/context | partial | Direct/CCXT observations, contextual feature joins, crypto factors | Actual funding/OI/dominance/protocol and non-USD histories |
 | B4 vendor/MCP data | partial | FMP/FRED/ALFRED/Yahoo/Finnhub/SEC/CoinGecko/Alpaca parsing and provenance | Credentialed schemas/entitlements, transcripts and document coverage |
-| B5 actual prints/ADV | offline_verified | `adapters/operating.py`, `opening_identity.py`; raw IDs/ns, aliases, source-bound price/liquidity, 20-session VWAP ADV | Authenticated feeds and full native constraint reference proof |
+| B5 actual prints/ADV | offline_verified | `adapters/operating.py`, `opening_identity.py`, `binance_reference.py`; raw IDs/ns, aliases, actual reference/absence/window evidence, 20-session VWAP ADV | Authenticated feeds, testnet/production source binding and remaining native constraints |
 | B6 source preparation | offline_verified | `data/operating_plan.py`; completed task receipts, dated seven-series macro inputs, immutable training prefix and contextual whitelist | Approved actual source recipes/historical breadth and rolling unattended preparation |
 | B7 income authority | partial | Native Alpaca raw capture/parser plus `operations/income.py`; unsupported positive/complete claims rejected | **No sufficient positive income/complete-stream parser admitted**; crypto scope also missing |
 | C1 evaluator roles | offline_verified | Actual US Qlib research and authoritative chronological ledger replay; explicit bundle CLI | Native RD/Qlib container and actual historical inputs |
@@ -43,14 +43,14 @@ enabled. This register supersedes the bootstrap table.
 | F1 five optimizers | offline_verified | Actual LW covariance, deterministic HRP, BL views, feasible constrained fallback and exact target conversion | Real histories and all venue fee/lot interactions |
 | F2 durable execution | offline_verified | Exclusive owner, pre-I/O claim, partial/ambiguous receipt recovery, opening capacity identity | Authenticated lifecycle and unsupported historical reconciliation |
 | F3 Alpaca | external_unverified | Typed bounded REST/activity adapter, actual FILL/FEE parsing and account/order reconciliation; synthetic HTTP tests | Actual paper account, bracket/trailing and full lifecycle |
-| F4 crypto venues | partial | Native gross settlement, actual inventory-fee ledger/sleeves and venue limit contracts | Typed Binance/Kraken adapters and authenticated/testnet acceptance |
+| F4 crypto venues | partial | Typed Binance/Kraken spot adapters, native gross settlement, actual inventory-fee ledger/sleeves, bounded CCXT signing and native predicates; 65 root protocol/ledger checks passed | Advanced orders, frozen source factory composition and authenticated/testnet acceptance |
 | F5 LEAN | pending | Mandatory operational bridge retained | Actual bridge, shared risk/account ownership and runtime |
 | F6 income ledger | offline_verified | Sourced terms/receivables, original sleeve owners, actual posted/local-paper distributions, taxes and publication fences | Sufficient source authority; mergers/spinoffs/due-bills/foreign conventions blocked |
-| G1 registry/lifecycle | offline_verified | Immutable candidates/trials, development-only views, independent validation and activation/rollback | Real statistical acceptance and whole native discovery exposure accounting |
+| G1 registry/lifecycle | offline_verified | Immutable candidates/trials, development-only views, independent validation and activation/rollback; full mount exposure, opaque-source restrictions and native lineage quarantine | Real statistical acceptance and native internal multiplicity/implementation audit |
 | G2 custom factor/model/crypto | offline_verified | Actual fit/artifact/ledger execution and independent reconstruction | Actual data, every variant and multiple-testing/holdout gates |
 | G3 strategy/regime/advice | offline_verified | Actual callback economics, same-trial paired HMM, authoritative archived advice receipts | Real prospective receipts, complete controls and statistical gates |
 | G4 research copilot | offline_verified | Full-document chunk coverage, exact claims, deep memos and durable generation/budget receipts | Authenticated research quality and actual papers |
-| G5 native RD | partial | Pinned supervisor/overlay, internal network, bounded gateway/watchdog and immutable knowledge reuse | Actual Docker/all seven workflows, whole-bundle exposure, orphan recovery and candidate import |
+| G5 native RD | partial | Pinned supervisor/overlay, internal network, bounded gateway/watchdog, frozen data/documents and registry-authenticated knowledge/UI inheritance | Actual Docker/all seven workflows, source-specific document scope, orphan recovery and candidate import |
 | H1 operating cycle | partial | Shared six-strategy models/HMM/desk/optimizer/ledger, actual mixed-calendar recovery verified before income guard | Fresh positive acceptance now blocked by insufficient income source; retained tests fail visibly |
 | H2 scheduler/entry points | partial | Same application services, frozen jobs, independent operating/research workers, durable recovery | Rolling unattended refresh/build and full intraday production operation |
 | H3 dashboard/alerts | partial | Read-only actual stores/ledger/usage; durable SMTP/Telegram outbox and uncertainty tests | Authenticated delivery, resource monitoring, backup/restore and deployment |
@@ -62,6 +62,11 @@ Evidence: [accounting/backtesting](implementation/accounting-backtesting.md),
 [data/quant](implementation/data-quant.md), [agents/Jev/H](implementation/jev-agents.md),
 [root operations](implementation/operations.md). Counts identify their exact pinned
 source states; do not sum them into a whole-repository green claim.
+
+The [income source assessment](implementation/income-source-assessment.md) records
+the exact DTCC SR2025 schemas reviewed and the still-missing account, deduction,
+delivery and complete-window authorities. No positive parser is admitted from
+generic ISO fields or those insufficient component formats.
 
 Current income-guard audit at root pin `335d8c2`: retained 38-case H suite reported
 18 passed, 2 failed and 18 setup errors. All unsuccessful cases depend on the old

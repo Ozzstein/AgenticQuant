@@ -11,7 +11,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -78,6 +78,25 @@ class Trial(VersionedContract):
         return self
 
 
+class DiscoveryExposure(VersionedContract):
+    """All mounted observations exposed before a native search, including failure.
+
+    This is not a trial count. Native internal search multiplicity is unknown
+    until an independently verifiable search audit is implemented.
+    """
+    exposure_id: NonEmptyString
+    request_hash: Sha256
+    bundle_hash: Sha256
+    dataset_hash: Sha256
+    starts_at: UtcTimestamp
+    ends_at: UtcTimestamp
+    admitted_at: UtcTimestamp
+    internal_trials: None = None
+    document_manifest_hash: Sha256 | None = None
+    inherited_exposures: tuple[Sha256, ...] = ()
+    observation_scope: Literal['market-snapshot','unbounded'] = 'market-snapshot'
+
+
 class PromotionPolicy(VersionedContract):
     """Research activation criteria; this does not grant live-capital eligibility."""
 
@@ -141,7 +160,10 @@ class ResearchRegistry:
     """Append-only artifacts and atomic active generations on one durable path."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        from src.research.native_mounts import NativeMountAuthority, canonical_path
+
+        self.path = canonical_path(path)
+        NativeMountAuthority().protect(self.path,Path(str(self.path)+'-wal'),Path(str(self.path)+'-shm'))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
             db.executescript("""
@@ -157,8 +179,10 @@ class ResearchRegistry:
                 CREATE TABLE IF NOT EXISTS activations(slot TEXT NOT NULL, generation INTEGER NOT NULL,
                     payload TEXT NOT NULL, PRIMARY KEY(slot,generation));
                 CREATE TABLE IF NOT EXISTS active(slot TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS discovery_exposures(id TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS discovery_results(id TEXT PRIMARY KEY, hash TEXT NOT NULL);
             """)
-            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "trial_snapshots", "activations"):
+            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "trial_snapshots", "activations", "discovery_exposures", "discovery_results"):
                 for action in ("UPDATE", "DELETE"):
                     db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{action} BEFORE {action} ON {table} "
                                "BEGIN SELECT RAISE(ABORT, 'research history is immutable'); END")
@@ -235,10 +259,122 @@ class ResearchRegistry:
                     max(trial.evaluation_start, holdout.starts_at) < min(trial.evaluation_end, holdout.ends_at)
                 ):
                     raise RegistryError("holdout was already exposed by a research trial")
+            for row in db.execute('SELECT payload FROM discovery_exposures'):
+                prior=DiscoveryExposure.model_validate_json(row[0])
+                if prior.observation_scope=='unbounded' or (self._datasets_overlap(db,prior.dataset_hash,holdout.dataset_hash) and max(prior.starts_at,holdout.starts_at)<min(prior.ends_at,holdout.ends_at)):
+                    raise RegistryError('holdout was already exposed to native discovery')
             if not db.execute("SELECT 1 FROM blobs WHERE hash=?", (holdout.dataset_hash,)).fetchone():
                 raise RegistryError("holdout dataset manifest is missing")
             db.execute("INSERT INTO holdouts VALUES (?,?,?)", (holdout.holdout_id, holdout.dataset_hash,
                                                               holdout.model_dump_json()))
+
+    def admit_native_discovery(self, request, bundle_manifest: dict, *, at: datetime,
+                               document_manifest: dict | None=None,
+                               inherited_exposures: tuple[DiscoveryExposure,...]=()) -> DiscoveryExposure:
+        """Reserve the ENTIRE verified mount before execution, never just its split.
+
+        The supervisor verifies actual bundle bytes and rejects unlisted files.
+        This boundary independently derives scope from the exact archived bundle
+        snapshot and enforces existing/future holdout protection transactionally.
+        Repeating an admission is not execution recovery permission.
+        """
+        from src.domain.market import MarketSnapshot
+        snapshot=MarketSnapshot.model_validate(bundle_manifest['snapshot'])
+        if not snapshot.bars:
+            raise RegistryError('native discovery requires actual mounted observations')
+        if snapshot.context.as_of > _utc(at):
+            raise RegistryError('native discovery snapshot is later than actual admission')
+        bundle=canonical(bundle_manifest)
+        if content_hash(bundle)!=request.scenario.bundle_hash:
+            raise RegistryError('native discovery manifest differs from requested bundle')
+        if (request.document is not None)!=(document_manifest is not None):
+            raise RegistryError('native source document manifest is required exactly when mounted')
+        for prior in inherited_exposures:
+            if self.discovery_exposure(prior.exposure_id)!=prior:
+                raise RegistryError('native inherited exposure differs from registry authority')
+        unbounded=document_manifest is not None or any(p.observation_scope=='unbounded' for p in inherited_exposures)
+        request_bytes=canonical(request.model_dump(mode='json'))
+        snapshot_bytes=canonical(snapshot.model_dump(mode='json'))
+        exposure=DiscoveryExposure(exposure_id='native:'+request.run_id,
+            request_hash=content_hash(request_bytes),bundle_hash=content_hash(bundle),
+            dataset_hash=content_hash(snapshot_bytes),
+            starts_at=min(bar.opened_at for bar in snapshot.bars),
+            ends_at=max(bar.closed_at for bar in snapshot.bars)+timedelta(microseconds=1),
+            admitted_at=_utc(at),
+            document_manifest_hash=content_hash(canonical(document_manifest)) if document_manifest is not None else None,
+            inherited_exposures=tuple(sorted(p.content_hash() for p in inherited_exposures)),
+            observation_scope='unbounded' if unbounded else 'market-snapshot')
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM discovery_exposures WHERE id=?',(exposure.exposure_id,)).fetchone():
+                raise RegistryError('native discovery already admitted; reconcile the original run instead of resubmitting')
+            self._blob(db,request_bytes)
+            self._blob(db,bundle)
+            self._blob(db,snapshot_bytes)
+            if document_manifest is not None:
+                self._blob(db,canonical(document_manifest))
+                for item in document_manifest['files'].values():
+                    if not db.execute('SELECT 1 FROM blobs WHERE hash=?',(item['sha256'],)).fetchone():
+                        raise RegistryError('native document bytes were not archived')
+            for row in db.execute('SELECT payload FROM holdouts'):
+                holdout=Holdout.model_validate_json(row[0])
+                if unbounded or (self._datasets_overlap(db,exposure.dataset_hash,holdout.dataset_hash) and max(exposure.starts_at,holdout.starts_at)<min(exposure.ends_at,holdout.ends_at)):
+                    raise RegistryError('native mounted data touches a reserved holdout')
+            key=self._blob(db,canonical(exposure.model_dump(mode='json')))
+            db.execute('INSERT INTO discovery_exposures VALUES (?,?,?)',(exposure.exposure_id,key,exposure.model_dump_json()))
+        return exposure
+
+    def discovery_exposure(self, exposure_id: str) -> DiscoveryExposure:
+        with self._connection() as db:
+            row=db.execute('SELECT hash,payload FROM discovery_exposures WHERE id=?',(exposure_id,)).fetchone()
+        if row is None:
+            raise RegistryError('unknown native discovery exposure')
+        value=DiscoveryExposure.model_validate_json(row[1])
+        if value.content_hash()!=row[0] or self.blob(row[0])!=canonical(value.model_dump(mode='json')):
+            raise RegistryError('native discovery exposure integrity differs')
+        for key in (value.request_hash,value.bundle_hash,value.dataset_hash):
+            self.blob(key)
+        if value.document_manifest_hash:
+            document=json.loads(self.blob(value.document_manifest_hash))
+            for item in document['files'].values():
+                data=self.blob(item['sha256'])
+                if len(data)!=item['bytes']:
+                    raise RegistryError('native document size differs')
+        for key in value.inherited_exposures:
+            prior=DiscoveryExposure.model_validate_json(self.blob(key))
+            if self.discovery_exposure(prior.exposure_id)!=prior:
+                raise RegistryError('native inherited discovery integrity differs')
+        return value
+
+    def record_native_result(self, result: dict) -> str:
+        """Coordinator-only completion, bound to the original immutable admission."""
+        exposure=self.discovery_exposure('native:'+result['run_id'])
+        if (result.get('discovery_exposure_hash')!=exposure.content_hash()
+                or result.get('request_hash')!=exposure.request_hash
+                or result.get('activation')!='quarantined'
+                or result.get('internal_search_trials') is not None):
+            raise RegistryError('native result differs from its original discovery admission')
+        raw=canonical(result)
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            key=self._blob(db,raw)
+            old=db.execute('SELECT hash FROM discovery_results WHERE id=?',(exposure.exposure_id,)).fetchone()
+            if old and old[0]!=key:
+                raise RegistryError('native discovery result is immutable')
+            db.execute('INSERT OR IGNORE INTO discovery_results VALUES (?,?)',(exposure.exposure_id,key))
+        return key
+
+    def native_result(self, run_id: str) -> dict:
+        exposure=self.discovery_exposure('native:'+run_id)
+        with self._connection() as db:
+            row=db.execute('SELECT hash FROM discovery_results WHERE id=?',(exposure.exposure_id,)).fetchone()
+        if row is None:
+            raise RegistryError('native run has no authoritative completion record')
+        result=json.loads(self.blob(row[0]))
+        if (result.get('run_id')!=run_id or result.get('discovery_exposure_hash')!=exposure.content_hash()
+                or result.get('request_hash')!=exposure.request_hash):
+            raise RegistryError('native result admission integrity differs')
+        return result
 
     @staticmethod
     def _datasets_overlap(db, first: str, second: str) -> bool:
@@ -386,6 +522,23 @@ class ResearchRegistry:
             self.blob(key)
         return value
 
+    @staticmethod
+    def _require_audited_origin(db,candidate):
+        pending=[candidate]
+        seen=set()
+        while pending:
+            item=pending.pop()
+            if item.candidate_id in seen:
+                continue
+            seen.add(item.candidate_id)
+            if item.origin=='native_rd_agent':
+                raise RegistryError('native discovery multiplicity and exact implementation audit are unverified; candidate remains quarantined')
+            for parent in item.parent_ids:
+                record=db.execute('SELECT payload FROM candidates WHERE id=?',(parent,)).fetchone()
+                if record is None:
+                    raise RegistryError('candidate lineage is incomplete')
+                pending.append(Candidate.model_validate_json(record[0]))
+
     def _eligible(self, db, trial_id: str, policy: PromotionPolicy):
         trow = db.execute("SELECT payload FROM trials WHERE id=?", (trial_id,)).fetchone()
         erow = db.execute("SELECT payload FROM outcomes WHERE trial=?", (trial_id,)).fetchone()
@@ -394,6 +547,7 @@ class ResearchRegistry:
         trial, evaluation = Trial.model_validate_json(trow[0]), Evaluation.model_validate_json(erow[0])
         crow = db.execute("SELECT payload FROM candidates WHERE id=?", (trial.candidate_id,)).fetchone()
         candidate = Candidate.model_validate_json(crow[0])
+        self._require_audited_origin(db,candidate)
         if trial.purpose != "holdout" or trial.policy_hash != policy.content_hash():
             raise RegistryError("activation requires the preregistered holdout policy")
         if candidate.synthetic or evaluation.synthetic or evaluation.status != "complete" or not evaluation.validation_reliable:
@@ -461,6 +615,7 @@ class ResearchRegistry:
             prior = Activation.model_validate_json(row[0])
             candidate = Candidate.model_validate_json(db.execute("SELECT payload FROM candidates WHERE id=?",
                                                                   (prior.candidate_id,)).fetchone()[0])
+            self._require_audited_origin(db,candidate)
             return self._activate(db, slot, candidate, prior.evaluation_hash, prior.policy_hash,
                                   expected_generation, at, "rollback")
 
@@ -473,6 +628,8 @@ class ResearchRegistry:
             activation = Activation.model_validate_json(payload)
             if cutoff is None or activation.activated_at <= cutoff:
                 self.blob(activation.payload_hash)
+                with self._connection() as db:
+                    self._require_audited_origin(db,self.candidate(activation.candidate_id))
                 return activation
         return None
 
@@ -510,6 +667,17 @@ class ResearchRegistry:
         with self._connection() as db:
             counts = {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("candidates", "trials", "holdouts", "outcomes")}
-            active = [Activation.model_validate_json(row[0]).model_dump(mode="json") for row in db.execute(
-                "SELECT a.payload FROM activations a JOIN active p ON a.slot=p.slot AND a.generation=p.generation")]
-        return {"counts": counts, "active": active, "live_capital_authorized": False}
+            discoveries=db.execute('SELECT count(*) FROM discovery_exposures').fetchone()[0]
+            active,blocked=[],[]
+            for row in db.execute("SELECT a.payload FROM activations a JOIN active p ON a.slot=p.slot AND a.generation=p.generation"):
+                value=Activation.model_validate_json(row[0])
+                candidate=Candidate.model_validate_json(db.execute('SELECT payload FROM candidates WHERE id=?',(value.candidate_id,)).fetchone()[0])
+                try:
+                    self._require_audited_origin(db,candidate)
+                except RegistryError as exc:
+                    blocked.append({'activation':value.model_dump(mode='json'),'reason':str(exc)})
+                else:
+                    active.append(value.model_dump(mode='json'))
+        return {"counts": counts, "active": active, "live_capital_authorized": False,
+                "blocked_activations":blocked,
+                "native_discovery": {"admissions":discoveries,"internal_trials":None}}

@@ -17,6 +17,7 @@ from src.research.gateway_deployment import (
 )
 from src.research.native import NativeRequest, NativeSupervisor
 from src.research.native_runtime.watchdog import supervise
+from src.research.registry import ResearchRegistry
 from src.utils.exceptions import BacktestError
 from tests.test_native_rd_adapter import request as native_request
 
@@ -295,7 +296,8 @@ def test_cleanup_failure_does_not_mask_start_failure(monkeypatch, tmp_path, spec
     monkeypatch.setattr(manager, "stop", failed_stop)
     with pytest.raises(ValueError, match="original-start-error") as info:
         manager.run_native(
-            spec, bound_request(spec), provider_key_path=private_key, workdir=tmp_path / "jobs"
+            spec, bound_request(spec), provider_key_path=private_key, workdir=tmp_path / "jobs",
+            registry=ResearchRegistry(tmp_path / "registry.db")
         )
     assert "cleanup" in info.value.__notes__[0]
 
@@ -343,7 +345,9 @@ def test_native_manifest_mounts_are_read_only(tmp_path):
 def test_native_result_requires_actual_final_budget_receipt(
     monkeypatch, tmp_path, private_key, changed_model
 ):
-    request = native_request()
+    from tests.test_native_discovery_exposure import mounted_request
+    request, _ = mounted_request(tmp_path)
+    registry = ResearchRegistry(tmp_path / "registry.db")
     supervisor = NativeSupervisor(tmp_path / "jobs")
     monkeypatch.setattr(supervisor, "preflight", lambda *a, **k: {"fixture": "offline-admission"})
     monkeypatch.setattr(
@@ -372,11 +376,13 @@ def test_native_result_requires_actual_final_budget_receipt(
         actual={"tokens": 30, "cost_usd": "0.00004"},
     )
     monkeypatch.setattr(supervisor, "gateway_receipt", lambda *a, **k: receipt)
-    result = supervisor.run(request, gateway_token_path=private_key)
+    result = supervisor.run(request, gateway_token_path=private_key, registry=registry)
     assert result["status"] == ("audit_unavailable" if changed_model else "discovery_complete")
     saved = json.loads((supervisor.root / request.run_id / "result.json").read_text())
     assert saved["gateway_final_receipt"] == receipt
     assert saved["activation"] == "quarantined"
+    assert saved["discovery_exposure_hash"] == registry.discovery_exposure("native:" + request.run_id).content_hash()
+    assert saved["internal_search_trials"] is None
 
 
 def test_managed_cli_exposes_lifecycle_and_validates_before_start(tmp_path):

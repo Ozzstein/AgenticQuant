@@ -117,12 +117,14 @@ def library_status(registry: Path=typer.Option(...,exists=True)):
 
 def _native_command(name):
     def execute(request: Path=typer.Option(...,exists=True,dir_okay=False),
-                gateway_token_file: Path=typer.Option(...,exists=True,dir_okay=False),workdir: Path=typer.Option(...)):
+                gateway_token_file: Path=typer.Option(...,exists=True,dir_okay=False),workdir: Path=typer.Option(...),
+                registry: Path=typer.Option(...)):
         try:
             value=NativeRequest.model_validate_json(request.read_text())
             if value.command!=name:
                 raise ValueError('native command differs from request manifest')
-            result=NativeSupervisor(workdir).run(value,gateway_token_path=gateway_token_file)
+            result=NativeSupervisor(workdir).run(value,gateway_token_path=gateway_token_file,
+                                                 registry=ResearchRegistry(registry))
             typer.echo(json.dumps(result,indent=2))
         except Exception as exc:
             fail(exc)
@@ -139,14 +141,15 @@ for _command in ('fin_factor','fin_model','fin_quant','fin_factor_report','gener
 def managed_native(request: Path=typer.Option(...,exists=True,dir_okay=False),
                    deployment: Path=typer.Option(...,exists=True,dir_okay=False),
                    provider_key_file: Path=typer.Option(...,exists=True,dir_okay=False),
-                   gateway_state: Path=typer.Option(...),workdir: Path=typer.Option(...)):
+                   gateway_state: Path=typer.Option(...),workdir: Path=typer.Option(...),
+                   registry: Path=typer.Option(...)):
     """Start an isolated metered gateway, run the pinned job, retain budgets, stop."""
     from src.research.gateway_deployment import GatewayDeployment, GatewayDeploymentManager
     try:
         result=GatewayDeploymentManager(gateway_state).run_native(
             GatewayDeployment.model_validate_json(deployment.read_text()),
             NativeRequest.model_validate_json(request.read_text()),
-            provider_key_path=provider_key_file,workdir=workdir)
+            provider_key_path=provider_key_file,workdir=workdir,registry=ResearchRegistry(registry))
         typer.echo(json.dumps(result,indent=2))
     except Exception as exc:
         fail(exc)

@@ -51,7 +51,8 @@ key mount or external network. Both images must include the current runtime code
 python -m scripts.run_rd_agent managed-native \
   --request native-request.json --deployment gateway-deployment.json \
   --provider-key-file /private/keys/research-provider \
-  --gateway-state /private/quantagent-gateways --workdir /work/quantagent-jobs
+  --gateway-state /private/quantagent-gateways --workdir /work/quantagent-jobs \
+  --registry outputs/research.sqlite3
 ```
 
 `gateway-start` and `gateway-stop` expose the same explicit lifecycle for operator
@@ -96,6 +97,69 @@ not independent performance or activation evidence. A malicious-pickle sentinel
 test confirms host staging only copies bytes; changed source files are rejected.
 The 23 native/deployment tests pass offline; actual CoSTEER workflow reuse still
 requires the unavailable Docker/provider acceptance run.
+
+## Native discovery exposure admission
+
+All seven native CLI commands and `managed-native` require `--registry`; the
+compatibility runner passes its same authoritative registry. Before generated
+code executes, the supervisor reconstructs the actual Qlib binaries from the
+declared immutable snapshot and verifies the complete source file inventory.
+Extra files, symlinks, modified binaries and a snapshot omitting mounted securities
+fail. The reconstructed view is retained under `.inputs/<run>/qlib`, outside the
+writable job mount, and Docker receives that read-only view. Subsequent changes
+to the caller's original data directory do not change admitted inputs.
+
+Before any staging or gateway startup, a host-wide SQLite authority at
+`~/.local/state/quantagentlab/native-mounts.sqlite3` permanently reserves canonical
+writable paths, allowed source inputs and never-expose control paths across
+registries. Nested/inverse job roots and other jobs' frozen inputs cannot become
+writable aliases. Research DB/WAL/SHM files, provider keys and private gateway
+state cannot become source inputs, even through a read-only mount or the same
+run's reservation. Symlinks and hardlinked ordinary files fail; overlapping
+concurrent reservations have only one winner. Registry/gateway construction
+protects control paths before writing them. Registry connections retain the same
+canonical absolute path after working-directory changes. Output deletion does not erase this audit or authorize
+reusing a run. All native launchers on a host must use this authority; migrating
+an older externally launched container requires stopping/reconciling it first.
+
+`DiscoveryExposure` reserves every mounted security/date, including observations
+outside Qlib's configured universe and train/validation/test intervals. Admission
+and holdout reservation are serialized in SQLite. Existing holdouts block the
+job; exposure blocks later attempts to relabel those observations as untouched.
+A failed launch still consumes that exposure; repeating the same run is not
+recovery permission. Exposure counts are distinct from internal search trial
+counts, which remain `null`.
+
+Paper/report documents are bounded, fully archived and staged outside writable
+aliases. Their byte manifest proves content identity but cannot prove the absence
+of held-out observations. They therefore carry explicit **unbounded observation
+scope**: incompatible reserved holdouts block execution, and later untouched
+holdout claims in that registry remain blocked. No caller flag or model
+classification can make their scope empty. A source-specific independent scope
+authority remains needed to narrow this conservative restriction.
+
+Knowledge and UI inputs require authoritative prior admission and completion in
+the same registry, with recursive inherited exposure links and exact output
+hashes. Legacy self-consistent result files alone are insufficient. Only the
+supervisor records `discovery_results`; copied pickle bytes are never deserialized
+on the host. Native candidates and descendants remain quarantined until exact
+implementation and internal multiplicity audits exist. The guard applies to
+promotion, current resolution and rollback, including older activations; immutable
+history remains intact and status identifies blocked activations separately.
+
+The updated bundle/registry/process tests exercise existing and later holdouts,
+failed launches, mutable original directories, opaque paper scope, legacy source
+rejection and older native activation upgrades. Actual Docker execution, all
+seven native workflow acceptance, orphan recovery and generated candidate import
+remain required; this admission checkpoint does not certify them.
+
+Coordinator evidence: 147 offline native/registry/gateway/compatibility/copilot
+tests passed in 23.93s, including source/control separation, hardlink and
+relative-path regressions. The focused native/mount/registry/gateway suite
+also passed 78 tests in 14.08s. Independent read-only review reproduced the prior
+failures and checked their fixes; the two relative-path cases were then added by
+the coordinator. These exercise actual exported binary bundles, SQLite and
+bounded local subprocesses; Docker/provider interfaces remain explicit fixtures.
 
 ## Registered strategy, paired regime and copilot integration
 
