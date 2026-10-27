@@ -181,8 +181,12 @@ class ResearchRegistry:
                 CREATE TABLE IF NOT EXISTS active(slot TEXT PRIMARY KEY, generation INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS discovery_exposures(id TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS discovery_results(id TEXT PRIMARY KEY, hash TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS native_launches(id TEXT PRIMARY KEY, hash TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS native_containers(id TEXT PRIMARY KEY, hash TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS native_recoveries(id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    hash TEXT NOT NULL, PRIMARY KEY(id,sequence));
             """)
-            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "trial_snapshots", "activations", "discovery_exposures", "discovery_results"):
+            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "trial_snapshots", "activations", "discovery_exposures", "discovery_results", "native_launches", "native_containers", "native_recoveries"):
                 for action in ("UPDATE", "DELETE"):
                     db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{action} BEFORE {action} ON {table} "
                                "BEGIN SELECT RAISE(ABORT, 'research history is immutable'); END")
@@ -375,6 +379,210 @@ class ResearchRegistry:
                 or result.get('request_hash')!=exposure.request_hash):
             raise RegistryError('native result admission integrity differs')
         return result
+
+    def _native_lifecycle_identity(self, value):
+        exposure = self.discovery_exposure('native:' + value.run_id)
+        if (value.request_hash != exposure.request_hash
+                or value.discovery_exposure_hash != exposure.content_hash()):
+            raise RegistryError('native lifecycle identity differs from original admission')
+        return exposure
+
+    def _validate_native_launch(self, payload):
+        from src.domain.market import MarketSnapshot
+        from src.research.native import NativeRequest
+        from src.research.native_mounts import canonical_path
+        from src.research.native_recovery import NativeLaunch
+        value = NativeLaunch.model_validate(payload)
+        exposure = self._native_lifecycle_identity(value)
+        request = NativeRequest.model_validate_json(self.blob(exposure.request_hash))
+        snapshot = MarketSnapshot.model_validate_json(self.blob(exposure.dataset_hash))
+        if (value.registry_path != str(self.path) or value.account_id != snapshot.context.account_id
+                or value.recorded_at < exposure.admitted_at):
+            raise RegistryError('native launch registry/account/clock differs from original admission')
+        for path in (value.supervisor_root,value.gateway_token_path,value.registry_path):
+            if str(canonical_path(path)) != path:
+                raise RegistryError('native launch requires fixed canonical absolute paths')
+        files = {(item.tree,item.path): self.blob(item.blob_hash) for item in value.files}
+        if any(len(files[item.tree,item.path]) != item.size for item in value.files):
+            raise RegistryError('native launch file size differs from archived bytes')
+        original = json.loads(files['work','request.json'])
+        if original.pop('native_args', request.native_args()) != request.native_args() or NativeRequest.model_validate(original) != request:
+            raise RegistryError('native launch request differs from original admission')
+        if json.loads(files['work','scenario.json']) != {**request.scenario.model_dump(mode='json'),'provider_uri':'/data/qlib'}:
+            raise RegistryError('native launch scenario differs from admitted scenario')
+        admission = json.loads(files['work','admission.json'])
+        if (admission.get('discovery_exposure_hash') != exposure.content_hash()
+                or admission.get('discovery_exposure') != exposure.model_dump(mode='json')
+                or admission.get('image_id') != value.image_id or admission.get('network_id') != value.network_id):
+            raise RegistryError('native launch preflight or exposure differs')
+        if ('frozen','qlib/manifest.json') not in files or json.loads(files['frozen','qlib/manifest.json']) != json.loads(self.blob(exposure.bundle_hash)):
+            raise RegistryError('native launch frozen bundle differs from original admission')
+        bundle = json.loads(self.blob(exposure.bundle_hash))
+        expected = {'qlib/' + name: digest for name,digest in bundle['files'].items()}
+        if exposure.document_manifest_hash:
+            documents = json.loads(self.blob(exposure.document_manifest_hash))
+            expected.update({'sources/' + name: item['sha256'] for name,item in documents['files'].items()})
+        for source in request.knowledge:
+            prior = self.native_result(source.source_run)
+            name = 'knowledge/' + source.artifact + '.pkl'
+            if prior['files'].get(name) != source.artifact_hash:
+                raise RegistryError('native launch inherited knowledge differs from completion')
+            expected[name] = source.artifact_hash
+        if request.ui_source_run:
+            expected.update({name: digest for name,digest in self.native_result(request.ui_source_run)['files'].items()
+                             if name.startswith('log/')})
+        actual = {name: content_hash(data) for (tree,name),data in files.items() if tree=='frozen'}
+        actual.pop('qlib/manifest.json')
+        if actual != expected:
+            raise RegistryError('native launch frozen inventory differs from authoritative admitted bytes')
+        root = Path(value.supervisor_root)
+        work, frozen = root/request.run_id, root/'.inputs'/request.run_id
+        mounts = {(str(work),'/work',False),(str(frozen/'qlib'),'/data/qlib',True),
+                  (value.gateway_token_path,'/run/gateway-token',True)}
+        mounts.update((str(work/name),'/work/'+name,True) for name in ('request.json','scenario.json','admission.json'))
+        if request.document:
+            mounts.add((str(frozen/'sources'),'/sources',True))
+        if request.knowledge:
+            mounts.add((str(frozen/'knowledge'),'/work/knowledge-input',True))
+        if request.ui_source_run:
+            mounts.add((str(frozen/'log'),'/work/log',True))
+        if {(m.source,m.destination,m.read_only) for m in value.mounts} != mounts:
+            raise RegistryError('native launch mounts differ from original admitted paths')
+        return value
+
+    def record_native_launch(self, payload: dict) -> str:
+        value = self._validate_native_launch(payload)
+        return self._record_native_once('native_launches',value)
+
+    def _record_native_once(self, table, value):
+        if table not in ('native_launches','native_containers'):
+            raise RegistryError('unsupported native lifecycle table')
+        raw = canonical(value.model_dump(mode='json'))
+        key = content_hash(raw)
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute(f'SELECT hash FROM {table} WHERE id=?',(value.run_id,)).fetchone()
+            if old and old[0] != key:
+                raise RegistryError('native launch/container identity is immutable')
+            self._blob(db,raw)
+            db.execute(f'INSERT OR IGNORE INTO {table} VALUES (?,?)',(value.run_id,key))
+        return key
+
+    def native_launch(self, run_id: str) -> dict | None:
+        self.discovery_exposure('native:' + run_id)
+        with self._connection() as db:
+            row = db.execute('SELECT hash FROM native_launches WHERE id=?',(run_id,)).fetchone()
+        if row is None:
+            return None
+        value = self._validate_native_launch(json.loads(self.blob(row[0])))
+        if value.run_id != run_id or value.content_hash() != row[0]:
+            raise RegistryError('native launch identity differs')
+        return value.model_dump(mode='json')
+
+    def _validate_native_container(self, payload):
+        from src.research.native_recovery import NativeContainerBinding, NativeLaunch
+        value = NativeContainerBinding.model_validate(payload)
+        self._native_lifecycle_identity(value)
+        launch_payload = self.native_launch(value.run_id)
+        if launch_payload is None:
+            raise RegistryError('native container has no original launch authority')
+        launch = NativeLaunch.model_validate(launch_payload)
+        if (value.launch_hash != launch.content_hash() or value.created_at < launch.recorded_at
+                or value.bound_at < value.created_at):
+            raise RegistryError('native container identity/clock differs from original launch')
+        identity = json.loads(self.blob(value.identity_hash))
+        expected = {'container_id':value.container_id, 'created_at':value.created_at.isoformat(),
+                    'launch_hash':launch.content_hash(), 'image_id':launch.image_id,
+                    'network_id':launch.network_id, 'name':'/quantagent-rd-'+value.run_id}
+        if any(identity.get(key) != actual for key,actual in expected.items()):
+            raise RegistryError('native container projection differs from original binding')
+        if identity.get('mounts') != [m.model_dump(mode='json') for m in launch.mounts]:
+            raise RegistryError('native container mount projection differs')
+        return value
+
+    def record_native_container(self, payload: dict) -> str:
+        value = self._validate_native_container(payload)
+        return self._record_native_once('native_containers',value)
+
+    def native_container(self, run_id: str) -> dict | None:
+        self.discovery_exposure('native:' + run_id)
+        with self._connection() as db:
+            row = db.execute('SELECT hash FROM native_containers WHERE id=?',(run_id,)).fetchone()
+        if row is None:
+            return None
+        value = self._validate_native_container(json.loads(self.blob(row[0])))
+        if value.run_id != run_id or value.content_hash() != row[0]:
+            raise RegistryError('native container binding identity differs')
+        return value.model_dump(mode='json')
+
+    def _validate_native_recovery(self, payload, *, recording=False):
+        from src.research.native_recovery import (
+            NativeContainerBinding,
+            NativeLaunch,
+            NativeRecoveryEvent,
+        )
+        value = NativeRecoveryEvent.model_validate(payload)
+        exposure = self._native_lifecycle_identity(value)
+        if value.observed_at < exposure.admitted_at:
+            raise RegistryError('native recovery precedes original admission')
+        for name, reader, model, clock in (
+            ('launch_hash',self.native_launch,NativeLaunch,'recorded_at'),
+            ('container_binding_hash',self.native_container,NativeContainerBinding,'bound_at'),
+        ):
+            authority = reader(value.run_id)
+            original = model.model_validate(authority) if authority is not None else None
+            if not recording and original is not None and getattr(original,clock) > value.observed_at:
+                original = None
+            if (getattr(value,name) != (original.content_hash() if original else None)
+                    or (original is not None and value.observed_at < getattr(original,clock))):
+                raise RegistryError('native recovery authority/clock differs')
+        for name in ('inspection_hash','artifact_manifest_hash','gateway_receipt_hash','result_hash'):
+            key = getattr(value,name)
+            if key is not None:
+                self.blob(key)
+        if value.result_hash is not None and value.result_hash != content_hash(canonical(self.native_result(value.run_id))):
+            raise RegistryError('native recovery result is not the authoritative completion')
+        return value
+
+    def append_native_recovery(self, payload: dict) -> str:
+        from src.research.native_recovery import NativeRecoveryEvent
+        value = self._validate_native_recovery(payload, recording=True)
+        raw = canonical(value.model_dump(mode='json'))
+        key = content_hash(raw)
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT sequence,hash FROM native_recoveries WHERE id=? ORDER BY sequence DESC LIMIT 1',(value.run_id,)).fetchone()
+            if old and old[0] == value.sequence and old[1] == key:
+                return key
+            if (value.sequence != (old[0]+1 if old else 1)
+                    or value.previous_hash != (old[1] if old else None)):
+                raise RegistryError('native recovery sequence changed concurrently')
+            if old:
+                previous_raw = db.execute('SELECT content FROM blobs WHERE hash=?',(old[1],)).fetchone()
+                if previous_raw is None or content_hash(bytes(previous_raw[0])) != old[1]:
+                    raise RegistryError('native recovery predecessor integrity differs')
+                previous = NativeRecoveryEvent.model_validate_json(previous_raw[0])
+                if previous.observed_at > value.observed_at:
+                    raise RegistryError('native recovery observation clock moved backwards')
+            self._blob(db,raw)
+            db.execute('INSERT INTO native_recoveries VALUES (?,?,?)',(value.run_id,value.sequence,key))
+        return key
+
+    def native_recoveries(self, run_id: str) -> tuple[dict, ...]:
+        self.discovery_exposure('native:' + run_id)
+        with self._connection() as db:
+            rows = db.execute('SELECT sequence,hash FROM native_recoveries WHERE id=? ORDER BY sequence',(run_id,)).fetchall()
+        values = []
+        previous_hash, previous_at = None, None
+        for sequence,key in rows:
+            value = self._validate_native_recovery(json.loads(self.blob(key)))
+            if (value.run_id != run_id or value.sequence != len(values)+1 or sequence != value.sequence
+                    or value.previous_hash != previous_hash or value.content_hash() != key
+                    or (previous_at is not None and previous_at > value.observed_at)):
+                raise RegistryError('native recovery history integrity differs')
+            values.append(value.model_dump(mode='json'))
+            previous_hash, previous_at = key, value.observed_at
+        return tuple(values)
 
     @staticmethod
     def _datasets_overlap(db, first: str, second: str) -> bool:
