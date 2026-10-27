@@ -13,8 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
-from src.core.backtester import ReplayArtifact, ReplayResult, load_replay_artifact
-from src.core.validation import ValidationSuite
+from src.core.backtester import ReplayArtifact, ReplayResult, canonical_hash, load_replay_artifact
+from src.core.validation import AdviceValidationProof, ValidationSuite
 from src.research.registry import RegistryError, canonical, content_hash
 
 
@@ -40,7 +40,8 @@ def require_reproduced(actual: ReplayResult, reproduced: ReplayResult) -> None:
 
 
 def verify_execution(registry, store, trial_id: str, result: ReplayResult, *,
-                     artifact_dir: str | Path, baseline: ReplayArtifact | None = None) -> dict:
+                     artifact_dir: str | Path, baseline: ReplayArtifact | None = None,
+                     authorities=None) -> dict:
     """Return archived verification evidence; never record or promote an outcome."""
     from src.research.regime_experiments import execute_registered_regime
     from src.research.strategy_experiments import execute_registered_strategy
@@ -55,7 +56,8 @@ def verify_execution(registry, store, trial_id: str, result: ReplayResult, *,
     with tempfile.TemporaryDirectory(prefix='quantagent-execution-proof-') as temporary:
         work = Path(temporary)
         expected = execute(registry, trial_id, store=store, ledger_path=work/'ledger.sqlite3',
-                           artifact_dir=work/'artifacts')
+                           artifact_dir=work/'artifacts',
+                           **({'authorities':authorities} if candidate.kind == 'strategy' else {}))
         if expected.inputs_hash != trial.inputs_hash or expected.candidate_hash != candidate.content_hash():
             raise RegistryError('reproduced execution has a different admission identity')
         require_reproduced(result, expected.result)
@@ -68,7 +70,19 @@ def verify_execution(registry, store, trial_id: str, result: ReplayResult, *,
         proof = {'trial_id':trial_id, 'inputs_hash':trial.inputs_hash,
                  'candidate_hash':candidate.content_hash(), 'artifacts':artifacts,
                  'result_hash':registry.archive(canonical(result.model_dump(mode='json'))),
+                 'actual_decision_hashes':list(expected.actual_decision_hashes),
                  'implementation':'registered-recipe-reproduction-1'}
+        advice_proof = None
+        if expected.actual_decision_hashes:
+            from src.agents.history import DeskHistoryReceipt
+            receipts = [DeskHistoryReceipt.model_validate_json(payload) for name,payload in expected.artifacts
+                        if name.startswith('receipts/')]
+            bindings = tuple(sorted({(r.decision_hash,r.content_hash(),
+                        json.loads(r.inputs_json)['portfolio_context']['snapshot_id']) for r in receipts}))
+            advice_proof = AdviceValidationProof(manifest_hash=canonical_hash(result.manifest),
+                decision_records_hash=result.manifest['decision_records_hash'],
+                actual_decision_hashes=expected.actual_decision_hashes,receipt_bindings=bindings)
+            proof['advice_proof'] = advice_proof.model_dump(mode='json')
         paired = None
         if baseline is not None:
             comparisons = dict(expected.comparisons)
@@ -106,7 +120,8 @@ def verify_execution(registry, store, trial_id: str, result: ReplayResult, *,
             # the original baseline's full economic trace was read above.
             paired['artifacts'] = {name:registry.archive(payload)
                                    for name,payload in comparisons['baseline'].artifacts}
-        return {'execution_hash':registry.archive(canonical(proof)), 'paired':paired}
+        return {'execution_hash':registry.archive(canonical(proof)), 'paired':paired,
+                'actual_decision_hashes':expected.actual_decision_hashes,'advice_proof':advice_proof}
 
 
 def verified_paired_returns(registry, key: str) -> list[float]:

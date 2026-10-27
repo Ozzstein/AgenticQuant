@@ -100,8 +100,9 @@ def block_bootstrap_p_value(returns: list[float], *, samples: int = 10000, seed:
 
 
 class ExperimentEvaluator:
-    def __init__(self, registry: ResearchRegistry, evidence_store: EvidenceStore):
+    def __init__(self, registry: ResearchRegistry, evidence_store: EvidenceStore, *, authorities=None):
         self.registry, self.evidence_store = registry, evidence_store
+        self.authorities = authorities
 
     def evaluate(self, trial_id: str, result: ReplayResult, *, ledger_path: str | Path,
                  artifact_dir: str | Path, completed_at: datetime, cost_results=None, cost_artifacts=None,
@@ -110,6 +111,7 @@ class ExperimentEvaluator:
         plan = load_experiment_plan(self.registry,trial_id)
         inputs = plan.inputs
         candidate = self.registry.candidate(trial.candidate_id)
+        model_free = candidate.kind == 'strategy' and plan.strategy.model_name is None
         if candidate.kind in ('strategy','regime'):
             from src.research.strategy_experiments import materialize_strategy_plan
             def materialize(specs):
@@ -148,8 +150,15 @@ class ExperimentEvaluator:
                 "features_hash": data.features, "labels_hash": data.labels,
                 "feature_availability_hash": data.feature_available_at, "label_end_hash": data.label_available_at,
             }.items()), "training/feature/label lineage differs")
-            require(bool(result.cross_sectional_ic), "OOS predictions missing")
-            first = min(pd.Timestamp(t) for t in result.cross_sectional_ic)
+            if model_free:
+                require(not result.cross_sectional_ic and not result.walk_forward_results,
+                        'model-free advice cannot claim numeric model folds or IC')
+                dates = sorted({reference.signal_at for reference in plan.agent_decisions})
+                require(bool(dates), 'archived advice schedule missing')
+            else:
+                require(bool(result.cross_sectional_ic), "OOS predictions missing")
+                dates = list(result.cross_sectional_ic)
+            first = min(pd.Timestamp(t) for t in dates)
             bars = sorted([b for b in inputs.bars if b.closed_at >= first],
                           key=lambda b: (b.opened_at, b.instrument.instrument_id))
             require(result.manifest["bars_hash"] == canonical_hash([b.model_dump(mode="json") for b in bars]),
@@ -161,7 +170,7 @@ class ExperimentEvaluator:
             require(result.manifest["actions_hash"] == canonical_hash([a.model_dump(mode="json") for a in actions]),
                     "OOS corporate actions differ")
             require(all(trial.evaluation_start <= pd.Timestamp(t) < trial.evaluation_end
-                        for t in result.cross_sectional_ic), "OOS predictions outside preregistered interval")
+                        for t in dates), "decisions outside preregistered interval")
             return data
 
         data = verify("registered_inputs", frozen_inputs)
@@ -185,16 +194,20 @@ class ExperimentEvaluator:
                 hashes.append(self.registry.archive(payload))
             require(bool(hashes), "no fitted model artifacts")
             return tuple(hashes)
-        model_hashes = verify("actual_model_contents", actual_models) or ()
+        model_hashes = () if model_free else verify("actual_model_contents", actual_models) or ()
 
         execution_hash, paired_hash, paired_returns = None, None, None
+        actual_decision_hashes = ()
+        advice_proof = None
         if candidate.kind in ('strategy', 'regime'):
             from src.research.execution_proof import verify_execution
             proof = verify('registered_recipe_reproduction', lambda: verify_execution(
                 self.registry, self.evidence_store, trial_id, result,
-                artifact_dir=artifact_dir, baseline=paired_baseline))
+                artifact_dir=artifact_dir, baseline=paired_baseline, authorities=self.authorities))
             if proof is not None:
                 execution_hash = proof['execution_hash']
+                actual_decision_hashes = proof['actual_decision_hashes']
+                advice_proof = proof['advice_proof']
                 if proof['paired'] is not None:
                     verify('paired_complete_runs',lambda: require(
                         proof['paired']['candidate_status'] == proof['paired']['baseline_status'] == 'complete',
@@ -213,7 +226,7 @@ class ExperimentEvaluator:
         verify("trial_registry_contents", trial_count)
 
         corr = None
-        if data is not None and plan.reference_features:
+        if data is not None and plan.reference_features and not model_free:
             references = materialize(plan.reference_features)
             dates = {pd.Timestamp(t) for t in result.cross_sectional_ic}
             mask = data.features.index.get_level_values(0).isin(dates)
@@ -225,8 +238,12 @@ class ExperimentEvaluator:
                         correlations.append(abs(float(value)))
             corr = max(correlations) if correlations else None
         reported = result.manifest["provenance"].get("max_existing_factor_correlation")
-        verify("factor_correlation_contents", lambda: require(corr is not None and reported is not None
-               and math.isclose(corr, reported, rel_tol=1e-12, abs_tol=1e-12), "factor correlation not reproduced from frozen reference features"))
+        if not model_free:
+            verify("factor_correlation_contents", lambda: require(corr is not None and reported is not None
+                   and math.isclose(corr, reported, rel_tol=1e-12, abs_tol=1e-12), "factor correlation not reproduced from frozen reference features"))
+        else:
+            verify('authoritative_advice_contents', lambda: require(bool(actual_decision_hashes)
+                and reported is None, 'model-free decisions require independently reproduced historical authorities, without factor metrics'))
         # Regimes are preregistered causal input evidence. Future portfolio
         # returns are computed here, so the plan has no circular result hash.
         def regime_evidence():
@@ -262,7 +279,18 @@ class ExperimentEvaluator:
                          'replay_manifest_hash':canonical_hash(result.manifest),'periods':periods}))
         regime_hash = verify("regime_artifact_contents", regime_evidence)
 
-        report = ValidationSuite().validate(result, ledger_path=ledger_path, cost_results=cost_results, cost_artifacts=cost_artifacts, benchmark=benchmark)
+        def authoritative_advice(candidate_result, source_ledger):
+            # Only this invocation's independent reexecution can issue the
+            # trusted proof. There is no serialized-proof CLI or JSON shortcut.
+            require(advice_proof is not None and execution_hash is not None,
+                    'authoritative recipe/receipt reproduction did not succeed')
+            require(candidate_result == result and Path(source_ledger).resolve() == Path(ledger_path).resolve(),
+                    'advice proof requested for a different replay or ledger')
+            return advice_proof
+
+        report = ValidationSuite().validate(result, ledger_path=ledger_path, cost_results=cost_results,
+            cost_artifacts=cost_artifacts, benchmark=benchmark,
+            advice_verifier=authoritative_advice if model_free else None)
         all_checks = list(report.checks)+checks
         report = report.model_copy(update={"checks": all_checks,
             "overall": "RELIABLE" if all(c.verdict == CheckVerdict.PASS for c in all_checks) else "NOT RELIABLE",
@@ -279,6 +307,7 @@ class ExperimentEvaluator:
             registry_snapshot_hash=self.registry.trial_snapshot(trial_id), completed_at=completed_at,
             status="complete" if result.status == "complete" else "failed",
             validation_reliable=report.overall == "RELIABLE", actual_model_hashes=model_hashes,
+            actual_decision_hashes=actual_decision_hashes,
             regime_evaluation_hash=regime_hash,
             execution_verification_hash=execution_hash, paired_evaluation_hash=paired_hash,
             observations=len(result.daily_returns), sharpe=metrics.sharpe_ratio, ic=mean_ic,

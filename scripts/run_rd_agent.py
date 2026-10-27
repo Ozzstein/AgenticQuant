@@ -72,10 +72,14 @@ def reserve_holdout(registry: Path=typer.Option(...),snapshot: Path=typer.Option
 
 @app.command()
 def run(trial: str=typer.Option(...),registry: Path=typer.Option(...,exists=True),evidence: Path=typer.Option(...,exists=True),
-        output: Path=typer.Option(...),simulations: int=typer.Option(1000,min=1000)):
+        output: Path=typer.Option(...),simulations: int=typer.Option(1000,min=1000),
+        agent_authorities: Path | None=typer.Option(None,exists=True,dir_okay=False)):
     """Train, replay, run matched cost/benchmark portfolios and record an outcome."""
     try:
-        outcome=ResearchRunner(ResearchRegistry(registry),EvidenceStore(evidence)).run(trial,output_dir=output,simulations=simulations)
+        from src.research.authorities import AgentAuthorityPaths
+        authorities=AgentAuthorityPaths.model_validate_json(agent_authorities.read_text()).open() if agent_authorities else None
+        outcome=ResearchRunner(ResearchRegistry(registry),EvidenceStore(evidence),authorities=authorities).run(
+            trial,output_dir=output,simulations=simulations)
         typer.echo(outcome.model_dump_json(indent=2))
     except Exception as exc:
         fail(exc)

@@ -26,8 +26,9 @@ from src.research.registry import (
 
 
 class ResearchRunner:
-    def __init__(self, registry: ResearchRegistry, evidence: EvidenceStore, config=None):
+    def __init__(self, registry: ResearchRegistry, evidence: EvidenceStore, config=None, *, authorities=None):
         self.registry, self.evidence, self.config = registry, evidence, config
+        self.authorities = authorities
 
     def register(self, *, plan: ExperimentPlan, candidate_id: str, trial_id: str, family_id: str,
                  kind: str, origin: str, code: bytes, environment: bytes, at: datetime,
@@ -133,7 +134,8 @@ class ResearchRunner:
         else:
             from src.research.strategy_experiments import execute_registered_strategy as execute
         executed = execute(self.registry,trial_id,store=self.evidence,ledger_path=output/'ledger.sqlite3',
-                           artifact_dir=output/'artifacts')
+                           artifact_dir=output/'artifacts',
+                           **({'authorities':self.authorities} if kind == 'strategy' else {}))
         trial = self.registry.trial(trial_id)
         candidate = self.registry.candidate(trial.candidate_id)
         if executed.inputs_hash != trial.inputs_hash or executed.candidate_hash != candidate.content_hash():
@@ -159,7 +161,7 @@ class ResearchRunner:
         comparison = benchmark.compare_replay(result,inputs=executed.replay_kwargs,output_dir=output/'benchmarks',
                                               ledger_path=executed.ledger_path,n_simulations=simulations)
         write_immutable(output/'comparison.json',comparison.model_dump_json(indent=2))
-        evaluation = ExperimentEvaluator(self.registry,self.evidence).evaluate(trial_id,result,
+        evaluation = ExperimentEvaluator(self.registry,self.evidence,authorities=self.authorities).evaluate(trial_id,result,
             ledger_path=executed.ledger_path,artifact_dir=executed.artifact_dir,
             completed_at=datetime.now(timezone.utc),cost_artifacts=costs,benchmark=comparison,
             paired_baseline=paired_baseline)
