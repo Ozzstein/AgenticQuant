@@ -33,6 +33,7 @@ from src.domain.portfolio import (
     PriceMark,
     exact_decimal_sum,
 )
+from src.execution.fill_arithmetic import FillArithmetic
 
 D = Decimal
 ZERO = D(0)
@@ -283,7 +284,7 @@ class PortfolioLedger:
             "intent": intent,
             "status": row["status"],
             "filled": D(row["filled"]),
-            "remaining": intent.quantity - D(row["filled"]),
+            "remaining": exact_decimal_sum([intent.quantity, D(row["filled"]).copy_negate()]),
             "reserved": D(row["reserved"]),
             "reason": row["reason"],
         }
@@ -296,8 +297,11 @@ class PortfolioLedger:
         return [self.order(account, r[0]) for r in rows]
 
     def available_cash(self, account: str):
-        return D(self._account(account)["cash"]) - sum(
-            (o["reserved"] for o in self.pending(account)), ZERO
+        return exact_decimal_sum(
+            [
+                D(self._account(account)["cash"]),
+                *(o["reserved"].copy_negate() for o in self.pending(account)),
+            ]
         )
 
     def quantity(self, account: str, instrument_id: str):
@@ -329,6 +333,7 @@ class PortfolioLedger:
         movements or invalidate published NAV. Such conflicts require explicit
         reconciliation; we never alter actual execution times to make them fit.
         """
+        fill = Fill.model_validate(fill.model_dump())
         with self.atomic():
             old = self.db.execute(
                 "SELECT payload FROM fills WHERE account=? AND id=?",
@@ -362,7 +367,7 @@ class PortfolioLedger:
                 if self.spec(fill.account_id).mode == "backtest" or booked_at < fill.executed_at:
                     raise LedgerError("operational receipt must follow actual execution")
                 latest = self.db.execute(
-                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist','account_fee','dividend_entitlement','dividend_payment') ORDER BY sequence DESC LIMIT 1",
+                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist','account_fee','dividend_entitlement','dividend_payment','inventory_fee') ORDER BY sequence DESC LIMIT 1",
                     (fill.account_id,),
                 ).fetchone()
                 if latest and datetime.fromisoformat(latest[0]) > fill.executed_at:
@@ -396,35 +401,36 @@ class PortfolioLedger:
                 and Instrument.model_validate_json(holding["definition"]) != intent.instrument
             ):
                 raise LedgerError("instrument identity changed without a security-master migration")
-            notional = fill.quantity * fill.price * fill.fx_rate
-            remaining = order["remaining"] - fill.quantity
+            notional = fill.base_notional
+            arithmetic = FillArithmetic(fill)
+            remaining = arithmetic.subtract(order["remaining"], fill.quantity)
             reserve = order["reserved"] * remaining / order["remaining"]
             realized = ZERO
             if intent.side == "buy":
-                delta = -notional - fill.fee
+                delta = arithmetic.subtract(arithmetic.negate(notional), fill.fee)
                 other_reservations = (
                     D(row["cash"]) - self.available_cash(fill.account_id) - order["reserved"]
                 )
-                if D(row["cash"]) + delta < other_reservations + reserve:
+                if arithmetic.add(D(row["cash"]), delta) < other_reservations + reserve:
                     raise LedgerError("fill would consume reserved cash or borrow")
-                qty += fill.quantity
-                basis += notional + fill.fee
+                qty = arithmetic.add(qty, fill.quantity)
+                basis = arithmetic.add(basis, arithmetic.add(notional, fill.fee))
             else:
                 if fill.quantity > qty:
                     raise LedgerError("fill would create a short position")
                 removed_basis = basis if fill.quantity == qty else basis * fill.quantity / qty
-                delta = notional - fill.fee
-                if D(row["cash"]) + delta < 0:
+                delta = arithmetic.subtract(notional, fill.fee)
+                if arithmetic.add(D(row["cash"]), delta) < 0:
                     raise LedgerError("sell fees exceed available cash")
-                realized = delta - removed_basis
-                basis -= removed_basis
-                qty -= fill.quantity
+                realized = arithmetic.subtract(delta, removed_basis)
+                basis = arithmetic.subtract(basis, removed_basis)
+                qty = arithmetic.subtract(qty, fill.quantity)
             self.db.execute(
                 "UPDATE accounts SET cash=?,realized=?,fees=? WHERE id=?",
                 (
-                    str(D(row["cash"]) + delta),
-                    str(D(row["realized"]) + realized),
-                    str(D(row["fees"]) + fill.fee),
+                    str(arithmetic.add(D(row["cash"]), delta)),
+                    str(arithmetic.add(D(row["realized"]), realized)),
+                    str(arithmetic.add(D(row["fees"]), fill.fee)),
                     fill.account_id,
                 ),
             )
@@ -451,7 +457,7 @@ class PortfolioLedger:
             self.db.execute(
                 "UPDATE orders SET filled=?,reserved=?,status=? WHERE account=? AND id=?",
                 (
-                    str(order["filled"] + fill.quantity),
+                    str(arithmetic.add(order["filled"], fill.quantity)),
                     str(reserve),
                     "filled" if remaining == 0 else "partial",
                     fill.account_id,
@@ -479,6 +485,10 @@ class PortfolioLedger:
                 fill.model_dump_json(),
                 delta,
             )
+            if fill.inventory_fees:
+                from src.execution.inventory_fees import apply
+
+                apply(self, fill, observed_at=booked_at)
             return True
 
     def mark(self, account: str, marks: list[PriceMark]):
@@ -708,14 +718,20 @@ class PortfolioLedger:
                 if intent.side == "buy":
                     if quantity == 0:
                         opened_at = fill.executed_at
-                    quantity += fill.quantity
+                    quantity = FillArithmetic(fill).add(quantity, fill.quantity)
                 else:
-                    quantity -= fill.quantity
+                    quantity = FillArithmetic(fill).subtract(quantity, fill.quantity)
             elif row["kind"] in ("split", "delist"):
                 action = CorporateAction.model_validate_json(row["payload"])
                 if action.instrument.instrument_id != instrument_id:
                     continue
                 quantity = quantity * action.value if action.kind == "split" else ZERO
+            elif row["kind"] == "inventory_fee":
+                payload = json.loads(row["payload"])
+                if payload["fee"]["instrument"]["instrument_id"] == instrument_id:
+                    quantity = exact_decimal_sum(
+                        [quantity, D(payload["fee"]["quantity"]).copy_negate()]
+                    )
             if quantity == 0:
                 opened_at = None
         return opened_at
@@ -827,12 +843,19 @@ class PortfolioLedger:
 
         cash, positions, realized, fees = ZERO, {}, ZERO, ZERO
         accrued, payments, outstanding, taxes = {}, {}, {}, ZERO
+        expected_inventory_fees, seen_inventory_fees, instruments = {}, set(), {}
+        pending_inventory_fees = []
         for row in self.db.execute(
             "SELECT * FROM journal WHERE account=? ORDER BY sequence", (account,)
         ):
+            if pending_inventory_fees and row["kind"] != "inventory_fee":
+                raise LedgerError("actual fill inventory fee coverage is incomplete or reordered")
             if row["kind"] in ("dividend_entitlement", "dividend_payment"):
                 cash = exact_decimal_sum([cash, D(row["cash_delta"])])
-            elif row["kind"] in ("deposit", "fill", "account_fee"):
+            elif row["kind"] == "fill":
+                f = Fill.model_validate_json(row["payload"])
+                cash = FillArithmetic(f).add(cash, D(row["cash_delta"]))
+            elif row["kind"] in ("deposit", "account_fee"):
                 cash += D(row["cash_delta"])
             elif row["kind"] in ("dividend", "delist"):
                 action = CorporateAction.model_validate_json(row["payload"])
@@ -844,18 +867,81 @@ class PortfolioLedger:
                 raise LedgerError("nonmonetary journal entry cannot change cash")
             if row["kind"] == "fill":
                 f = Fill.model_validate_json(row["payload"])
+                arithmetic = FillArithmetic(f)
                 intent = self.order(account, f.intent_id)["intent"]
                 key = intent.instrument.instrument_id
+                if key in instruments and instruments[key] != intent.instrument:
+                    raise LedgerError("historical fill instrument identity changed")
+                instruments[key] = intent.instrument
                 qty, basis = positions.get(key, (ZERO, ZERO))
-                amount = f.quantity * f.price * f.fx_rate
+                amount = f.base_notional
+                trade_realized = ZERO
                 if intent.side == "buy":
-                    qty, basis = qty + f.quantity, basis + (amount + f.fee)
+                    movement = arithmetic.subtract(arithmetic.negate(amount), f.fee)
+                    qty, basis = (
+                        arithmetic.add(qty, f.quantity),
+                        arithmetic.add(basis, arithmetic.add(amount, f.fee)),
+                    )
                 else:
                     removed = basis if f.quantity == qty else basis * f.quantity / qty
-                    qty, basis = qty - f.quantity, basis - removed
-                    realized += amount - f.fee - removed
+                    movement = arithmetic.subtract(amount, f.fee)
+                    trade_realized = arithmetic.subtract(movement, removed)
+                    qty, basis = (
+                        arithmetic.subtract(qty, f.quantity),
+                        arithmetic.subtract(basis, removed),
+                    )
+                realized = arithmetic.add(realized, trade_realized)
+                stored_fill = self.db.execute(
+                    "SELECT * FROM fills WHERE account=? AND id=?", (account, f.fill_id)
+                ).fetchone()
+                if (
+                    f.account_id != account
+                    or row["at"] != f.executed_at.isoformat()
+                    or D(row["cash_delta"]) != movement
+                    or stored_fill is None
+                    or Fill.model_validate_json(stored_fill["payload"]) != f
+                    or D(stored_fill["cash_delta"]) != movement
+                    or D(stored_fill["realized"]) != trade_realized
+                    or D(stored_fill["notional"]) != amount
+                ):
+                    raise LedgerError(
+                        "fill cash/basis differs from exact persisted source economics"
+                    )
                 positions[key] = qty, basis
-                fees += f.fee
+                fees = arithmetic.add(fees, f.fee)
+                from src.execution.inventory_fees import fee_key
+
+                for fee in f.inventory_fees:
+                    identity = fee_key(f.fill_id, fee.instrument.instrument_id)
+                    expected_inventory_fees[identity] = f.content_hash()
+                    pending_inventory_fees.append(identity)
+            elif row["kind"] == "inventory_fee":
+                from src.execution.inventory_fees import fee_key, verify_payload
+
+                payload = json.loads(row["payload"])
+                key = payload["fee"]["instrument"]["instrument_id"]
+                qty, basis = positions.get(key, (ZERO, ZERO))
+                f, fee = verify_payload(self, account, payload, qty, basis)
+                if instruments.get(key) != fee.instrument:
+                    raise LedgerError("inventory fee historical instrument identity changed")
+                if (
+                    row["id"] != fee_key(f.fill_id, key)
+                    or not pending_inventory_fees
+                    or row["id"] != pending_inventory_fees[0]
+                    or expected_inventory_fees.get(row["id"]) != f.content_hash()
+                    or row["id"] in seen_inventory_fees
+                    or row["at"] != f.executed_at.isoformat()
+                    or D(row["cash_delta"]) != 0
+                ):
+                    raise LedgerError("inventory fee journal differs from its actual fill")
+                pending_inventory_fees.pop(0)
+                seen_inventory_fees.add(row["id"])
+                positions[key] = (
+                    exact_decimal_sum([qty, fee.quantity.copy_negate()]),
+                    exact_decimal_sum([basis, D(payload["removed_basis"]).copy_negate()]),
+                )
+                fees = exact_decimal_sum([fees, fee.base_value])
+                realized = exact_decimal_sum([realized, D(payload["removed_basis"]).copy_negate()])
             elif row["kind"] == "account_fee":
                 fee = AccountFee.model_validate_json(row["payload"])
                 if D(row["cash_delta"]) != fee.amount.copy_negate():
@@ -914,6 +1000,8 @@ class PortfolioLedger:
             for r in self.db.execute("SELECT * FROM holdings WHERE account=?", (account,))
         }
         expected = {k: v for k, v in positions.items() if v[0]}
+        if set(expected_inventory_fees) != seen_inventory_fees:
+            raise LedgerError("actual fill inventory fee coverage is incomplete")
         state = self._account(account)
         verify_projections(self, account, accrued, payments, outstanding)
         valid = (

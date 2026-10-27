@@ -28,6 +28,7 @@ from src.domain.portfolio import (
     PriceMark,
     SleeveSnapshot,
 )
+from src.execution.fill_arithmetic import FillArithmetic
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.routing import intent_for_delta, target_to_intents
 
@@ -327,7 +328,10 @@ class SleeveBook:
         ):
             if row["kind"] in ("dividend_entitlement", "dividend_payment"):
                 cash = exact_sum([cash, D(row["cash_delta"])])
-            elif row["kind"] in ("deposit", "fill", "account_fee"):
+            elif row["kind"] == "fill":
+                fill = Fill.model_validate_json(row["payload"])
+                cash = FillArithmetic(fill).add(cash, D(row["cash_delta"]))
+            elif row["kind"] in ("deposit", "account_fee"):
                 cash += D(row["cash_delta"])
             elif row["kind"] in ("dividend", "delist"):
                 action = CorporateAction.model_validate_json(row["payload"])
@@ -340,23 +344,29 @@ class SleeveBook:
             realized = ZERO
             if row["kind"] == "fill":
                 fill = Fill.model_validate_json(row["payload"])
+                arithmetic = FillArithmetic(fill)
                 order = self.ledger.order(self.account_id, fill.intent_id)["intent"]
                 economic = self.ledger.db.execute(
                     "SELECT * FROM fills WHERE account=? AND id=?", (self.account_id, fill.fill_id)
                 ).fetchone()
-                total_fees += fill.fee
-                total_realized += D(economic["realized"])
+                total_fees = arithmetic.add(total_fees, fill.fee)
+                total_realized = arithmetic.add(total_realized, D(economic["realized"]))
                 key = order.instrument.instrument_id
                 if order.side == "buy":
-                    basis[key] += D(economic["notional"]) + fill.fee
-                    held[key] += fill.quantity
+                    basis[key] = arithmetic.add(
+                        basis[key], arithmetic.add(D(economic["notional"]), fill.fee)
+                    )
+                    held[key] = arithmetic.add(held[key], fill.quantity)
                 else:
                     basis[key] = (
                         ZERO
                         if held[key] == fill.quantity
-                        else basis[key] - (D(economic["cash_delta"]) - D(economic["realized"]))
+                        else arithmetic.subtract(
+                            basis[key],
+                            arithmetic.subtract(D(economic["cash_delta"]), D(economic["realized"])),
+                        )
                     )
-                    held[key] -= fill.quantity
+                    held[key] = arithmetic.subtract(held[key], fill.quantity)
             elif row["kind"] == "split":
                 action = CorporateAction.model_validate_json(row["payload"])
                 held[action.instrument.instrument_id] *= action.value
@@ -373,6 +383,19 @@ class SleeveBook:
                 realized = fee.amount.copy_negate()
                 total_fees += fee.amount
                 total_realized += realized
+            elif row["kind"] == "inventory_fee":
+                from src.execution.inventory_fees import verify_payload
+
+                payload = json.loads(row["payload"])
+                key = payload["fee"]["instrument"]["instrument_id"]
+                _, fee = verify_payload(
+                    self.ledger, self.account_id, payload, held[key], basis[key]
+                )
+                held[key] = exact_sum([held[key], fee.quantity.copy_negate()])
+                basis[key] = exact_sum([basis[key], D(payload["removed_basis"]).copy_negate()])
+                realized = D(payload["removed_basis"]).copy_negate()
+                total_fees = exact_sum([total_fees, fee.base_value])
+                total_realized = exact_sum([total_realized, realized])
             elif row["kind"] == "dividend_entitlement":
                 entry = DividendEntitlement.model_validate_json(row["payload"])
                 realized = entry.gross_amount
@@ -475,6 +498,10 @@ class SleeveBook:
             from src.execution.dividend_projection import economic_payload
 
             payload = economic_payload(self, journal, state)
+        elif kind == "inventory_fee":
+            from src.execution.inventory_fees import sleeve_payload
+
+            payload = sleeve_payload(self, journal, state)
         else:
             action = CorporateAction.model_validate_json(journal["payload"])
             key = action.instrument.instrument_id
@@ -534,6 +561,7 @@ class SleeveBook:
                         "account_fee",
                         "dividend_entitlement",
                         "dividend_payment",
+                        "inventory_fee",
                     )
                     or "source:" + journal["id"] in known
                 ):

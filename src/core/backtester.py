@@ -958,7 +958,7 @@ class PortfolioReplay:
                 order = ledger.order(account.account_id, f.intent_id)["intent"]
                 previous = [s for s in snapshots if s.as_of < f.executed_at]
                 denominator = previous[-1].nav if previous else account.initial_cash
-                turnover += float(f.quantity * f.price * f.fx_rate / denominator)
+                turnover += float(f.base_notional / denominator)
                 economic = ledger.db.execute(
                     "SELECT cash_delta,realized,notional FROM fills WHERE account=? AND id=?",
                     (account.account_id, f.fill_id),

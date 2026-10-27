@@ -22,10 +22,25 @@ from src.core.backtester import (
     verify_decision_trace,
 )
 from src.domain.common import Sha256, VersionedContract
-from src.domain.portfolio import DividendPayment, exact_decimal_sum
+from src.domain.portfolio import DividendPayment, Fill, exact_decimal_sum
+from src.execution.fill_arithmetic import FillArithmetic
 from src.execution.ledger import PortfolioLedger
 from src.utils.exceptions import BacktestError
 from src.utils.schemas import CheckResult, CheckVerdict, ValidationReport
+
+
+def _reported_fill(trade):
+    return Fill.model_validate(
+        {key: value for key, value in trade.items() if key in Fill.model_fields}
+    )
+
+
+def _fill_fees(previous, trade):
+    fill = _reported_fill(trade)
+    result = FillArithmetic(fill).add(previous, fill.fee)
+    for fee in fill.inventory_fees:
+        result = exact_decimal_sum([result, fee.base_value])
+    return result
 
 
 class AdviceValidationProof(VersionedContract):
@@ -137,7 +152,9 @@ class ValidationSuite:
                     f"metric mismatch: {name}",
                 )
             require(result.metrics.total_trades == len(result.trades), "trade count mismatch")
-            fees = sum((Decimal(trade["fee"]) for trade in result.trades), Decimal(0))
+            fees = Decimal(0)
+            for trade in result.trades:
+                fees = _fill_fees(fees, trade)
             taxes = Decimal(0)
             if result.economic_events:
                 # Match the canonical chronological Decimal accumulation order,
@@ -151,7 +168,7 @@ class ValidationSuite:
                 ]
                 for _, kind, entry in sorted(entries, key=lambda e: (e[0], e[1])):
                     if kind:
-                        fees += Decimal(entry["fee"])
+                        fees = _fill_fees(fees, entry)
                     else:
                         payment = DividendPayment.model_validate(entry["payload"])
                         fees = exact_decimal_sum([fees, payment.fee])
@@ -166,12 +183,7 @@ class ValidationSuite:
             for trade in result.trades:
                 before = [s for s in snapshots if s.as_of < pd.Timestamp(trade["executed_at"])]
                 denominator = before[-1].nav if before else snapshots[0].nav
-                turnover += float(
-                    Decimal(trade["quantity"])
-                    * Decimal(trade["price"])
-                    * Decimal(trade["fx_rate"])
-                    / denominator
-                )
+                turnover += float(_reported_fill(trade).base_notional / denominator)
             require(
                 math.isclose(turnover, result.metrics.turnover, rel_tol=1e-12, abs_tol=1e-12),
                 "turnover mismatch",

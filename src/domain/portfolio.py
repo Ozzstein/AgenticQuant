@@ -105,6 +105,39 @@ class OrderIntent(VersionedContract):
         return self
 
 
+class FillSettlement(VersionedContract):
+    """Actual gross quote debit/credit, when the native venue reports it explicitly."""
+
+    gross_quote: Positive
+    source_id: NonEmptyString
+    source_hash: Sha256
+
+
+class InventoryFee(VersionedContract):
+    """Actual noncash crypto fee, with explicit sourced base-currency valuation."""
+
+    instrument: Instrument
+    quantity: Positive
+    price: Positive
+    fx_rate: Positive = Decimal(1)
+    valued_at: UtcTimestamp
+    available_at: UtcTimestamp
+    source_id: NonEmptyString
+    source_hash: Sha256
+    valuation_source_id: NonEmptyString
+    valuation_source_hash: Sha256
+
+    @property
+    def base_value(self):
+        return exact_decimal_product(exact_decimal_product(self.quantity, self.price), self.fx_rate)
+
+    @model_validator(mode="after")
+    def actual_asset(self):
+        if self.instrument.asset_class != "crypto" or self.valued_at > self.available_at:
+            raise ValueError("inventory fee requires an actual crypto debit and causal valuation")
+        return self
+
+
 class Fill(VersionedContract):
     fill_id: NonEmptyString
     intent_id: NonEmptyString
@@ -115,6 +148,37 @@ class Fill(VersionedContract):
     fx_rate: Positive = Decimal(1)
     executed_at: UtcTimestamp
     event_id: NonEmptyString
+    settlement: FillSettlement | None = None
+    inventory_fees: tuple[InventoryFee, ...] = ()
+
+    @property
+    def base_notional(self):
+        if self.settlement is not None:
+            return exact_decimal_product(self.settlement.gross_quote, self.fx_rate)
+        return self.quantity * self.price * self.fx_rate
+
+    @property
+    def total_fee(self):
+        return exact_decimal_sum([self.fee, *(fee.base_value for fee in self.inventory_fees)])
+
+    @model_validator(mode="after")
+    def actual_fees(self):
+        if len({fee.instrument.instrument_id for fee in self.inventory_fees}) != len(
+            self.inventory_fees
+        ):
+            raise ValueError("one exact fee amount per actual fee asset required")
+        if any(fee.valued_at > self.executed_at for fee in self.inventory_fees):
+            raise ValueError("inventory fee cannot use a future market valuation")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.settlement is None:
+            result.pop("settlement", None)
+        if not self.inventory_fees:
+            result.pop("inventory_fees", None)
+        return result
 
 
 class AccountFee(VersionedContract):

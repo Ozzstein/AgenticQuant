@@ -265,6 +265,12 @@ class VenueOrderReport(VersionedContract):
             raise ValueError("duplicate executions in report")
         if any(f.executed_at > self.observed_at for f in self.fills):
             raise ValueError("future execution in venue report")
+        if any(
+            fee.available_at > self.observed_at
+            for fill in self.fills
+            for fee in fill.inventory_fees
+        ):
+            raise ValueError("future inventory fee source in venue report")
         if sum((f.quantity for f in self.fills), D(0)) > self.cumulative_quantity:
             raise ValueError("execution quantity exceeds broker cumulative quantity")
         return self
@@ -690,6 +696,7 @@ class VenueExecution:
         """
         pending = []
         for intent_id, report in reports:
+            report = VenueOrderReport.model_validate(report.model_dump())
             if self._persist_report(intent_id, report):
                 pending.append((intent_id, report))
         if not pending:
