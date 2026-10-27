@@ -255,8 +255,9 @@ class OperationsStore:
 
     def pending_alerts(self, channel: str) -> list[dict]:
         with self.connection() as db:
-            rows = db.execute('''SELECT a.* FROM alerts a WHERE NOT EXISTS
-                (SELECT 1 FROM alert_delivery d WHERE d.id=a.id AND d.channel=? AND d.state IN ('sent','uncertain','sending'))
+            rows = db.execute('''SELECT a.* FROM alerts a WHERE COALESCE(
+                (SELECT d.state FROM alert_delivery d WHERE d.id=a.id AND d.channel=?
+                 ORDER BY d.attempt DESC LIMIT 1),'new') IN ('new','retry_authorized')
                 ORDER BY created_at''',(channel,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -270,15 +271,16 @@ class OperationsStore:
                     raise OperationError('unknown alert')
                 previous = db.execute('SELECT * FROM alert_delivery WHERE id=? AND channel=? ORDER BY attempt DESC LIMIT 1',
                                       (identity,channel)).fetchone()
-                if previous:
+                if previous and previous['state'] != 'retry_authorized':
                     if previous['state'] == 'sent':
                         key = previous['receipt_hash']
                     else:
                         raise RecoveryRequired('alert delivery is uncertain; do not send it again automatically')
                 else:
                     key = None
+                    attempt = previous['attempt']+1 if previous else 1
                     db.execute('INSERT INTO alert_delivery VALUES (?,?,?,?,?,?)',
-                               (identity,channel,1,'sending',datetime.now(timezone.utc).isoformat(),None))
+                               (identity,channel,attempt,'sending',datetime.now(timezone.utc).isoformat(),None))
             if key:
                 return self.artifact(key)
             try:
@@ -288,8 +290,27 @@ class OperationsStore:
                 key = self.archive(receipt)
             except BaseException:
                 with self.connection() as db:
-                    db.execute("UPDATE alert_delivery SET state='uncertain' WHERE id=? AND channel=? AND attempt=1",(identity,channel))
+                    db.execute("UPDATE alert_delivery SET state='uncertain' WHERE id=? AND channel=? AND attempt=?",(identity,channel,attempt))
                 raise
             with self.connection() as db:
-                db.execute("UPDATE alert_delivery SET state='sent',receipt_hash=? WHERE id=? AND channel=? AND attempt=1",(key,identity,channel))
+                db.execute("UPDATE alert_delivery SET state='sent',receipt_hash=? WHERE id=? AND channel=? AND attempt=?",(key,identity,channel,attempt))
             return receipt
+
+    def resolve_delivery(self, identity: str, channel: str, *, expected_attempt: int,
+                         outcome: Literal['confirmed','abandoned','retry_authorized'], evidence: dict) -> str:
+        """Explicit operator resolution, distinct from measured transport acceptance."""
+        if outcome not in ('confirmed','abandoned','retry_authorized') or not evidence:
+            raise OperationError('explicit resolution and archived review evidence required')
+        with self.exclusive('alert:'+identity+':'+channel):
+            with self.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                old = db.execute('SELECT * FROM alert_delivery WHERE id=? AND channel=? ORDER BY attempt DESC LIMIT 1',
+                                 (identity,channel)).fetchone()
+                if old is None or old['attempt'] != expected_attempt or old['state'] not in ('sending','uncertain'):
+                    raise OperationError('resolution must identify the current uncertain delivery attempt')
+                key = self._archive(db,canonical({'basis':'operator_review','outcome':outcome,'evidence':evidence,
+                    'alert_id':identity,'channel':channel,'attempt':expected_attempt,'previous':dict(old)}))
+                db.execute('UPDATE alert_delivery SET state=?,receipt_hash=? WHERE id=? AND channel=? AND attempt=?',
+                           (outcome,key,identity,channel,expected_attempt))
+                self._event(db,'alert:'+identity,None,'delivery_resolved',{'resolution_hash':key})
+                return key
