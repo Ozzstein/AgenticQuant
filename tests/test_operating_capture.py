@@ -825,6 +825,36 @@ def test_crypto_exact_turnover_limits_individual_print_size_and_wire_ids(crypto_
     assert all("/aggTrades" not in r.url.path for r in f.requests)
 
 
+def test_crypto_upstream_identity_uses_exact_native_print_not_projection(crypto_capture):
+    from src.data.opening_identity import verified_opening_source_identity
+
+    f = crypto_capture
+    f.clock.at = datetime(2024, 3, 22, 0, 8, tzinfo=UTC)
+    req = context(datetime(2024, 3, 22, 0, 7, tzinfo=UTC))
+    proof = primary(
+        f.adapter.trades(
+            f.instrument,
+            req,
+            start=datetime(2024, 3, 22, 0, 6, tzinfo=UTC),
+            end=req.as_of,
+            calendar_id=f.calendar.record.evidence_id,
+            fx_evidence_id=f.fx.record.evidence_id if f.fx else None,
+            **f.kwargs,
+        ),
+        "operating_prints",
+    )
+    event = read(f.store, proof, f.clock)["opening_events"][0]
+    identity = verified_opening_source_identity(
+        f.store, proof.record.evidence_id, event["event_id"], as_of=f.clock()
+    )
+    assert identity.provider == f.venue
+    assert identity.instrument == f.instrument
+    assert identity.trade_id == "9007199254740993123"
+    assert identity.wire_timestamp == (
+        "1711065960123456789" if f.venue == "kraken" else "1711065960123000000"
+    )
+
+
 def test_crypto_missing_history_wrong_identity_and_unknown_fx_fail(crypto_capture):
     f = crypto_capture
     f.state["truncated"] = True
