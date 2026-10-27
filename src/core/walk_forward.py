@@ -15,10 +15,16 @@ import pandas as pd
 from src.core.backtester import (
     FoldEvidence,
     PortfolioReplay,
+    ReplayResult,
+    canonical_hash,
+    file_hash,
     performance_metrics,
+    require_matching_inputs,
     split_folds,
+    write_immutable,
 )
-from src.domain.portfolio import FillPolicy, RankedSignal
+from src.domain.common import RunContext
+from src.domain.portfolio import AccountSpec, FillPolicy, RankedSignal, RiskPolicy
 from src.utils.exceptions import BacktestError
 
 
@@ -48,6 +54,55 @@ def cross_sectional_ic(predictions: pd.Series, labels: pd.Series) -> dict[str, f
             float(value) if value is not None and np.isfinite(value) else None
         )
     return result
+
+
+def reconstruct_oos_inputs(
+    result: ReplayResult, original_inputs: dict, *, signals_path=None
+) -> dict:
+    """Rebuild exactly the observed OOS replay without fitting or guessing signals.
+
+    The supplied development bundle supplies market/metadata/universe events;
+    the immutable result fixes the OOS span and conventions. Every reconstructed
+    input hash is compared before any benchmark/cost rerun may execute.
+    """
+    provenance = result.manifest.get("provenance", {})
+    reference = provenance.get("oos_signals_artifact")
+    if not reference:
+        raise BacktestError("walk-forward result lacks bound OOS signal artifact; rerun training")
+    path = Path(signals_path or reference["path"])
+    if file_hash(path) != reference["sha256"]:
+        raise BacktestError("OOS signals artifact bytes differ from frozen hash")
+    signals = [RankedSignal.model_validate(s) for s in json.loads(path.read_text())]
+    if (
+        canonical_hash(
+            [s.model_dump(mode="json") for s in sorted(signals, key=lambda s: s.signal_id)]
+        )
+        != result.manifest["signals_hash"]
+    ):
+        raise BacktestError("OOS signal content differs from replay manifest")
+    first = pd.Timestamp(provenance["oos_first_decision_at"])
+    manifest = result.manifest
+    account = AccountSpec.model_validate(manifest["account"])
+    args = {
+        **original_inputs,
+        "account": account,
+        "context": RunContext.model_validate(manifest["context"]),
+        "bars": [b for b in original_inputs["bars"] if b.closed_at >= first],
+        "signals": signals,
+        "targets": [],
+        "actions": [
+            a for a in original_inputs.get("actions") or [] if a.effective_at > account.opened_at
+        ],
+        "fill_policy": FillPolicy.model_validate(manifest["fill_policy"]),
+        "risk_policy": RiskPolicy.model_validate(manifest["risk_policy"]),
+        "topk": manifest["topk"],
+        "samples_per_year": manifest["samples_per_year"],
+        "valuation_calendar": manifest["valuation_calendar"],
+        "valuation_times": [pd.Timestamp(t).to_pydatetime() for t in manifest["valuation_times"]],
+        "provenance": provenance,
+    }
+    require_matching_inputs(result, args)
+    return args
 
 
 class WalkForwardRunner:
@@ -282,8 +337,22 @@ class WalkForwardRunner:
             oos_account = account.model_copy(
                 update={"opened_at": oos_start - pd.Timedelta(microseconds=1)}
             )
+            signal_path = (artifacts / "signals.json").resolve()
+            write_immutable(
+                signal_path,
+                json.dumps(
+                    [s.model_dump(mode="json") for s in sorted(signals, key=lambda s: s.signal_id)],
+                    sort_keys=True,
+                    indent=2,
+                ),
+            )
             run_provenance = {
                 **(provenance or {}),
+                "oos_signals_artifact": {
+                    "path": str(signal_path),
+                    "sha256": file_hash(signal_path),
+                },
+                "oos_first_decision_at": first.isoformat(),
                 "folds": [e.model_dump(mode="json") for e in evidence],
                 "features_hash": frame_hash(features),
                 "labels_hash": frame_hash(labels),
@@ -338,9 +407,6 @@ class WalkForwardRunner:
                     "status": "incomplete" if incomplete else "complete",
                     "diagnostics": diagnostics,
                 }
-            )
-            (artifacts / "signals.json").write_text(
-                json.dumps([s.model_dump(mode="json") for s in signals], indent=2)
             )
             (artifacts / "result.json").write_text(result.model_dump_json(indent=2))
             # Store the enhanced result in the same ledger run record.

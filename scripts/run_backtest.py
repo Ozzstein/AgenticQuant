@@ -16,10 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pandas as pd
 import typer
 
-from src.core.backtester import PortfolioReplay, ReplayResult
+from src.core.backtester import PortfolioReplay, ReplayArtifact, ReplayResult
 from src.core.benchmark import BenchmarkRunner, MatchedComparison
 from src.core.validation import ValidationSuite
-from src.core.walk_forward import WalkForwardRunner
+from src.core.walk_forward import WalkForwardRunner, reconstruct_oos_inputs
 from src.domain.common import RunContext
 from src.domain.portfolio import (
     AccountSpec,
@@ -164,11 +164,9 @@ def compare(
     """Run matched benchmarks and cost reruns, retaining every random NAV path."""
     try:
         args, raw = load_inputs(input)
-        if "walk_forward" in raw:
-            raise BacktestError(
-                "compare needs the persisted OOS signals and OOS execution span from the training artifact"
-            )
         baseline = ReplayResult.model_validate_json(result.read_text())
+        if "walk_forward" in raw:
+            args = reconstruct_oos_inputs(baseline, args)
         runner = BenchmarkRunner()
         comparison = runner.compare_replay(
             baseline, inputs=args, output_dir=output, n_simulations=simulations
@@ -199,15 +197,28 @@ def validate(
             [
                 ReplayResult.model_validate_json(p.read_text())
                 for p in sorted(costs.glob("cost-*.json"))
+                if p.name != "cost-artifacts.json"
             ]
             if costs
             else []
+        )
+        cost_artifacts = (
+            [
+                ReplayArtifact.model_validate(item)
+                for item in json.loads((costs / "cost-artifacts.json").read_text())
+            ]
+            if costs and (costs / "cost-artifacts.json").exists()
+            else None
         )
         benchmark = (
             MatchedComparison.model_validate_json(benchmarks.read_text()) if benchmarks else None
         )
         report = ValidationSuite().validate(
-            data, ledger_path=ledger, cost_results=cost_results, benchmark=benchmark
+            data,
+            ledger_path=ledger,
+            cost_results=cost_results,
+            cost_artifacts=cost_artifacts,
+            benchmark=benchmark,
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report.model_dump_json(indent=2))

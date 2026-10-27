@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 from decimal import Decimal
 
 import numpy as np
 import pandas as pd
 
-from src.core.backtester import ReplayResult, canonical_hash, performance_metrics
+from src.core.backtester import (
+    ReplayResult,
+    canonical_hash,
+    load_replay_artifact,
+    performance_metrics,
+    recorded_replay_inputs,
+    require_matching_inputs,
+)
 from src.execution.ledger import PortfolioLedger
+from src.utils.exceptions import BacktestError
 from src.utils.schemas import CheckResult, CheckVerdict, ValidationReport
 
 
@@ -19,7 +28,14 @@ class ValidationSuite:
         self.config = config
 
     def validate(
-        self, result, *, ledger_path=None, cost_results=None, benchmark=None
+        self,
+        result,
+        *,
+        ledger_path=None,
+        cost_results=None,
+        cost_artifacts=None,
+        benchmark=None,
+        _accounting_only=False,
     ) -> ValidationReport:
         checks = []
 
@@ -131,9 +147,11 @@ class ValidationSuite:
                 "Persisted ledger required for independent journal/state reconciliation.",
             )
         else:
-            ledger = PortfolioLedger(ledger_path)
+            ledger = None
             try:
+                ledger = PortfolioLedger(ledger_path, read_only=True)
                 ledger.reconcile(result.account_id)
+                require_matching_inputs(result, recorded_replay_inputs(ledger, result))
                 require(
                     ledger.history(result.account_id) == snapshots, "persisted snapshots differ"
                 )
@@ -181,10 +199,18 @@ class ValidationSuite:
                     True,
                     "Independent journal/state reconciliation, exact immutable manifest/hash binding, complete fill/order content and persisted report agree.",
                 )
-            except (ValueError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError, OSError, sqlite3.Error, BacktestError) as exc:
                 check("durable_accounting", False, f"Durable ledger mismatch: {exc}")
             finally:
-                ledger.close()
+                if ledger is not None:
+                    ledger.close()
+        if _accounting_only:
+            reliable = all(c.verdict == CheckVerdict.PASS for c in checks)
+            return ValidationReport(
+                checks=checks,
+                overall="RELIABLE" if reliable else "NOT RELIABLE",
+                summary="; ".join(c.explanation for c in checks if c.verdict != CheckVerdict.PASS),
+            )
         timing = bool(result.trades) and len({t["fill_id"] for t in result.trades}) == len(
             result.trades
         )
@@ -256,33 +282,47 @@ class ValidationSuite:
             f"Observed position-cap breaches (including market drift): {len(breaches)}.",
             warning=True,
         )
-        costs = cost_results or []
-        matched = len(costs) >= 3
-        for c in costs:
-            matched &= c.status == "complete" and c.timestamps == result.timestamps
-            matched &= all(
-                c.manifest.get(k) == result.manifest.get(k)
-                for k in (
-                    "bars_hash",
-                    "signals_hash",
-                    "targets_hash",
-                    "metadata_hash",
-                    "universe_hash",
-                    "actions_hash",
-                    "risk_policy",
+        cost_error = "persisted result/ledger bindings are required"
+        costs = []
+        matched = False
+        try:
+            if not cost_artifacts:
+                raise ValueError(cost_error)
+            costs = [load_replay_artifact(reference) for reference in cost_artifacts]
+            if cost_results is not None and {(c.run_id, c.account_id): c for c in costs} != {
+                (c.run_id, c.account_id): c for c in cost_results
+            }:
+                raise ValueError("cost summaries differ from verified replay artifacts")
+            from src.core.benchmark import require_matched_replay
+
+            levels = set()
+            for candidate in costs:
+                require_matched_replay(result, candidate, cost_variant=True)
+                levels.add(
+                    (
+                        Decimal(candidate.manifest["fill_policy"]["equity_cost_bps"]),
+                        Decimal(candidate.manifest["fill_policy"]["crypto_cost_bps"]),
+                    )
                 )
+            required_levels = {
+                (Decimal(0), Decimal(0)),
+                (Decimal(10), Decimal(20)),
+                (Decimal(20), Decimal(40)),
+            }
+            matched = (
+                len({(c.account_id, c.run_id) for c in costs}) == len(costs)
+                and required_levels <= levels
             )
-        eq_levels = {Decimal(c.manifest["fill_policy"]["equity_cost_bps"]) for c in costs}
-        crypto_levels = {Decimal(c.manifest["fill_policy"]["crypto_cost_bps"]) for c in costs}
-        matched &= {Decimal(0), Decimal(10), Decimal(20)} <= eq_levels and {
-            Decimal(0),
-            Decimal(20),
-            Decimal(40),
-        } <= crypto_levels
+            cost_error = "all persisted cost runs verified; required paired cost levels " + (
+                "present" if matched else "absent/duplicated"
+            )
+        except (ValueError, KeyError, TypeError, OSError, sqlite3.Error, BacktestError) as exc:
+            cost_error = str(exc)
         check(
             "cost_sensitivity",
             matched,
-            "Requires matched actual fill reruns at 0/10/20 bps equity and 0/20/40 bps crypto; no return-subtraction shortcut.",
+            "Requires independently reconciled cost replay result and ledger bytes at paired 0/0,10/20,20/40 bps. "
+            + cost_error,
         )
         values = [v for v in result.cross_sectional_ic.values() if v is not None]
         ic = float(np.mean(values)) if values else None
@@ -335,23 +375,24 @@ class ValidationSuite:
             significant,
             f"Moving-block bootstrap lower mean-return bound after trial correction: {lower}; requires >=60 observations and resolvable positive bound.",
         )
-        bench_ok = (
-            benchmark is not None
-            and benchmark.simulations >= 1000
-            and benchmark.monte_carlo_percentile is not None
-        )
-        if bench_ok:
-            bench_ok &= (
-                benchmark.match.get("timestamps") == result.timestamps
-                and benchmark.match.get("signals_hash") == result.manifest["signals_hash"]
+        bench_ok, bench_error = False, "persisted benchmark evidence absent"
+        try:
+            if benchmark is None:
+                raise ValueError(bench_error)
+            from src.core.benchmark import verify_comparison
+
+            verify_comparison(result, benchmark, minimum_simulations=1000)
+            bench_ok, bench_error = (
+                True,
+                "All named/random replay bytes, manifests, input events, accounting and summaries verified.",
             )
-            bench_ok &= all(
-                k in benchmark.benchmark_metrics for k in ("SPY", "BTC", "60/40", "equal_weight")
-            )
+        except (ValueError, KeyError, TypeError, OSError, sqlite3.Error, BacktestError) as exc:
+            bench_error = str(exc)
         check(
             "matched_benchmarks",
             bench_ok,
-            "Requires SPY/BTC/60-40/equal-weight and 1000 nondegenerate random selections under declared matched replay assumptions.",
+            "Requires SPY/BTC/60-40/equal-weight and 1000 nondegenerate seeded selection replays. "
+            + bench_error,
         )
         check(
             "regime_dependence",

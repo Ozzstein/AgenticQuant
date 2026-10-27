@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -19,7 +21,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.domain.common import RunContext
+from src.domain.common import RunContext, Sha256
 from src.domain.portfolio import (
     AccountSpec,
     CorporateAction,
@@ -99,6 +101,172 @@ class ReplayResult(BaseModel):
     cross_sectional_ic: dict[str, float | None] = Field(default_factory=dict)
     reconciliation: dict
     diagnostics: list[str] = Field(default_factory=list)
+
+
+class ReplayArtifact(BaseModel):
+    """External immutable binding; kept outside ReplayResult to avoid self-hashing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    result_path: str
+    result_sha256: Sha256
+    ledger_path: str
+    ledger_sha256: Sha256
+    run_id: str
+    account_id: str
+    manifest_hash: Sha256
+
+
+def file_hash(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_immutable(path: str | Path, content: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_text() != content:
+                    raise BacktestError(f"immutable artifact content changed: {path}")
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def persist_replay_artifact(result: ReplayResult, ledger_path, result_path) -> ReplayArtifact:
+    ledger_path, result_path = Path(ledger_path).resolve(), Path(result_path).resolve()
+    wal = Path(str(ledger_path) + "-wal")
+    if not ledger_path.is_file() or (wal.exists() and wal.stat().st_size):
+        raise BacktestError("artifact requires a closed, checkpointed persistent ledger")
+    write_immutable(
+        result_path, json.dumps(result.model_dump(mode="json"), sort_keys=True, indent=2)
+    )
+    return ReplayArtifact(
+        result_path=str(result_path),
+        result_sha256=file_hash(result_path),
+        ledger_path=str(ledger_path),
+        ledger_sha256=file_hash(ledger_path),
+        run_id=result.run_id,
+        account_id=result.account_id,
+        manifest_hash=canonical_hash(result.manifest),
+    )
+
+
+def load_replay_artifact(reference: ReplayArtifact, *, verify_accounting=True) -> ReplayResult:
+    """Load bytes, verify hashes and independently reconcile persisted economics."""
+    reference = ReplayArtifact.model_validate(reference)
+    if (
+        file_hash(reference.result_path) != reference.result_sha256
+        or file_hash(reference.ledger_path) != reference.ledger_sha256
+    ):
+        raise BacktestError("replay artifact bytes differ from their binding")
+    wal = Path(reference.ledger_path + "-wal")
+    if wal.exists() and wal.stat().st_size:
+        raise BacktestError("replay artifact has uncheckpointed writes")
+    result = ReplayResult.model_validate_json(Path(reference.result_path).read_text())
+    if (result.run_id, result.account_id, canonical_hash(result.manifest)) != (
+        reference.run_id,
+        reference.account_id,
+        reference.manifest_hash,
+    ):
+        raise BacktestError("replay artifact identity/manifest mismatch")
+    if verify_accounting:
+        from src.core.validation import ValidationSuite
+
+        report = ValidationSuite().validate(
+            result, ledger_path=reference.ledger_path, _accounting_only=True
+        )
+        if report.overall != "RELIABLE":
+            raise BacktestError("artifact accounting verification failed: " + report.summary)
+    if file_hash(reference.ledger_path) != reference.ledger_sha256:
+        raise BacktestError("replay ledger changed during verification")
+    return result
+
+
+def recorded_replay_inputs(ledger: PortfolioLedger, result: ReplayResult) -> dict:
+    """Recover actual input events, never treating manifest hash strings as data."""
+    rows = list(
+        ledger.db.execute(
+            "SELECT id,payload FROM events WHERE account=? ORDER BY rowid", (result.account_id,)
+        )
+    )
+
+    def records(prefix, contract):
+        return [
+            contract.model_validate_json(row["payload"])
+            for row in rows
+            if row["id"].startswith(prefix)
+        ]
+
+    manifest = result.manifest
+    return {
+        "context": RunContext.model_validate(manifest["context"]),
+        "account": ledger.spec(result.account_id),
+        "bars": records("open:", ExecutionBar),
+        "signals": records("input:signal:", RankedSignal),
+        "targets": records("input:target:", PortfolioTarget),
+        "metadata": records("input:metadata:", InstrumentRisk),
+        "universes": records("input:universe:", UniverseEligibility),
+        "actions": records("input:action:", CorporateAction),
+        "fill_policy": FillPolicy.model_validate(manifest["fill_policy"]),
+        "risk_policy": RiskPolicy.model_validate(manifest["risk_policy"]),
+        "topk": manifest["topk"],
+        "samples_per_year": manifest["samples_per_year"],
+        "valuation_calendar": manifest["valuation_calendar"],
+        "valuation_times": [datetime.fromisoformat(t) for t in manifest["valuation_times"]],
+        "provenance": manifest.get("provenance", {}),
+    }
+
+
+def require_matching_inputs(result: ReplayResult, inputs: dict) -> None:
+    """Bind input content and conventions, including clocks, actions and costs."""
+    expected = {
+        "bars_hash": canonical_hash(
+            [
+                b.model_dump(mode="json")
+                for b in sorted(
+                    inputs["bars"], key=lambda b: (b.opened_at, b.instrument.instrument_id)
+                )
+            ]
+        ),
+        "signals_hash": canonical_hash(
+            [
+                s.model_dump(mode="json")
+                for s in sorted(inputs.get("signals") or [], key=lambda s: s.signal_id)
+            ]
+        ),
+        "targets_hash": canonical_hash(
+            [t.model_dump(mode="json") for t in inputs.get("targets") or []]
+        ),
+        "metadata_hash": canonical_hash([m.model_dump(mode="json") for m in inputs["metadata"]]),
+        "universe_hash": canonical_hash([u.model_dump(mode="json") for u in inputs["universes"]]),
+        "actions_hash": canonical_hash(
+            [a.model_dump(mode="json") for a in inputs.get("actions") or []]
+        ),
+        "account": inputs["account"].model_dump(mode="json"),
+        "context": inputs["context"].model_dump(mode="json"),
+        "fill_policy": (inputs.get("fill_policy") or FillPolicy()).model_dump(mode="json"),
+        "risk_policy": (inputs.get("risk_policy") or RiskPolicy()).model_dump(mode="json"),
+        "topk": inputs.get("topk", 30),
+        "samples_per_year": inputs.get("samples_per_year", 252),
+        "valuation_calendar": inputs.get("valuation_calendar", "declared-equity-sessions"),
+    }
+    times = inputs.get("valuation_times")
+    if times is None:
+        times = sorted({b.closed_at for b in inputs["bars"]})
+    expected["valuation_times"] = [t.isoformat() for t in times]
+    changed = [key for key, value in expected.items() if result.manifest.get(key) != value]
+    if changed:
+        raise BacktestError("replay inputs differ from frozen manifest: " + ", ".join(changed))
 
 
 def performance_metrics(nav: list[float], samples_per_year: int) -> ReplayMetrics:
@@ -291,6 +459,40 @@ class PortfolioReplay:
             "provenance": provenance or {},
         }
         manifest_hash = canonical_hash(manifest)
+        # Finished evidence is immutable, including SQLite file bytes. An
+        # idempotent rerun must not rewrite run rows or invalidate artifact hashes.
+        if self.ledger_path != ":memory:" and Path(self.ledger_path).is_file():
+            existing = PortfolioLedger(self.ledger_path, read_only=True)
+            try:
+                previous = existing.db.execute(
+                    "SELECT payload FROM runs WHERE account=? AND id=?",
+                    (account.account_id, context.run_id),
+                ).fetchone()
+                if previous:
+                    payload = json.loads(previous[0])
+                    if payload["manifest_hash"] != manifest_hash:
+                        raise BacktestError("run inputs changed; use a new isolated account/run")
+                    if payload.get("status") in ("complete", "incomplete") and payload.get(
+                        "result"
+                    ):
+                        saved = ReplayResult.model_validate(payload["result"])
+                        existing.reconcile(account.account_id)
+                        require_matching_inputs(saved, recorded_replay_inputs(existing, saved))
+                        from src.core.validation import ValidationSuite
+
+                        report = ValidationSuite().validate(
+                            saved, ledger_path=self.ledger_path, _accounting_only=True
+                        )
+                        if any(
+                            c.name != "complete_run" and c.verdict.value != "PASS"
+                            for c in report.checks
+                        ):
+                            raise BacktestError(
+                                "stored replay failed accounting verification: " + report.summary
+                            )
+                        return saved
+            finally:
+                existing.close()
         ledger = PortfolioLedger(self.ledger_path)
         try:
             ledger.create_account(account)

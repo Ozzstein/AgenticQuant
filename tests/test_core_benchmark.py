@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from src.core.backtester import PortfolioReplay
-from src.core.benchmark import BenchmarkRunner
+from src.core.benchmark import BenchmarkRunner, verify_comparison
 from src.utils.exceptions import BacktestError
 from tests.test_core_backtest import B, replay_inputs
 
@@ -42,6 +42,10 @@ def test_1000_random_portfolios_use_real_costed_nav_and_disclose_missing_benchma
     assert {"SPY", "BTC", "60/40"} <= set(result.unavailable)
     assert "equal_weight" in result.benchmark_metrics
     assert (tmp_path / "comparison" / "benchmarks.json").exists()
+    assert len(result.random_artifacts) == 1000
+    # Verification traverses all 1000 actual ledgers before rejecting missing named coverage.
+    with pytest.raises(BacktestError, match="missing durable named benchmark SPY"):
+        verify_comparison(base, result)
 
 
 def test_small_universe_does_not_fabricate_random_percentile(tmp_path):
@@ -81,7 +85,7 @@ def test_mismatched_benchmark_input_fails(tmp_path):
         )
 
 
-def test_named_benchmarks_use_supplied_equity_crypto_prices_and_6040_weights(tmp_path):
+def named_inputs():
     from src.domain.common import Instrument
     from src.domain.portfolio import InstrumentRisk
 
@@ -115,10 +119,16 @@ def test_named_benchmarks_use_supplied_equity_crypto_prices_and_6040_weights(tmp
             update={"instrument_ids": ("A", "B", "SPY", "AGG", "BTC/USD")}
         )
     ]
+    return args
+
+
+def test_named_benchmarks_use_supplied_equity_crypto_prices_and_6040_weights(tmp_path):
+    args = named_inputs()
     base = PortfolioReplay(tmp_path / "base.db").run(**args)
     result = BenchmarkRunner().compare_replay(
         base, inputs=args, output_dir=tmp_path / "comparison", n_simulations=5
     )
+    verify_comparison(base, result, minimum_simulations=5)
     assert all(name in result.benchmark_metrics for name in ("SPY", "BTC", "60/40", "equal_weight"))
     assert result.benchmark_metrics["60/40"]["weights"] == {"SPY": "0.6", "AGG": "0.4"}
     assert result.benchmark_metrics["SPY"]["total_return"] == pytest.approx(
