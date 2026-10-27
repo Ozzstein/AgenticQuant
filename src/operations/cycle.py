@@ -1110,7 +1110,7 @@ class PaperCycleService:
             detector.load(path)
         return detector, data
 
-    def _model_availability(self, plan):
+    def _model_availability(self, plan, *, snapshot):
         """Bind physical creation and completed consumption stages separately.
 
         The original creation receipt survives reuse and recovery; a failed
@@ -1167,12 +1167,32 @@ class PaperCycleService:
                 },
                 "available_at": max(created, finished).isoformat(),
             }
-        context = plan.inputs.context.model_copy(update={"as_of": max(available)})
+        context = plan.inputs.context.model_copy(
+            update={"as_of": max(available), "account_id": snapshot.account_id}
+        )
         if (
             context.as_of - plan.inputs.context.as_of
         ).total_seconds() > self.config.operations.max_cycle_age_seconds:
             raise ValueError("model completion exceeded operating source freshness deadline")
-        return {"models": values, "desk_context": context.model_dump(mode="json")}
+        portfolio = self._desk_snapshot(plan, context)
+        return {
+            "models": values,
+            "desk_context": context.model_dump(mode="json"),
+            "portfolio_snapshot": portfolio.model_dump(mode="json"),
+            "portfolio_snapshot_hash": portfolio.content_hash(),
+        }
+
+    def _desk_snapshot(self, plan, context):
+        """Persist actual canonical and sleeve valuations before any desk call.
+
+        This reads the reconciled ledger at the measured consumption clock; it
+        does not advance price marks or copy the earlier input valuation.
+        """
+        age = plan.inputs.risk_policy.max_price_age_seconds
+        with self.ledger.atomic():
+            snapshot = self.ledger.snapshot(context.account_id, context.as_of, age)
+            sleeves = SleeveBook(self.ledger, context.account_id).snapshot(context.as_of, age)
+            return snapshot.model_copy(update={"sleeves": sleeves})
 
     @staticmethod
     def _predict_regime(detector, data, context, max_observation_age_seconds):
@@ -1239,6 +1259,8 @@ class PaperCycleService:
 
     def _desk(self, plan, regime, snapshot, returns, models, datasets, now, *, context=None):
         context = context or plan.inputs.context
+        if snapshot.as_of != context.as_of or snapshot.account_id != context.account_id:
+            raise ValueError("desk portfolio must match the actual decision clock and account")
         correlation = returns.corr()
         if not np.isfinite(correlation.to_numpy()).all():
             raise ValueError("actual correlation unavailable")
@@ -1945,8 +1967,13 @@ class PaperCycleService:
                     detector, macro = self._macro(plan)
                 returns = self._returns(plan)
                 snapshot = PortfolioSnapshot.model_validate(reconciled["snapshot"])
-                availability = stage("model_availability", lambda: self._model_availability(plan))
+                availability = stage(
+                    "model_availability", lambda: self._model_availability(plan, snapshot=snapshot)
+                )
                 desk_context = RunContext.model_validate(availability["desk_context"])
+                desk_snapshot = PortfolioSnapshot.model_validate(availability["portfolio_snapshot"])
+                if desk_snapshot.content_hash() != availability["portfolio_snapshot_hash"]:
+                    raise ValueError("persisted desk snapshot identity differs")
                 desk = stage(
                     "agent_desk",
                     lambda: self._desk(
@@ -1954,7 +1981,7 @@ class PaperCycleService:
                         self._predict_regime(
                             detector, macro, desk_context, plan.macro_dataset.max_source_age_seconds
                         ),
-                        snapshot,
+                        desk_snapshot,
                         returns,
                         models,
                         datasets,
