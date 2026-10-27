@@ -526,3 +526,36 @@ def test_acceptance_at_open_and_later_cycles_cannot_consume_past_prints(tmp_path
             order.eligible_at,
         )
     ledger.close()
+
+
+def test_observed_receipt_reader_recovers_original_metadata_after_full_fill_restart(tmp_path):
+    ledger, adapter, engine, order = setup(tmp_path)
+    engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
+    engine.dispatch(order.intent_id, as_of=order.eligible_at)
+    opening = bar(at=order.eligible_at + timedelta(seconds=1))
+    clocks = dict(
+        observed_at=opening.closed_at,
+        available_at=opening.closed_at,
+        as_of=opening.closed_at,
+        evidence_id="fixture-print",
+        evidence_hash="d" * 64,
+    )
+    assert adapter.observed_open_receipt(opening.event_id) is None
+    adapter.settle_open(
+        opening, {order.intent_id: engine.admission_metadata(order.intent_id)}, **clocks
+    )
+    assert not ledger.pending(order.account_id)
+    ledger.close()
+    ledger, adapter, engine, _ = setup(tmp_path)
+    receipt = adapter.observed_open_receipt(opening.event_id)
+    original = {key: engine.admission_metadata(key) for key, _ in receipt.admission_metadata_hashes}
+    assert set(original) == {order.intent_id}
+    assert (
+        adapter.settle_open(
+            opening, original, **{**clocks, "as_of": opening.closed_at + timedelta(seconds=1)}
+        )
+        == []
+    )
+    assert len(ledger.fills(order.account_id)) == 1
+    assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()

@@ -829,6 +829,24 @@ class PaperVenue:
             bar, metadata, eligible_intent_ids=self.accepted_intent_ids_before(bar.opened_at)
         )
 
+    def observed_open_receipt(self, event_id: str) -> ObservedOpenReceipt | None:
+        """Read the committed settlement identity, including original intent IDs.
+
+        After partial/full fills H reconstructs the exact original metadata map
+        from these IDs via VenueExecution.admission_metadata, rather than from
+        the current pending orders. Absence means no committed settlement.
+        """
+        row = self.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?",
+            (self.account_id, "paper-observed-open:" + event_id),
+        ).fetchone()
+        if row is None:
+            return None
+        receipt = ObservedOpenReceipt.model_validate_json(row[0])
+        if receipt.account_id != self.account_id or receipt.event_id != event_id:
+            raise LedgerError("persisted observed opening receipt identity changed")
+        return receipt
+
     def settle_open(
         self,
         bar,
