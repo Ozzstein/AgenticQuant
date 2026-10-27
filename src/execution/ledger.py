@@ -36,17 +36,21 @@ class LedgerError(ValueError):
 
 
 class PortfolioLedger:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = str(path)
-        if self.path != ":memory:":
+        if self.path != ":memory:" and not read_only:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        source = Path(path).resolve().as_uri() + "?mode=ro" if read_only else self.path
         self.db = sqlite3.connect(
-            self.path, isolation_level=None, timeout=30, check_same_thread=False
+            source, uri=read_only, isolation_level=None, timeout=30, check_same_thread=False
         )
         self.db.row_factory = sqlite3.Row
         self._lock = RLock()
         self._depth = 0
         self.db.execute("PRAGMA foreign_keys=ON")
+        if read_only:
+            self.db.execute("PRAGMA query_only=ON")
+            return
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -338,7 +342,7 @@ class PortfolioLedger:
             else:
                 if fill.quantity > qty:
                     raise LedgerError("fill would create a short position")
-                removed_basis = basis * fill.quantity / qty
+                removed_basis = basis if fill.quantity == qty else basis * fill.quantity / qty
                 delta = notional - fill.fee
                 if D(row["cash"]) + delta < 0:
                     raise LedgerError("sell fees exceed available cash")
@@ -603,9 +607,9 @@ class PortfolioLedger:
                 qty, basis = positions.get(key, (ZERO, ZERO))
                 amount = f.quantity * f.price * f.fx_rate
                 if intent.side == "buy":
-                    qty, basis = qty + f.quantity, basis + amount + f.fee
+                    qty, basis = qty + f.quantity, basis + (amount + f.fee)
                 else:
-                    removed = basis * f.quantity / qty
+                    removed = basis if f.quantity == qty else basis * f.quantity / qty
                     qty, basis = qty - f.quantity, basis - removed
                     realized += amount - f.fee - removed
                 positions[key] = qty, basis

@@ -432,3 +432,35 @@ PaperExecution(l,'backtest:test').open_bar(ExecutionBar.model_validate_json(sys.
     assert len(engine.open_bar(event, {A.instrument_id: metadata()})) == 1
     assert ledger.quantity("backtest:test", A.instrument_id) == 10
     assert ledger.reconcile("backtest:test")["reconciled"]
+
+
+def test_full_liquidation_consumes_exact_basis_before_reentry(tmp_path):
+    # A finite Decimal multiply/divide round trip need not equal its input.
+    # Closing 3.001 units previously left a hidden -1E-26 basis residue.
+    path = tmp_path / "precision.sqlite3"
+    ledger = account(path)
+    basis = D("37.84564546343524345566432112")
+    quantity = D("3.001")
+    buy_fee = basis - quantity * D(12)
+    expected_realized = D(0)
+    for cycle in range(2):
+        for side, price, fee in (("buy", "12", buy_fee), ("sell", "13", D(".001"))):
+            step = cycle * 2 + (side == "sell")
+            order = intent(
+                name=f"precision-{step}",
+                side=side,
+                qty=str(quantity),
+                price=price,
+                fee=str(fee),
+                at=T + timedelta(seconds=2 * step),
+            )
+            ledger.submit(order)
+            ledger.apply_fill(fill(order, name=f"precision-{step}", price=price, fee=str(fee)))
+            if side == "sell":
+                expected_realized += (quantity * D(price) - fee) - basis
+                assert ledger.quantity(order.account_id, A.instrument_id) == 0
+            assert ledger.reconcile(order.account_id)["realized_pnl"] == str(expected_realized)
+            ledger.close()
+            ledger = PortfolioLedger(path)
+    assert D(ledger._account(order.account_id)["realized"]) == expected_realized
+    ledger.close()
