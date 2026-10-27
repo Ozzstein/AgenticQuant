@@ -59,7 +59,13 @@ class PaperExecution:
                 raise LedgerError("risk rejected: " + "; ".join(result.details.values()))
             return self.ledger.submit(intent)
 
-    def open_bar(self, bar: ExecutionBar, metadata: dict[str, InstrumentRisk]) -> list[Fill]:
+    def open_bar(
+        self,
+        bar: ExecutionBar,
+        metadata: dict[str, InstrumentRisk],
+        *,
+        eligible_intent_ids: set[str] | None = None,
+    ) -> list[Fill]:
         """At the open, fill market/marketable-limit/triggered-stop orders only.
 
         Intrabar high/low are deliberately not used to invent execution order.
@@ -90,6 +96,8 @@ class PaperExecution:
             fills = []
             for state in self.ledger.pending(self.account_id):
                 order = state["intent"]
+                if eligible_intent_ids is not None and order.intent_id not in eligible_intent_ids:
+                    continue
                 if order.instrument.instrument_id != bar.instrument.instrument_id:
                     continue
                 if order.expires_at and bar.opened_at > order.expires_at:

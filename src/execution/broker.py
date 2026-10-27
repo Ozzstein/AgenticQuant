@@ -185,3 +185,35 @@ def create_broker(config: AppConfig | None = None) -> BaseBroker:
         account_id=getattr(config, "paper_account_id", "paper:default"),
         base_currency=getattr(config, "paper_base_currency", "USD"),
     )
+
+
+def create_typed_paper_execution(
+    *, ledger_path, account, rules, fill_policy=None, risk_policy=None
+):
+    """Bind the operational paper owner to explicit account and venue metadata.
+
+    The caller supplies the persisted AccountSpec, typed VenueRules by instrument,
+    and observed market events. Reopening requires identical account/policy state.
+    Ownership of the returned service's ledger passes to the caller.
+    """
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import PaperVenue, VenueExecution
+
+    ledger = PortfolioLedger(ledger_path)
+    try:
+        ledger.create_account(account)
+        adapter = PaperVenue(
+            ledger, account.account_id, rules, fill_policy=fill_policy, risk_policy=risk_policy
+        )
+        return VenueExecution(
+            ledger,
+            account.account_id,
+            {adapter.venue: adapter},
+            {key: adapter.venue for key in rules},
+            owner="direct",
+            fill_policy=fill_policy,
+            risk_policy=risk_policy,
+        )
+    except Exception:
+        ledger.close()
+        raise
