@@ -145,7 +145,7 @@ def test_attribution_returns_cutoffs_and_allocation_modes(tmp_path):
     for name, scale in [('momentum_topk',1), ('crypto_trend',.5)]:
         nav = Decimal(100)
         for i in range(30):
-            end = context.as_of-pd.Timedelta(days=30-i)
+            end = pd.Timestamp(context.as_of).normalize()-pd.Timedelta(days=30-i)
             closed = nav * Decimal(str(1+scale*(.003 if i%3 else -.001)))
             store.record_nav(name, started_at=end-pd.Timedelta(days=1), ended_at=end, available_at=end,
                              opening_nav=nav, closing_nav=closed, end_flow=Decimal(0), source_event_id=f'{name}:{i}', source_event_hash='a'*64)
@@ -234,19 +234,15 @@ def test_registry_exact_hash_and_executable_parameter_change():
                           resolver=lambda *a, **k:SimpleNamespace(payload_hash='0'*64,activated_at=snapshot.context.as_of), **args)
 
 
-def test_sampling_gaps_never_generate_annualized_sharpe(tmp_path):
+def test_sampling_gaps_rejected_before_annualized_sharpe(tmp_path):
     store = AttributedPerformanceStore(tmp_path/'gap.sqlite')
-    base = pd.Timestamp('2020-01-01',tz='UTC').to_pydatetime()
-    nav = Decimal(100)
-    for i in range(22):
-        end = base+pd.Timedelta(days=2*i+1)
-        close = nav*Decimal('1.01' if i%2 else '.999')
-        store.record_nav('gap',started_at=end-pd.Timedelta(days=1),ended_at=end,available_at=end,
-                         opening_nav=nav,closing_nav=close,end_flow=Decimal(0),source_event_id=f'gap:{i}',source_event_hash='a'*64)
-        nav = close
-    metrics = store.metrics(as_of=end,annualization=365)
-    assert not metrics.loc['gap','complete']
-    assert np.isnan(metrics.loc['gap','sharpe'])
+    start = pd.Timestamp('2020-01-01',tz='UTC')
+    store.record_nav('gap',started_at=start,ended_at=start+pd.Timedelta(days=1),available_at=start+pd.Timedelta(days=1),
+        opening_nav=Decimal(100),closing_nav=Decimal(101),end_flow=Decimal(0),source_event_id='first',source_event_hash='a'*64)
+    with pytest.raises(ValueError,match='without gaps'):
+        store.record_nav('gap',started_at=start+pd.Timedelta(days=2),ended_at=start+pd.Timedelta(days=3),
+            available_at=start+pd.Timedelta(days=3),opening_nav=Decimal(101),closing_nav=Decimal(102),
+            end_flow=Decimal(0),source_event_id='missing-day',source_event_hash='b'*64)
 
 
 def test_blend_preserves_passive_holdings_and_rejects_mixed_provenance():

@@ -279,7 +279,9 @@ class AttributedPerformanceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS attributed_nav (strategy TEXT, ended_at TEXT, available_at TEXT, source_event_id TEXT UNIQUE, payload TEXT, PRIMARY KEY(strategy,ended_at))")
+            db.execute("CREATE TABLE IF NOT EXISTS funded_epochs (strategy TEXT, at TEXT, available_at TEXT, source_event_id TEXT UNIQUE, payload TEXT, PRIMARY KEY(strategy,at))")
             for operation in ("UPDATE", "DELETE"):
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS epoch_no_{operation.lower()} BEFORE {operation} ON funded_epochs BEGIN SELECT RAISE(ABORT, 'immutable funded epoch'); END")
                 db.execute(f"CREATE TRIGGER IF NOT EXISTS nav_no_{operation.lower()} BEFORE {operation} ON attributed_nav BEGIN SELECT RAISE(ABORT, 'immutable attributed observation'); END")
 
     @contextmanager
@@ -291,6 +293,46 @@ class AttributedPerformanceStore:
                 yield connection
         finally:
             connection.close()
+
+    def start_funded_epoch(self, strategy: str, *, at, available_at, opening_nav,
+                           source_event_id: str, source_event_hash: str):
+        """Record a source-bound positive funding anchor, never a return or flow estimate.
+
+        Initial anchoring requires no prior history. Reactivation requires the
+        latest recorded NAV to be exactly zero and a new authoritative snapshot.
+        The caller verifies the accounting snapshot/transfer source.
+        """
+        from decimal import Decimal
+
+        from src.data.evidence.store import canonical_bytes
+        from src.domain.common import _utc
+        at, available_at = _utc(at), _utc(available_at)
+        if not strategy or not source_event_id or available_at < at:
+            raise ValueError("funding anchor requires identity and actual availability")
+        if not isinstance(opening_nav, Decimal) or not opening_nav.is_finite() or opening_nav <= 0:
+            raise ValueError("positive Decimal funded snapshot required")
+        if len(source_event_hash) != 64 or any(c not in "0123456789abcdef" for c in source_event_hash):
+            raise ValueError("immutable funding source hash required")
+        payload = canonical_bytes(dict(strategy=strategy,at=at.isoformat(),available_at=available_at.isoformat(),
+            opening_nav=str(opening_nav),source_event_id=source_event_id,source_event_hash=source_event_hash)).decode()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT payload FROM funded_epochs WHERE source_event_id=?",(source_event_id,)).fetchone()
+            if existing:
+                if existing[0] != payload:
+                    raise ValueError("funding source cannot be rewritten")
+                return
+            previous_epoch = db.execute("SELECT payload FROM funded_epochs WHERE strategy=? ORDER BY at DESC LIMIT 1",(strategy,)).fetchone()
+            previous = db.execute("SELECT payload FROM attributed_nav WHERE strategy=? ORDER BY ended_at DESC LIMIT 1",(strategy,)).fetchone()
+            if previous:
+                value = json.loads(previous[0])
+                if Decimal(value["closing_nav"]) != 0 or at.isoformat() < value["ended_at"]:
+                    raise ValueError("reactivation requires an actual prior zero NAV and forward funding clock")
+                if previous_epoch and json.loads(previous_epoch[0])["at"] >= value["ended_at"]:
+                    raise ValueError("funded epoch has no subsequent authoritative zero NAV")
+            elif previous_epoch:
+                raise ValueError("existing positive anchor cannot be reset without zero NAV history")
+            db.execute("INSERT INTO funded_epochs VALUES (?,?,?,?,?)",(strategy,at.isoformat(),available_at.isoformat(),source_event_id,payload))
 
     def record_nav(self, strategy: str, *, started_at, ended_at, available_at, opening_nav,
                    closing_nav, end_flow, source_event_id: str, source_event_hash: str):
@@ -321,47 +363,132 @@ class AttributedPerformanceStore:
                     raise ValueError("source event cannot be rewritten")
                 return
             prior = db.execute("SELECT payload FROM attributed_nav WHERE strategy=? ORDER BY ended_at DESC LIMIT 1", (strategy,)).fetchone()
-            if prior:
-                previous = json.loads(prior[0])
-                if started_at.isoformat() < previous["ended_at"] or opening_nav != Decimal(previous["closing_nav"]):
-                    raise ValueError("attributed NAV must continue reconciled history without overlap")
+            epoch = db.execute("SELECT payload FROM funded_epochs WHERE strategy=? ORDER BY at DESC LIMIT 1",(strategy,)).fetchone()
+            epoch = json.loads(epoch[0]) if epoch else None
+            previous = json.loads(prior[0]) if prior else None
+            if epoch and (previous is None or previous["ended_at"] <= epoch["at"]):
+                if started_at.isoformat() != epoch["at"] or opening_nav != Decimal(epoch["opening_nav"]):
+                    raise ValueError("first return must begin at the exact funded snapshot")
+                if available_at.isoformat() < epoch["available_at"]:
+                    raise ValueError("return cannot precede funding anchor availability")
+            elif previous:
+                if started_at.isoformat() != previous["ended_at"] or opening_nav != Decimal(previous["closing_nav"]):
+                    raise ValueError("attributed NAV must continue reconciled history without gaps or overlap")
             db.execute("INSERT INTO attributed_nav VALUES (?,?,?,?,?)", (strategy, ended_at.isoformat(), available_at.isoformat(), source_event_id, payload))
 
-    def metrics(self, *, as_of, annualization: int, window: int = 60):
+    def daily_returns(self, *, as_of, annualization: int):
+        """Compound actual contiguous subperiods between exact completed closes.
+
+        XNYS uses prior/current exchange closes (including overnight/weekends).
+        Continuous markets use UTC midnights. A crossing interval is never split,
+        a missing close is never inferred, and late evidence keeps its true clock.
+        The returned frame retains exact constituent payloads and source hashes.
+        """
+        from decimal import Decimal
+
         import pandas as pd
 
+        from src.data.evidence.store import canonical_bytes, digest
         from src.domain.common import _utc
         cutoff = _utc(as_of)
-        if annualization not in (252, 365) or window < 2:
-            raise ValueError("explicit equity or continuous calendar and valid window required")
+        if annualization not in (252, 365):
+            raise ValueError("explicit equity or continuous calendar required")
         with self._db() as db:
-            rows = db.execute("SELECT payload FROM attributed_nav WHERE ended_at<=? AND available_at<=? ORDER BY ended_at", (cutoff.isoformat(), cutoff.isoformat())).fetchall()
-        groups = {}
+            rows = db.execute("SELECT payload FROM attributed_nav WHERE ended_at<=? AND available_at<=? ORDER BY ended_at", (cutoff.isoformat(),cutoff.isoformat())).fetchall()
+            anchors = db.execute("SELECT payload FROM funded_epochs WHERE at<=? AND available_at<=? ORDER BY at",(cutoff.isoformat(),cutoff.isoformat())).fetchall()
+        groups, epochs = {}, {}
+        for row in anchors:
+            value = json.loads(row[0])
+            epochs.setdefault(value["strategy"], []).append(value)
+            groups.setdefault(value["strategy"], [])
         for row in rows:
             value = json.loads(row[0])
             groups.setdefault(value["strategy"], []).append(value)
-        metrics = []
+        output, coverage, chains = [], {}, []
         for name, history in groups.items():
-            trailing = history[-window:]
-            dates = [pd.Timestamp(item["ended_at"]).date().isoformat() for item in history]
+            starts = epochs.get(name, [])
+            implicit = [item for item in history if not starts or item["started_at"] < starts[0]["at"]]
+            if implicit:
+                chains.append((name,implicit,None))
+            for i, anchor in enumerate(starts):
+                chain = [item for item in history if anchor["at"] <= item["started_at"]
+                         and (i+1 == len(starts) or item["started_at"] < starts[i+1]["at"])]
+                if i+1 < len(starts) and any(item["ended_at"] > starts[i+1]["at"] for item in chain):
+                    raise ValueError("attributed period crosses a funding epoch")
+                chains.append((name,chain,anchor))
+        for name, history, anchor in chains:
+            epoch_id = anchor["source_event_id"] if anchor else "initial-unanchored"
+            if anchor and history and (history[0]["started_at"] != anchor["at"] or Decimal(history[0]["opening_nav"]) != Decimal(anchor["opening_nav"])):
+                raise ValueError("return chain differs from its exact funding anchor")
+            for previous, current in zip(history, history[1:]):
+                if current["started_at"] != previous["ended_at"] or Decimal(current["opening_nav"]) != Decimal(previous["closing_nav"]):
+                    raise ValueError("attributed return chain has a gap or unreconciled NAV")
+            first = pd.Timestamp(anchor["at"] if anchor else history[0]["started_at"])
+            last = pd.Timestamp(history[-1]["ended_at"]) if history else first
             if annualization == 365:
-                expected = pd.date_range(dates[0], dates[-1], freq="D").strftime("%Y-%m-%d").tolist()
+                boundaries = list(pd.date_range(first.normalize(),last.normalize(),freq="D"))
             else:
                 from src.data.calendars import sessions
-                expected = list(sessions(dates[0], dates[-1], calendar="XNYS"))
-            complete = dates == expected
-            # Gaps are visible and never converted to zero daily returns or
-            # annualized as if sparse observations were consecutive sessions.
-            returns = np.array([float(item["period_return"]) for item in trailing])
-            std = returns.std(ddof=1) if len(returns) > 1 else np.nan
-            sharpe = float(returns.mean()/std*np.sqrt(annualization)) if complete and std > 0 and len(returns) >= 20 else np.nan
-            nav = np.r_[1., np.cumprod(1+np.array([float(item["period_return"]) for item in history]))]
+                calendar = sessions((first-pd.Timedelta(days=14)).date().isoformat(),last.date().isoformat(),calendar="XNYS")
+                boundaries = [pd.Timestamp(close) for _,close in calendar.values() if close <= last]
+            pairs = [(a,b) for a,b in zip(boundaries,boundaries[1:]) if first <= a and b <= cutoff]
+            by_start = {pd.Timestamp(item["started_at"]):item for item in history}
+            complete, used = 0, set()
+            for begin,end in pairs:
+                cursor, parts = begin, []
+                while cursor < end:
+                    item = by_start.get(cursor)
+                    if item is None or pd.Timestamp(item["ended_at"]) > end or pd.Timestamp(item["available_at"]) > cutoff:
+                        break
+                    parts.append(item)
+                    cursor = pd.Timestamp(item["ended_at"])
+                if cursor != end:
+                    continue
+                factor = Decimal(1)
+                for item in parts:
+                    value = (Decimal(item["closing_nav"])-Decimal(item["end_flow"]))/Decimal(item["opening_nav"])
+                    if value-1 != Decimal(item["period_return"]):
+                        raise ValueError("stored return differs from actual NAV and end flow")
+                    factor *= value
+                    used.add(item["source_event_id"])
+                record = dict(strategy=name,epoch_id=epoch_id,started_at=begin,ended_at=end,
+                    available_at=pd.Timestamp(max(item["available_at"] for item in parts)),
+                    period_return=factor-1,source_event_ids=tuple(item["source_event_id"] for item in parts),
+                    source_event_hashes=tuple(item["source_event_hash"] for item in parts),subperiods=tuple(parts))
+                record["aggregation_hash"] = digest(canonical_bytes({"implementation":"exact-close-compounded-1",
+                    "annualization":annualization,"funding_anchor":anchor,"started_at":begin.isoformat(),"ended_at":end.isoformat(),"subperiods":parts}))
+                output.append(record)
+                complete += 1
+            coverage[name] = dict(epoch_id=epoch_id,funding_anchor=anchor,complete=bool(pairs) and complete == len(pairs),expected_periods=len(pairs),
+                completed_periods=complete,available_at=max([item["available_at"] for item in history]+([anchor["available_at"]] if anchor else [])),
+                unaggregated_source_ids=tuple(item["source_event_id"] for item in history if item["source_event_id"] not in used))
+        columns = ["strategy","epoch_id","started_at","ended_at","available_at","period_return","source_event_ids",
+                   "source_event_hashes","subperiods","aggregation_hash"]
+        result = pd.DataFrame(output,columns=columns)
+        result.attrs["coverage"] = coverage
+        return result
+
+    def metrics(self, *, as_of, annualization: int, window: int = 60):
+        import pandas as pd
+        if window < 2:
+            raise ValueError("valid daily window required")
+        daily = self.daily_returns(as_of=as_of,annualization=annualization)
+        metrics = []
+        for name,coverage in daily.attrs["coverage"].items():
+            history = daily.loc[(daily.strategy == name) & (daily.epoch_id == coverage["epoch_id"])]
+            trailing = history.iloc[-window:]
+            returns = np.asarray(trailing.period_return,dtype=float)
+            complete = coverage["complete"]
+            std = returns.std(ddof=1) if len(returns)>1 else np.nan
+            sharpe = float(returns.mean()/std*np.sqrt(annualization)) if complete and std>0 and len(returns)>=20 else np.nan
+            nav = np.r_[1.,np.cumprod(1+np.asarray(history.period_return,dtype=float))]
             drawdown = nav/np.maximum.accumulate(nav)-1
-            metrics.append(dict(strategy=name, sharpe=sharpe, observations=len(returns), annualization=annualization,
-                                complete=complete,
-                                available_at=pd.Timestamp(max(item["available_at"] for item in history)),
-                                source_event_ids=tuple(item["source_event_id"] for item in trailing),
-                                max_drawdown=float(drawdown.min()), current_drawdown=float(drawdown[-1]),
-                                total_return=float(nav[-1]-1)))
-        columns = ["strategy", "sharpe", "observations", "annualization", "complete", "available_at", "source_event_ids", "max_drawdown", "current_drawdown", "total_return"]
-        return pd.DataFrame(metrics, columns=columns).set_index("strategy")
+            metrics.append(dict(strategy=name,epoch_id=coverage["epoch_id"],funding_anchor=coverage["funding_anchor"],sharpe=sharpe,observations=len(returns),annualization=annualization,
+                complete=complete,available_at=trailing.available_at.max() if len(trailing) else pd.Timestamp(coverage["available_at"]),
+                source_event_ids=tuple(key for values in trailing.source_event_ids for key in values),
+                source_event_hashes=tuple(key for values in trailing.source_event_hashes for key in values),
+                aggregation_hashes=tuple(trailing.aggregation_hash),max_drawdown=float(drawdown.min()),
+                current_drawdown=float(drawdown[-1]),total_return=float(nav[-1]-1)))
+        columns = ["strategy","epoch_id","funding_anchor","sharpe","observations","annualization","complete","available_at","source_event_ids",
+                   "source_event_hashes","aggregation_hashes","max_drawdown","current_drawdown","total_return"]
+        return pd.DataFrame(metrics,columns=columns).set_index("strategy")
