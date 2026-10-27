@@ -409,6 +409,30 @@ class VenueExecution:
                     > balances.available_cash_base - reserved
                 ):
                     raise LedgerError("insufficient available funding at the routed venue")
+            else:
+                reserved_quantity = sum(
+                    (
+                        self.ledger.order(self.account_id, row[0])["intent"].quantity
+                        - self.ledger.order(self.account_id, row[0])["filled"]
+                        for row in self.ledger.db.execute(
+                            "SELECT intent FROM venue_outbox WHERE account=? AND venue=?",
+                            (self.account_id, venue),
+                        )
+                        if self.ledger.order(self.account_id, row[0])["status"]
+                        in ("pending", "partial")
+                        and self.ledger.order(self.account_id, row[0])["intent"].side == "sell"
+                        and self.ledger.order(self.account_id, row[0])["intent"].instrument
+                        == intent.instrument
+                    ),
+                    D(0),
+                )
+                if (
+                    intent.quantity
+                    > balances.quantities.get(intent.instrument.instrument_id, D(0))
+                    - reserved_quantity
+                ):
+                    raise LedgerError("insufficient unreserved holding at the routed venue")
+            self.reconcile_balances(as_of=as_of)
             PaperExecution(self.ledger, self.account_id, self.fill_policy, self.risk_policy).submit(
                 intent, metadata
             )
@@ -453,6 +477,7 @@ class VenueExecution:
                 self._status(intent_id, "expired")
                 return self.state(intent_id)
             VenueRules.model_validate_json(state["rules"]).require_order(intent, as_of)
+            self.reconcile_balances(as_of=as_of)
             self._status(intent_id, "submitting")
         # The durable submitting claim precedes I/O. No network call is retried here.
         try:

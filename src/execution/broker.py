@@ -217,3 +217,62 @@ def create_typed_paper_execution(
     except Exception:
         ledger.close()
         raise
+
+
+def create_typed_alpaca_execution(
+    *,
+    ledger_path,
+    account,
+    broker_account_id,
+    api_key,
+    api_secret,
+    rules,
+    fill_policy=None,
+    risk_policy=None,
+    allow_live=False,
+    max_balance_age_seconds=30,
+    client=None,
+    clock=None,
+):
+    """Bind the actual Alpaca REST adapter to the canonical durable book.
+
+    Construction makes no network requests. Call adapter.capture() before the
+    decision cutoff, reconcile receipts and posted fees, then verify balances.
+    The caller owns adapter.close() and execution.ledger.close(). No legacy
+    float/average-price order facade participates in this path.
+    """
+    from src.execution.alpaca_venue import AlpacaVenue
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import VenueExecution
+
+    ledger = PortfolioLedger(ledger_path)
+    adapter = None
+    try:
+        ledger.create_account(account)
+        adapter = AlpacaVenue(
+            ledger,
+            account.account_id,
+            broker_account_id=broker_account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            rules=rules,
+            allow_live=allow_live,
+            client=client,
+            clock=clock,
+        )
+        return VenueExecution(
+            ledger,
+            account.account_id,
+            {adapter.venue: adapter},
+            {key: adapter.venue for key in rules},
+            owner="direct",
+            fill_policy=fill_policy,
+            risk_policy=risk_policy,
+            allow_live=allow_live,
+            max_balance_age_seconds=max_balance_age_seconds,
+        )
+    except Exception:
+        if adapter is not None:
+            adapter.close()
+        ledger.close()
+        raise
