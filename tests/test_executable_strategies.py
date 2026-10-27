@@ -288,3 +288,44 @@ def test_blend_common_market_preserves_distinct_actual_feature_datasets():
     outputs['plain'].attrs['market_snapshot_hash'] = 'f'*64
     with pytest.raises(StrategyInputError,match='approved in RunContext'):
         blend_sleeves(outputs,{'contextual':.5,'plain':.5},context,current_weights=pd.Series(dtype=float))
+
+
+def test_mixed_universe_sparse_contributions_route_and_preserve_actual_holdings():
+    from src.domain.portfolio import Holding, PortfolioSnapshot, SleeveSnapshot
+    from src.execution.routing import target_from_blended_frame
+
+    equity = archived_snapshot(periods=1).bars[0].instrument
+    crypto = archived_snapshot(crypto=True, periods=1).bars[0].instrument
+    context = archived_snapshot(periods=1).context.model_copy(update={
+        'account_id':'paper:mixed', 'data_snapshot_ids':('a'*64, 'b'*64, 'c'*64)})
+    held = Holding(instrument=equity, quantity='1.23456789', cost_basis=10,
+                   market_value=20, price=Decimal(20)/Decimal('1.23456789'), fx_rate=1,
+                   marked_at=context.as_of)
+    common = dict(account_id=context.account_id, as_of=context.as_of, reserved_cash=0,
+                  realized_pnl=0, fees=0, turnover_today=0)
+    eq_portfolio = PortfolioSnapshot(**common, cash=30, nav=50, high_water_mark=50, positions=(held,))
+    cr_portfolio = PortfolioSnapshot(**common, cash=50, nav=50, high_water_mark=50)
+    actual = PortfolioSnapshot(**common, cash=80, nav=100, high_water_mark=100, positions=(held,),
+        sleeves={name:SleeveSnapshot(portfolio=portfolio,net_capital_flow=50,last_rebalanced_at=None,
+                                   source_hash='d'*64,source_event_ids=(name,))
+                 for name,portfolio in [('equity',eq_portfolio),('crypto',cr_portfolio)]})
+    outputs = {}
+    for name,instrument,action,weight,source in [('equity',equity,'HOLD',.4,'b'*64),
+                                                ('crypto',crypto,'BUY',.6,'c'*64)]:
+        frame = pd.DataFrame(dict(target_weight=[weight], action=[action], reason=['test'], score=[1.]),
+                             index=[instrument.instrument_id])
+        frame.attrs.update(strategy=name, context=context.model_dump(mode='json'),
+                           data_snapshot_hash=source, market_snapshot_hash='a'*64, universe_version='current-test',
+                           signal_at=context.as_of.isoformat(), strategy_hash='e'*64, feature_spec_hash='f'*64,
+                           model_hash=None, model_training_data_hash=None)
+        outputs[name] = frame
+    result = blend_sleeves(outputs, {'equity':.5,'crypto':.5}, context,
+        current_weights=pd.Series({equity.instrument_id:.2}),
+        current_contributions={'equity':pd.Series({equity.instrument_id:.2}),'crypto':pd.Series(dtype=float)})
+    assert result.attrs['contributions'] == {'equity':{equity.instrument_id:.2},'crypto':{crypto.instrument_id:.3}}
+    target = target_from_blended_frame(result, context, (equity,crypto), target_id='mixed',
+                                      current_snapshot=actual, outputs=outputs)
+    assert target.sleeve_preserve_quantities['equity'][equity.instrument_id] == held.quantity
+    assert target.sleeve_contributions == {'equity':{equity.instrument_id:Decimal('.2')},
+                                         'crypto':{crypto.instrument_id:Decimal('.3')}}
+    assert result.target_weight.sum() == pytest.approx(.5)

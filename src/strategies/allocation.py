@@ -161,5 +161,7 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
                         strategy_hashes={name: frame.attrs["strategy_hash"] for name, frame in outputs.items()},
                         model_artifact_hashes={name: frame.attrs["model_hash"] for name, frame in outputs.items()},
                         sleeve_provenance={name: dict(frame.attrs) for name, frame in outputs.items()},
-                        contributions=contribution.to_dict(), vetoed=tuple(sorted(vetoed)))
+                        contributions={name: contribution.loc[frame.index, name].to_dict()
+                                       for name, frame in outputs.items()},
+                        vetoed=tuple(sorted(vetoed)))
     return result
