@@ -101,7 +101,10 @@ class Evaluation(VersionedContract):
     status: Literal["complete", "failed"]
     validation_reliable: bool
     actual_model_hashes: tuple[Sha256, ...]
+    actual_decision_hashes: tuple[Sha256, ...] = ()
     regime_evaluation_hash: Sha256 | None = None
+    execution_verification_hash: Sha256 | None = None
+    paired_evaluation_hash: Sha256 | None = None
     observations: int = Field(ge=0)
     sharpe: float | None = None
     ic: float | None = None
@@ -346,8 +349,9 @@ class ResearchRegistry:
                     or evaluation.registry_snapshot_hash != snapshot_hash or evaluation.completed_at < trial.registered_at):
                 raise RegistryError("evaluation lineage/time mismatch")
             for key in (evaluation.replay_hash, evaluation.manifest_hash, evaluation.validation_hash,
-                        *evaluation.actual_model_hashes,
-                        *((evaluation.regime_evaluation_hash,) if evaluation.regime_evaluation_hash else ())):
+                        *evaluation.actual_model_hashes, *evaluation.actual_decision_hashes,
+                        *(key for key in (evaluation.regime_evaluation_hash, evaluation.execution_verification_hash,
+                                          evaluation.paired_evaluation_hash) if key)):
                 if not db.execute("SELECT 1 FROM blobs WHERE hash=?", (key,)).fetchone():
                     raise RegistryError("evaluation evidence/model artifact is missing")
             db.execute("INSERT INTO outcomes VALUES (?,?,?)", (evaluation.trial_id, evaluation.content_hash(),
@@ -372,8 +376,9 @@ class ResearchRegistry:
             raise RegistryError('development outcome identity or chronology differs')
         for key in (candidate.payload_hash,candidate.code_hash,candidate.environment_hash,
                     value.inputs_hash,value.registry_snapshot_hash,value.replay_hash,
-                    value.manifest_hash,value.validation_hash,*value.actual_model_hashes,
-                    *((value.regime_evaluation_hash,) if value.regime_evaluation_hash else ())):
+                    value.manifest_hash,value.validation_hash,*value.actual_model_hashes,*value.actual_decision_hashes,
+                    *(key for key in (value.regime_evaluation_hash,value.execution_verification_hash,
+                                      value.paired_evaluation_hash) if key)):
             self.blob(key)
         return value
 
@@ -389,8 +394,16 @@ class ResearchRegistry:
             raise RegistryError("activation requires the preregistered holdout policy")
         if candidate.synthetic or evaluation.synthetic or evaluation.status != "complete" or not evaluation.validation_reliable:
             raise RegistryError("synthetic, incomplete or unreliable research cannot activate")
-        if not evaluation.actual_model_hashes or evaluation.observations < policy.min_observations:
-            raise RegistryError("actual model artifacts and sufficient observations required")
+        if not (evaluation.actual_model_hashes or (candidate.kind == 'strategy' and evaluation.actual_decision_hashes)) or evaluation.observations < policy.min_observations:
+            raise RegistryError("actual model or verified strategy decision artifacts and sufficient observations required")
+        if candidate.kind in ('strategy','regime') and evaluation.execution_verification_hash is None:
+            raise RegistryError('strategy/regime activation requires independent recipe reproduction')
+        if candidate.kind == 'regime':
+            if evaluation.paired_evaluation_hash is None:
+                raise RegistryError('regime activation requires same-trial paired baseline evidence')
+            from src.research.execution_proof import verified_paired_returns
+            if sum(verified_paired_returns(self,evaluation.paired_evaluation_hash)) <= 0:
+                raise RegistryError('regime candidate does not improve its preregistered baseline')
         if evaluation.sharpe is None or evaluation.sharpe <= policy.min_sharpe:
             raise RegistryError("research Sharpe gate failed")
         if candidate.kind in ("factor", "semantic_question") and (
@@ -483,7 +496,9 @@ class ResearchRegistry:
         for key in (candidate.code_hash, candidate.environment_hash, candidate.payload_hash,
                     activation.policy_hash, evaluation.inputs_hash, evaluation.replay_hash,
                     evaluation.manifest_hash, evaluation.validation_hash, *evaluation.actual_model_hashes,
-                    *((evaluation.regime_evaluation_hash,) if evaluation.regime_evaluation_hash else ())):
+                    *evaluation.actual_decision_hashes,
+                    *(key for key in (evaluation.regime_evaluation_hash,evaluation.execution_verification_hash,
+                                      evaluation.paired_evaluation_hash) if key)):
             self.blob(key)
         return activation
 

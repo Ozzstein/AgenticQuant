@@ -274,37 +274,31 @@ class TestWeightsIntrospection:
 
 
 class TestBacktesterIntegration:
-    def test_ensemble_with_walk_forward_backtester(self):
-        """EnsembleModel works as drop-in for WalkForwardBacktester.run()."""
-        X, y = _make_data(n=300, p=5)
-        # Add a date index for the backtester
-        dates = pd.date_range("2022-01-01", periods=300, freq="B")
-        X.index = dates
-        y.index = dates
-
-        ensemble = EnsembleModel(
-            model_names=["Linear"],  # single model for speed
-            weighting="equal",
-        )
-
+    def test_prefitted_or_shared_model_cannot_replace_fresh_fold_factory(self):
         from src.core.backtester import WalkForwardBacktester
-        bt = WalkForwardBacktester()
-        result = bt.run(X, y, model=ensemble, topk=5)
+        from src.utils.exceptions import BacktestError
+        X,y = _make_data(n=300,p=5)
+        with pytest.raises(BacktestError,match="fresh unfitted model"):
+            WalkForwardBacktester().run(X,y,model=EnsembleModel(model_names=["Linear"],weighting="equal"))
 
-        assert result.metrics.sharpe_ratio is not None
-
-    def test_ensemble_with_walk_forward_runner(self):
-        """WalkForwardRunner works with model_factory for ensemble."""
-        X, y = _make_data(n=300, p=5)
-        dates = pd.date_range("2022-01-01", periods=300, freq="B")
-        X.index = dates
-        y.index = dates
-
+    def test_actual_ensemble_folds_execute_canonical_ledger(self,tmp_path):
         from src.core.walk_forward import WalkForwardRunner
-
-        def ensemble_factory():
-            return EnsembleModel(model_names=["Linear"], weighting="equal")
-
-        runner = WalkForwardRunner()
-        result = runner.run(X, y, model_factory=ensemble_factory, topk=5)
-        assert result.model_name.startswith("Ensemble")
+        from src.domain.market import FeatureSpec
+        from tests.test_research_inputs import research_inputs
+        inputs = research_inputs()
+        data = inputs.materialize((FeatureSpec(name="momentum",expression="$close/Ref($close,3)-1"),))
+        created=[]
+        def factory():
+            model = EnsembleModel(model_names=["Linear","LightGBM","CatBoost","XGBoost"],weighting="ic_weighted",val_fraction=.35)
+            created.append(model)
+            return model
+        result = WalkForwardRunner().run(data.features,data.labels,model_name="Ensemble",model_factory=factory,
+            label_end_times=data.label_available_at,feature_available_at=data.feature_available_at,
+            feature_spec_hash=data.feature_spec_hash,data_snapshot_hash=data.snapshot_hash,
+            initial_train_months=inputs.initial_train_months,walk_months=6,universe_version=inputs.universe_version,
+            ledger_path=tmp_path/"ledger.db",artifact_dir=tmp_path/"models",**inputs.replay_kwargs())
+        assert result.engine == "chronological-ledger-v1" and result.trades
+        assert len(created)==len(result.walk_forward_results) and len({id(m) for m in created})==len(created)
+        assert all(set(model.get_weights())=={"Linear","LightGBM","CatBoost","XGBoost"} for model in created)
+        assert all(pd.Timestamp(t["executed_at"])>pd.Timestamp(t["decision_at"]) for t in result.trades)
+        assert len(result.daily_returns)==len(result.equity_curve)-1

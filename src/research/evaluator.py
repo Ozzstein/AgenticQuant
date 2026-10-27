@@ -65,6 +65,19 @@ class ExperimentPlan(VersionedContract):
         return ModelWrapper(self.model_name,config)
 
 
+def load_experiment_plan(registry: ResearchRegistry, trial_id: str):
+    """Only owned executable plan types may cross the registry boundary."""
+    trial = registry.trial(trial_id)
+    kind = registry.candidate(trial.candidate_id).kind
+    if kind == 'strategy':
+        from src.research.strategy_experiments import StrategyExperimentPlan
+        return StrategyExperimentPlan.model_validate_json(registry.blob(trial.inputs_hash))
+    if kind == 'regime':
+        from src.research.regime_experiments import RegimeExperimentPlan
+        return RegimeExperimentPlan.model_validate_json(registry.blob(trial.inputs_hash))
+    return ExperimentPlan.model_validate_json(registry.blob(trial.inputs_hash))
+
+
 def block_bootstrap_p_value(returns: list[float], *, samples: int = 10000, seed: int = 42) -> float | None:
     """One-sided centered moving-block bootstrap test for positive mean returns."""
     values = np.asarray(returns, dtype=float)
@@ -92,11 +105,17 @@ class ExperimentEvaluator:
 
     def evaluate(self, trial_id: str, result: ReplayResult, *, ledger_path: str | Path,
                  artifact_dir: str | Path, completed_at: datetime, cost_results=None, cost_artifacts=None,
-                 benchmark=None) -> Evaluation:
+                 benchmark=None, paired_baseline=None) -> Evaluation:
         trial = self.registry.trial(trial_id)
-        plan = ExperimentPlan.model_validate_json(self.registry.blob(trial.inputs_hash))
+        plan = load_experiment_plan(self.registry,trial_id)
         inputs = plan.inputs
         candidate = self.registry.candidate(trial.candidate_id)
+        if candidate.kind in ('strategy','regime'):
+            from src.research.strategy_experiments import materialize_strategy_plan
+            def materialize(specs):
+                return materialize_strategy_plan(plan,self.evidence_store,specs=specs)
+        else:
+            materialize = inputs.materialize
         checks = []
 
         def verify(name, operation):
@@ -123,7 +142,7 @@ class ExperimentEvaluator:
                         "topk": inputs.topk, "samples_per_year": inputs.samples_per_year,
                         "valuation_calendar": inputs.valuation_calendar}
             require(all(result.manifest.get(k) == v for k, v in expected.items()), "economic inputs differ from trial")
-            data = inputs.materialize(plan.features)
+            data = materialize(plan.features)
             provenance = result.manifest["provenance"]
             require(all(provenance.get(k) == frame_hash(v) for k, v in {
                 "features_hash": data.features, "labels_hash": data.labels,
@@ -168,6 +187,22 @@ class ExperimentEvaluator:
             return tuple(hashes)
         model_hashes = verify("actual_model_contents", actual_models) or ()
 
+        execution_hash, paired_hash, paired_returns = None, None, None
+        if candidate.kind in ('strategy', 'regime'):
+            from src.research.execution_proof import verify_execution
+            proof = verify('registered_recipe_reproduction', lambda: verify_execution(
+                self.registry, self.evidence_store, trial_id, result,
+                artifact_dir=artifact_dir, baseline=paired_baseline))
+            if proof is not None:
+                execution_hash = proof['execution_hash']
+                if proof['paired'] is not None:
+                    verify('paired_complete_runs',lambda: require(
+                        proof['paired']['candidate_status'] == proof['paired']['baseline_status'] == 'complete',
+                        'paired regime runs must both have complete registered OOS windows'))
+                    paired_returns = proof['paired']['excess_returns']
+                    proof['paired']['unadjusted_p_value'] = block_bootstrap_p_value(paired_returns)
+                    paired_hash = self.registry.archive(canonical(proof['paired']))
+
         def trial_count():
             provenance = result.manifest["provenance"].get("trial_registry", {})
             count = self.registry.trial_count_at_admission(trial_id)
@@ -179,7 +214,7 @@ class ExperimentEvaluator:
 
         corr = None
         if data is not None and plan.reference_features:
-            references = inputs.materialize(plan.reference_features)
+            references = materialize(plan.reference_features)
             dates = {pd.Timestamp(t) for t in result.cross_sectional_ic}
             mask = data.features.index.get_level_values(0).isin(dates)
             correlations = []
@@ -200,8 +235,12 @@ class ExperimentEvaluator:
                 recompute_regime_artifact,
             )
             key = result.manifest["provenance"].get("regime_evaluation_artifact")
+            if hasattr(plan,'regime_artifact_hash'):
+                require(key == plan.regime_artifact_hash, 'executed causal regime differs from the registered recipe')
             artifact = CausalRegimeArtifact.model_validate_json(self.registry.blob(key))
             require(artifact.inputs_hash == inputs.content_hash(), "regime artifact input identity differs")
+            if candidate.kind == 'regime':
+                require(artifact.variant == plan.variant, 'evaluated HMM parameters differ from the candidate')
             import tempfile
             with tempfile.TemporaryDirectory(prefix='quantagent-regime-proof-') as work:
                 recompute_regime_artifact(self.registry,self.evidence_store,artifact,inputs,work_dir=Path(work))
@@ -209,7 +248,13 @@ class ExperimentEvaluator:
             for start,end,value in zip(result.timestamps[:-1],result.timestamps[1:],result.daily_returns,strict=True):
                 eligible = [o for o in artifact.observations if o.context.as_of <= pd.Timestamp(start)
                             and o.status == 'available']
-                require(bool(eligible), 'causal regime unavailable at the return interval start')
+                if not eligible:
+                    start_snapshot = result.snapshots[result.timestamps.index(start)]
+                    require(not start_snapshot.positions and value == 0,
+                            'exposed return interval has no eligible starting regime')
+                    periods.append({'started_at':start,'ended_at':end,'return':value,
+                                    'regime':None,'observation_hash':None,'reason':'unexposed_initial_cash'})
+                    continue
                 observation = max(eligible,key=lambda o:o.context.as_of)
                 periods.append({'started_at':start,'ended_at':end,'return':value,
                                 'regime':observation.regime,'observation_hash':observation.content_hash()})
@@ -235,9 +280,11 @@ class ExperimentEvaluator:
             status="complete" if result.status == "complete" else "failed",
             validation_reliable=report.overall == "RELIABLE", actual_model_hashes=model_hashes,
             regime_evaluation_hash=regime_hash,
+            execution_verification_hash=execution_hash, paired_evaluation_hash=paired_hash,
             observations=len(result.daily_returns), sharpe=metrics.sharpe_ratio, ic=mean_ic,
             icir=mean_ic/std_ic if std_ic and std_ic > 0 else None, max_factor_correlation=corr,
-            unadjusted_p_value=block_bootstrap_p_value(result.daily_returns),
+            unadjusted_p_value=block_bootstrap_p_value(paired_returns) if candidate.kind == 'regime' and paired_returns is not None
+                else None if candidate.kind == 'regime' else block_bootstrap_p_value(result.daily_returns),
             synthetic=inputs.synthetic or candidate.synthetic,
             diagnostics=tuple(f"{c.name}: {c.explanation}" for c in all_checks if c.verdict != CheckVerdict.PASS))
         self.registry.record_evaluation(outcome)

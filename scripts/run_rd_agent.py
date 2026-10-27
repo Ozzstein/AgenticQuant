@@ -9,6 +9,7 @@ from typing import Literal
 
 import typer
 
+from scripts.run_research_copilot import app as copilot_app
 from src.data.evidence.store import EvidenceStore
 from src.domain.market import MarketSnapshot
 from src.research.evaluator import ExperimentPlan
@@ -17,6 +18,8 @@ from src.research.registry import Holdout, PromotionPolicy, ResearchRegistry
 from src.research.runner import ResearchRunner
 
 app=typer.Typer(help='Native RD-Agent plus quarantined, preregistered ledger experiments.',add_completion=False)
+
+app.add_typer(copilot_app,name='copilot')
 
 
 def fail(exc):
@@ -30,13 +33,20 @@ def register(plan: Path=typer.Option(...,exists=True,dir_okay=False),
              code: Path=typer.Option(...,exists=True,dir_okay=False),
              environment: Path=typer.Option(...,exists=True,dir_okay=False),
              candidate: str=typer.Option(...),trial: str=typer.Option(...),family: str=typer.Option(...),
-             kind: Literal['factor','model','semantic_question']=typer.Option(...),
+             kind: Literal['factor','model','semantic_question','strategy','regime']=typer.Option(...),
              start: str=typer.Option(...),end: str=typer.Option(...),
              holdout: str | None=typer.Option(None),policy: Path | None=typer.Option(None,exists=True,dir_okay=False)):
     """Freeze candidate, inputs, splits and policy before any trial executes."""
     try:
         service=ResearchRunner(ResearchRegistry(registry),EvidenceStore(evidence))
-        record=service.register(plan=ExperimentPlan.model_validate_json(plan.read_text()),candidate_id=candidate,
+        plan_type = ExperimentPlan
+        if kind == 'strategy':
+            from src.research.strategy_experiments import StrategyExperimentPlan
+            plan_type = StrategyExperimentPlan
+        elif kind == 'regime':
+            from src.research.regime_experiments import RegimeExperimentPlan
+            plan_type = RegimeExperimentPlan
+        record=service.register(plan=plan_type.model_validate_json(plan.read_text()),candidate_id=candidate,
             trial_id=trial,family_id=family,kind=kind,origin='custom',code=code.read_bytes(),environment=environment.read_bytes(),
             at=datetime.now(timezone.utc),evaluation_start=datetime.fromisoformat(start),evaluation_end=datetime.fromisoformat(end),
             holdout_id=holdout,policy=PromotionPolicy.model_validate_json(policy.read_text()) if policy else None)

@@ -27,6 +27,7 @@ class FactorBacktester:
         return WalkForwardRunner(self.config).run(
             data.features, data.labels, model_name=model_name,
             label_end_times=data.label_available_at, feature_available_at=data.feature_available_at,
+            feature_spec_hash=data.feature_spec_hash, data_snapshot_hash=data.snapshot_hash,
             ledger_path=ledger_path, artifact_dir=artifact_dir, universe_version=inputs.universe_version,
             walk_months=inputs.walk_months, embargo_days=inputs.embargo_days,
             validation_months=inputs.validation_months, initial_train_months=inputs.initial_train_months,
