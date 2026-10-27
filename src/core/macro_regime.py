@@ -6,8 +6,6 @@ from 8 daily market signals using a Gaussian Hidden Markov Model.
 Typical usage::
 
     from src.core.macro_regime import HMMRegimeDetector, RegimeEvaluator
-    from src.utils.config import get_config
-
     detector = HMMRegimeDetector()
     result = detector.fit_and_predict("2018-01-01", "2024-12-31")
     print(result.regime, result.confidence)
@@ -16,17 +14,25 @@ Typical usage::
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from loguru import logger
+from pydantic import Field, model_validator
+from scipy.special import logsumexp
 
+from src.data.evidence.store import canonical_bytes, digest
+from src.domain.common import EvidenceRecord, RunContext, Sha256, UtcTimestamp, VersionedContract
 from src.utils.config import AppConfig, get_config
 from src.utils.exceptions import RegimeError
 from src.utils.schemas import MacroRegime, RegimeDetectionResult
+
+# The original detector below is retained for explicit diagnostics. Production
+# callers use CausalHMMRegimeDetector, which requires time/evidence contracts.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -74,115 +80,8 @@ class HMMRegimeDetector:
     # ------------------------------------------------------------------
 
     def fetch_signals(self, start: str, end: str) -> pd.DataFrame:
-        """Fetch all 8 market signals from yfinance and return a daily DataFrame.
-
-        Columns: vix_level, vix_roc_10d, yield_curve_10y2y, sp500_breadth,
-        sp500_realized_vol_20d, sp500_momentum_20d, dxy_roc_20d,
-        credit_spread_proxy.
-
-        Args:
-            start: Start date string "YYYY-MM-DD".
-            end: End date string "YYYY-MM-DD".
-
-        Returns:
-            DataFrame indexed by date with one column per signal.
-        """
-        import yfinance as yf
-
-        logger.info("Fetching macro signals {} → {}", start, end)
-
-        # Fetch raw price series with fallback per-ticker error handling
-        raw: dict[str, pd.Series] = {}
-
-        def _fetch(ticker: str) -> pd.Series | None:
-            try:
-                df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-                if df.empty:
-                    logger.warning("Empty data returned for {}", ticker)
-                    return None
-                close = df["Close"]
-                if isinstance(close, pd.DataFrame):
-                    close = close.iloc[:, 0]
-                return close.squeeze()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to fetch {}: {}", ticker, exc)
-                return None
-
-        raw["vix"] = _fetch("^VIX")
-        raw["tnx"] = _fetch("^TNX")   # 10Y yield
-        raw["irx"] = _fetch("^IRX")   # 13-week T-bill (proxy for 2Y)
-        raw["sp500"] = _fetch("^GSPC")
-        raw["dxy"] = _fetch("DX-Y.NYB")
-        raw["hyg"] = _fetch("HYG")    # high-yield bond ETF
-        raw["tlt"] = _fetch("TLT")    # 20Y treasury ETF
-
-        signals: dict[str, pd.Series] = {}
-
-        # 1. VIX level
-        if raw["vix"] is not None:
-            signals["vix_level"] = raw["vix"]
-        else:
-            logger.warning("VIX unavailable; using zeros for vix_level")
-            signals["vix_level"] = pd.Series(dtype=float)
-
-        # 2. VIX 10-day ROC
-        if raw["vix"] is not None:
-            signals["vix_roc_10d"] = raw["vix"].pct_change(10)
-        else:
-            signals["vix_roc_10d"] = pd.Series(dtype=float)
-
-        # 3. Yield curve: 10Y minus 2Y (using IRX as 2Y proxy, both in %)
-        if raw["tnx"] is not None and raw["irx"] is not None:
-            signals["yield_curve_10y2y"] = raw["tnx"] - raw["irx"]
-        elif raw["tnx"] is not None:
-            signals["yield_curve_10y2y"] = raw["tnx"]
-        else:
-            signals["yield_curve_10y2y"] = pd.Series(dtype=float)
-
-        # 4. S&P 500 breadth (approximate: rolling % of days above 200d SMA)
-        #    We use a rolling 252-day "fraction above" its own expanding mean
-        if raw["sp500"] is not None:
-            sp = raw["sp500"]
-            sma200 = sp.rolling(200, min_periods=50).mean()
-            signals["sp500_breadth"] = (sp > sma200).rolling(20, min_periods=5).mean()
-        else:
-            signals["sp500_breadth"] = pd.Series(dtype=float)
-
-        # 5. S&P 500 20-day realized volatility (annualised)
-        if raw["sp500"] is not None:
-            log_ret = np.log(raw["sp500"] / raw["sp500"].shift(1))
-            signals["sp500_realized_vol_20d"] = log_ret.rolling(20, min_periods=10).std() * math.sqrt(252)
-        else:
-            signals["sp500_realized_vol_20d"] = pd.Series(dtype=float)
-
-        # 6. S&P 500 20-day momentum
-        if raw["sp500"] is not None:
-            signals["sp500_momentum_20d"] = raw["sp500"].pct_change(20)
-        else:
-            signals["sp500_momentum_20d"] = pd.Series(dtype=float)
-
-        # 7. DXY 20-day ROC
-        if raw["dxy"] is not None:
-            signals["dxy_roc_20d"] = raw["dxy"].pct_change(20)
-        else:
-            signals["dxy_roc_20d"] = pd.Series(dtype=float)
-
-        # 8. Credit spread proxy: negative log(HYG/TLT) — wider spread = higher value = more risk
-        if raw["hyg"] is not None and raw["tlt"] is not None:
-            # Align on common index
-            hyg_aligned, tlt_aligned = raw["hyg"].align(raw["tlt"], join="inner")
-            ratio = hyg_aligned / tlt_aligned
-            signals["credit_spread_proxy"] = -np.log(ratio)
-        else:
-            signals["credit_spread_proxy"] = pd.Series(dtype=float)
-
-        # Combine into DataFrame
-        df = pd.DataFrame(signals)
-        df.index = pd.to_datetime(df.index)
-        df.sort_index(inplace=True)
-
-        logger.info("Fetched {} rows, {} signals", len(df), len(df.columns))
-        return df
+        """Ambient proxy data cannot satisfy the production macro contract."""
+        raise RegimeError("Use macro_signals with actual DGS10/DGS2, historical constituent membership and versioned source inputs; Yahoo/IRX/index-time-above-average are not substitutes")
 
     # ------------------------------------------------------------------
     # Preprocessing
@@ -466,7 +365,16 @@ class HMMRegimeDetector:
             return []
 
         X = signals.values.astype(float)
-        state_seq = self._model.predict(X)
+        # Filter prefix probabilities; full-sequence Viterbi rewrites old states.
+        from scipy.special import logsumexp
+        alpha = None
+        state_seq = []
+        transitions = np.log(np.maximum(self._model.transmat_, np.finfo(float).tiny))
+        for emission in self._model._compute_log_likelihood(X):
+            prior = np.log(np.maximum(self._model.startprob_, np.finfo(float).tiny)) if alpha is None else logsumexp(alpha[:, None]+transitions, axis=0)
+            alpha = prior + emission
+            alpha -= logsumexp(alpha)
+            state_seq.append(int(alpha.argmax()))
         recent = state_seq[-n_days:]
         return [self._state_to_regime.get(int(s), MacroRegime.NEUTRAL.value) for s in recent]
 
@@ -700,3 +608,305 @@ class RegimeEvaluator:
         rolling_max = cum.expanding().max()
         drawdowns = cum / rolling_max - 1
         return float(drawdowns.min())
+
+# ---------------------------------------------------------------------------
+# Versioned causal production path
+# ---------------------------------------------------------------------------
+
+
+MACRO_SIGNALS = (
+    "vix_level", "vix_roc_10d", "yield_curve_10y2y", "sp500_breadth",
+    "sp500_realized_vol_20d", "sp500_momentum_20d", "dxy_roc_20d", "credit_spread_proxy",
+)
+
+
+class CausalRegimeResult(VersionedContract):
+    context: RunContext
+    status: Literal["available", "insufficient_data"]
+    regime: Literal["risk_on", "neutral", "risk_off", "crisis"] | None = None
+    state_probabilities: tuple[tuple[str, float], ...] = ()
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    model_hash: Sha256 | None = None
+    trained_through: UtcTimestamp | None = None
+    input_hash: Sha256
+    evidence_ids: tuple[str, ...]
+    held_reason: str | None = None
+
+    @model_validator(mode="after")
+    def coherent_result(self):
+        if self.status == "available" and (self.regime is None or self.model_hash is None or self.trained_through is None or self.confidence is None):
+            raise ValueError("available regime requires a fitted model and effective state")
+        if self.status == "insufficient_data" and self.regime is not None:
+            raise ValueError("insufficient data cannot assert a neutral or other regime")
+        if self.state_probabilities:
+            probabilities = dict(self.state_probabilities)
+            if len(self.state_probabilities) != 4 or set(probabilities) != {"risk_on", "neutral", "risk_off", "crisis"}:
+                raise ValueError("four distinct state probabilities required")
+            if any(not 0 <= p <= 1 for p in probabilities.values()) or not math.isclose(sum(probabilities.values()), 1, abs_tol=1e-8):
+                raise ValueError("state probabilities must sum to one")
+            if self.regime is not None and not math.isclose(self.confidence, probabilities[self.regime], abs_tol=1e-8):
+                raise ValueError("confidence is the probability of the effective state")
+        return self
+
+
+def macro_signals(raw: pd.DataFrame, constituent_prices: pd.DataFrame,
+                  membership: pd.DataFrame) -> pd.DataFrame:
+    """Build eight signals from actual yields and constituent breadth.
+
+    Inputs are already as-of materialized: raw columns vix,dgs10,dgs2,sp500,dxy,
+    hyg,tlt. Membership is an explicit boolean historical matrix, not today's
+    index list. Missing constituents fail breadth coverage rather than counting
+    as below their moving average.
+    """
+    required = {"vix", "dgs10", "dgs2", "sp500", "dxy", "hyg", "tlt"}
+    if required - set(raw) or not constituent_prices.index.equals(membership.index) or not constituent_prices.columns.equals(membership.columns):
+        raise RegimeError("actual yields and aligned historical constituent prices/membership required")
+    if not raw.index.equals(constituent_prices.index) or not all(pd.api.types.is_bool_dtype(dtype) for dtype in membership.dtypes):
+        raise RegimeError("explicit date-aligned boolean historical membership required")
+    if not raw.index.is_unique or not raw.index.is_monotonic_increasing:
+        raise RegimeError("macro history must be unique and chronological")
+    average = constituent_prices.rolling(200, min_periods=200).mean()
+    coverage = (constituent_prices.notna() & average.notna()) | ~membership
+    breadth = ((constituent_prices > average) & membership).sum(axis=1) / membership.sum(axis=1).replace(0, np.nan)
+    breadth = breadth.where(coverage.all(axis=1))
+    return pd.DataFrame({
+        "vix_level": raw.vix,
+        "vix_roc_10d": raw.vix.pct_change(10, fill_method=None),
+        "yield_curve_10y2y": raw.dgs10 - raw.dgs2,
+        "sp500_breadth": breadth,
+        "sp500_realized_vol_20d": np.log(raw.sp500 / raw.sp500.shift(1)).rolling(20).std() * np.sqrt(252),
+        "sp500_momentum_20d": raw.sp500.pct_change(20, fill_method=None),
+        "dxy_roc_20d": raw.dxy.pct_change(20, fill_method=None),
+        "credit_spread_proxy": -np.log(raw.hyg / raw.tlt),
+    }, index=raw.index)
+
+
+class CausalHMMRegimeDetector:
+    """Four-state HMM with causal filtering and durable per-session transitions.
+
+    All fit/inference input availability is explicit. Historical diagnostic
+    methods of HMMRegimeDetector are not used to manufacture trading evidence.
+    """
+
+    def __init__(self, state_path: str | Path, *, normalization_window: int = 252,
+                 min_regime_days: int = 5, confidence_threshold: float = 0.6,
+                 n_init: int = 10, n_iter: int = 100):
+        if normalization_window < 20 or min_regime_days < 1 or not 0 <= confidence_threshold <= 1 or not 1 <= n_init <= 20:
+            raise RegimeError("invalid causal HMM configuration")
+        self.state_path = Path(state_path)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.window, self.min_days, self.threshold = normalization_window, min_regime_days, confidence_threshold
+        self.n_init, self.n_iter = n_init, n_iter
+        self.model = None
+        self.model_hash = None
+        self.trained_through = None
+        self.fitted_at = None
+        self.training_hash = None
+        self.training_code_version = None
+        self.labels = {}
+        self.initial_alpha = None
+        with self._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS regime_events (model_hash TEXT, timestamp TEXT, input_hash TEXT, result TEXT, alpha TEXT, held_count INTEGER, PRIMARY KEY(model_hash,timestamp))")
+
+    @contextmanager
+    def _db(self):
+        import sqlite3
+        connection = sqlite3.connect(self.state_path, timeout=30)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _validate(self, raw, available_at, context, evidence, source_ids):
+        if tuple(raw.columns) != MACRO_SIGNALS or not isinstance(raw.index, pd.DatetimeIndex) or raw.index.tz is None:
+            raise RegimeError("all eight ordered macro signals require timezone-aware dates")
+        if raw.empty or not raw.index.is_unique or not raw.index.is_monotonic_increasing or raw.index[-1] > context.as_of:
+            raise RegimeError("invalid/future macro history")
+        if not isinstance(available_at, pd.Series) or not available_at.index.equals(raw.index) or available_at.isna().any():
+            raise RegimeError("aligned explicit macro availability required")
+        if any(pd.Timestamp(t).tzinfo is None for t in available_at) or (available_at > raw.index).any():
+            raise RegimeError("macro observation was unavailable at its historical decision time")
+        if not evidence:
+            raise RegimeError("macro evidence provenance required")
+        for record in evidence:
+            record.require_available(context.as_of)
+        records = {record.evidence_id: record for record in evidence}
+        if len(records) != len(evidence) or not isinstance(source_ids, pd.Series) or not source_ids.index.equals(raw.index):
+            raise RegimeError("distinct evidence and aligned per-row source IDs required")
+        for timestamp, ids in source_ids.items():
+            if not isinstance(ids, tuple) or not ids or set(ids) - records.keys():
+                raise RegimeError("every macro row requires immutable source IDs")
+            for source_id in ids:
+                record = records[source_id]
+                record.require_available(timestamp.to_pydatetime())
+                if available_at.loc[timestamp] < max(record.available_at, record.requested_as_of or record.available_at):
+                    raise RegimeError("macro availability precedes its source availability")
+
+    def preprocess(self, raw):
+        average = raw.rolling(self.window, min_periods=self.window).mean()
+        std = raw.rolling(self.window, min_periods=self.window).std()
+        # A documented constant feature normalizes to 0; missing data stays NaN.
+        return ((raw - average) / std.where(std != 0, 1)).replace([np.inf, -np.inf], np.nan).dropna()
+
+    @staticmethod
+    def _input_hash(raw, evidence, available_at, source_ids):
+        used = set(source_id for ids in source_ids for source_id in ids)
+        return digest(canonical_bytes({"signals": raw.to_json(orient="split", date_format="iso", double_precision=15),
+                                       "availability": [t.isoformat() for t in available_at], "sources": source_ids.tolist(),
+                                       "evidence": sorted(e.content_hash() for e in evidence if e.evidence_id in used)}))
+
+    def _forward(self, values, previous=None):
+        emissions = self.model._compute_log_likelihood(np.asarray(values, dtype=float))
+        result = []
+        transition = np.log(np.maximum(self.model.transmat_, np.finfo(float).tiny))
+        alpha = np.log(np.maximum(previous, np.finfo(float).tiny)) if previous is not None else None
+        for emission in emissions:
+            prior = np.log(np.maximum(self.model.startprob_, np.finfo(float).tiny)) if alpha is None else logsumexp(alpha[:, None] + transition, axis=0)
+            alpha = prior + emission
+            alpha -= logsumexp(alpha)
+            result.append(np.exp(alpha))
+        return np.asarray(result)
+
+    def fit(self, raw: pd.DataFrame, context: RunContext, *, available_at: pd.Series,
+            evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series):
+        from hmmlearn.hmm import GaussianHMM
+        self._validate(raw, available_at, context, evidence, source_ids)
+        normalized = self.preprocess(raw)
+        if len(normalized) < 80:
+            raise RegimeError("insufficient eligible macro training history after one-year normalization")
+        best, score = None, -np.inf
+        for seed in range(self.n_init):
+            model = GaussianHMM(n_components=4, covariance_type="full", n_iter=self.n_iter, random_state=seed, min_covar=1e-4)
+            try:
+                model.fit(normalized.values)
+                likelihood = model.score(normalized.values)
+                if np.isfinite(likelihood) and likelihood > score:
+                    best, score = model, likelihood
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+        if best is None:
+            raise RegimeError("all causal HMM fits failed")
+        self.model = best
+        risk = sum(best.means_[:, MACRO_SIGNALS.index(key)] * weight for key, weight in _RISK_SCORE_WEIGHTS.items())
+        self.labels = {int(state): label for state, label in zip(np.argsort(risk), ("risk_on", "neutral", "risk_off", "crisis"))}
+        self.trained_through, self.fitted_at = raw.index[-1].to_pydatetime(), context.as_of
+        self.training_code_version = context.code_version
+        self.training_hash = self._input_hash(raw, evidence, available_at, source_ids)
+        self.initial_alpha = self._forward(normalized.values)[-1]
+        self.model_hash = digest(canonical_bytes({"means": best.means_.tolist(), "covars": best.covars_.tolist(),
+                                                 "transitions": best.transmat_.tolist(), "start": best.startprob_.tolist(),
+                                                 "training": self.training_hash, "window": self.window,
+                                                 "min_days": self.min_days, "threshold": self.threshold,
+                                                 "fitted_at": self.fitted_at.isoformat(), "code_version": context.code_version,
+                                                 "implementation": "causal-gaussian-hmm-1"}))
+        return self
+
+    def predict(self, raw: pd.DataFrame, context: RunContext, *, available_at: pd.Series,
+                evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series) -> CausalRegimeResult:
+        self._validate(raw, available_at, context, evidence, source_ids)
+        input_hash = self._input_hash(raw, evidence, available_at, source_ids)
+        if self.model is None:
+            return CausalRegimeResult(context=context, status="insufficient_data", input_hash=input_hash,
+                                     evidence_ids=tuple(e.evidence_id for e in evidence), held_reason="model_unavailable")
+        normalized = self.preprocess(raw)
+        training_raw = raw.loc[:self.trained_through]
+        if self._input_hash(training_raw, evidence, available_at.loc[training_raw.index], source_ids.loc[training_raw.index]) != self.training_hash:
+            raise RegimeError("training history changed or is incomplete")
+        if normalized.empty or normalized.index[-1] != raw.index[-1] or raw.index[-1] <= self.fitted_at:
+            return CausalRegimeResult(context=context, status="insufficient_data", input_hash=input_hash,
+                                     model_hash=self.model_hash, trained_through=self.trained_through,
+                                     evidence_ids=tuple(e.evidence_id for e in evidence), held_reason="insufficient_out_of_sample_signals")
+        import json
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT timestamp,input_hash,result,alpha,held_count FROM regime_events WHERE model_hash=? ORDER BY timestamp", (self.model_hash,)).fetchall()
+            last = rows[-1] if rows else None
+            # Verify every supplied recorded prefix. Future additions never alter
+            # the earlier normalization or result, and revised history fails.
+            for timestamp, previous_hash, _, _, _ in rows:
+                time = pd.Timestamp(timestamp)
+                if time <= raw.index[-1]:
+                    if self._input_hash(raw.loc[:time], evidence, available_at.loc[:time], source_ids.loc[:time]) != previous_hash:
+                        raise RegimeError("historical regime inputs changed; use a new model/run namespace")
+            if last and raw.index[-1] < pd.Timestamp(last[0]):
+                raise RegimeError("regime state cannot move backwards")
+            alpha = np.array(json.loads(last[3])) if last else self.initial_alpha.copy()
+            effective = CausalRegimeResult.model_validate_json(last[2]).regime if last else None
+            held = last[4] if last else 0
+            after = pd.Timestamp(last[0]) if last else pd.Timestamp(self.fitted_at)
+            pending = normalized.loc[normalized.index > after]
+            if not pending.index.equals(raw.index[raw.index > after]):
+                raise RegimeError("macro coverage gap in inference history")
+            if not last:
+                delayed = normalized.loc[(normalized.index > self.trained_through) & (normalized.index <= self.fitted_at)]
+                if not delayed.empty:
+                    alpha = self._forward(delayed.values, alpha)[-1]
+            result = CausalRegimeResult.model_validate_json(last[2]) if last else None
+            for timestamp, row in pending.iterrows():
+                alpha = self._forward([row.values], alpha)[0]
+                winner = int(alpha.argmax())
+                proposed = self.labels[winner]
+                reason = None
+                if alpha[winner] < self.threshold:
+                    reason = "confidence_below_threshold"
+                elif effective is not None and proposed != effective and held < self.min_days:
+                    reason = "minimum_duration"
+                else:
+                    if proposed != effective:
+                        held = 0
+                    effective = proposed
+                held = held + 1 if effective is not None else 0
+                source_records = tuple(e for e in evidence if e.available_at <= timestamp and (e.requested_as_of is None or e.requested_as_of <= timestamp))
+                prefix_hash = self._input_hash(raw.loc[:timestamp], source_records, available_at.loc[:timestamp], source_ids.loc[:timestamp])
+                probabilities = tuple((self.labels[i], float(p)) for i, p in enumerate(alpha))
+                result = CausalRegimeResult(context=context.model_copy(update={"as_of": timestamp.to_pydatetime()}),
+                                           status="available" if effective is not None else "insufficient_data", regime=effective, state_probabilities=probabilities,
+                                           confidence=dict(probabilities)[effective] if effective else None, model_hash=self.model_hash,
+                                           trained_through=self.trained_through, input_hash=prefix_hash,
+                                           evidence_ids=tuple(e.evidence_id for e in source_records), held_reason=reason)
+                db.execute("INSERT INTO regime_events VALUES (?,?,?,?,?,?)", (self.model_hash, timestamp.isoformat(), prefix_hash,
+                           result.model_dump_json(), json.dumps(alpha.tolist()), held))
+            if result is None:
+                raise RegimeError("no eligible regime inference events")
+        return result.model_copy(update={"context": context})
+
+    def save(self, path: str | Path):
+        import importlib.metadata
+        import os
+        import tempfile
+
+        import joblib
+        if self.model is None:
+            raise RegimeError("cannot save an unfitted causal HMM")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {key: value for key, value in self.__dict__.items() if key != "state_path"}
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name+".")
+        os.close(descriptor)
+        try:
+            joblib.dump(payload, temporary)
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        payload_hash = digest(path.read_bytes())
+        Path(str(path)+".sha256").write_text(payload_hash)
+        Path(str(path)+".json").write_bytes(canonical_bytes({
+            "schema_version": "1.0", "implementation": "causal-gaussian-hmm-1", "model_hash": self.model_hash,
+            "payload_hash": payload_hash, "training_input_hash": self.training_hash,
+            "trained_through": self.trained_through.isoformat(), "fitted_at": self.fitted_at.isoformat(),
+            "code_version": self.training_code_version, "signals": MACRO_SIGNALS,
+            "environment": {name: importlib.metadata.version(name) for name in ("hmmlearn", "numpy", "pandas", "scipy")},
+            "normalization_window": self.window, "minimum_duration": self.min_days,
+            "confidence_threshold": self.threshold, "state_labels": self.labels,
+        }))
+        return path
+
+    def load(self, path: str | Path):
+        import joblib
+        path = Path(path)
+        if digest(path.read_bytes()) != Path(str(path)+".sha256").read_text().strip():
+            raise RegimeError("causal HMM artifact integrity failure")
+        # Trusted application-owned artifacts only; no provider/generated pickle.
+        self.__dict__.update(joblib.load(path))
+        return self
