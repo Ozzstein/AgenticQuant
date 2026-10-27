@@ -252,3 +252,60 @@ def test_consensus_requires_four_named_votes_and_records_derivation(
         update={"risk_veto": True, "action": "VETO", "new_exposure_blocked": True}
     )
     assert consensus_recommendation(veto).action.value == "VETO"
+
+
+@pytest.mark.parametrize("canonical", ["ABSTAIN", "HOLD"])
+@pytest.mark.parametrize("votes", ["BUY", "REDUCE", "EXIT"])
+def test_consensus_never_revives_blocked_or_different_canonical_action(
+    decision_context, decision_instrument, canonical, votes
+):
+    roles = ("fundamental", "sentiment", "technical", "risk_manager", "strategist")
+    reports = tuple(
+        SpecialistReport(
+            role=role,
+            action=votes,
+            status="ok",
+            reasoning="fixture earlier vote",
+            derived_from=roles[:4] if role == "strategist" else (),
+        )
+        for role in roles
+    )
+    decision = AgentDecision(
+        context=decision_context,
+        instrument=decision_instrument,
+        action=canonical,
+        reasoning="Canonical evidence gate or final synthesis",
+        reports=reports,
+    )
+    assert consensus_recommendation(decision).action.value == "ABSTAIN"
+
+
+def test_consensus_rejects_duplicate_or_unattributed_role_votes(
+    decision_context, decision_instrument
+):
+    roles = ("fundamental", "sentiment", "technical", "risk_manager", "strategist")
+    reports = tuple(
+        SpecialistReport(
+            role=role,
+            action="HOLD",
+            status="ok",
+            reasoning="fixture vote",
+        )
+        for role in roles
+    )
+    decision = AgentDecision(
+        context=decision_context,
+        instrument=decision_instrument,
+        action="HOLD",
+        reasoning="fixture synthesis",
+        reports=reports,
+    )
+    assert consensus_recommendation(decision).reason == "Strategist derivation is incomplete"
+    attributed = reports[:-1] + (reports[-1].model_copy(update={"derived_from": roles[:4]}),)
+    valid = decision.model_copy(update={"reports": attributed})
+    assert consensus_recommendation(valid).action.value == "HOLD"
+    duplicate = valid.model_copy(update={"reports": attributed + (attributed[0],)})
+    assert consensus_recommendation(duplicate).action.value == "ABSTAIN"
+    risk_veto = reports[3].model_copy(update={"action": "VETO"})
+    gated = valid.model_copy(update={"reports": attributed[:3] + (risk_veto,) + attributed[4:]})
+    assert consensus_recommendation(gated).action.value == "VETO"

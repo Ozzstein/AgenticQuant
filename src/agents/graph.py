@@ -172,6 +172,31 @@ def build_trading_desk_graph(
             )
         )
 
+    def persist(state):
+        try:
+            return save_memory_node(state, config)
+        except Exception as exc:
+            # Preserve completed reasoning and qualitative vetoes if persistence
+            # fails; the outer failure handler cannot recover this node's state.
+            decision = state["agent_decision"]
+            veto = decision.risk_veto or decision.action == AgentAction.VETO
+            decision = decision.model_copy(
+                update={
+                    "action": AgentAction.VETO if veto else AgentAction.ABSTAIN,
+                    "risk_veto": veto,
+                    "new_exposure_blocked": True,
+                    "reasoning": decision.reasoning
+                    + f"\nPersistence unavailable ({type(exc).__name__})",
+                    "risk_flags": decision.risk_flags + ("decision_persistence_unavailable",),
+                }
+            )
+            output = {"agent_decision": decision, "new_exposure_blocked": True, "risk_veto": veto}
+            if state.get("result") is not None:
+                from src.agents.contracts import legacy_analysis
+
+                output["result"] = legacy_analysis(decision)
+            return output
+
     graph = StateGraph(TradingDeskState)
     nodes = {
         "prepare": prepare,
@@ -188,7 +213,7 @@ def build_trading_desk_graph(
         "debate": bind(debate_node),
         "risk_manager": risk,
         "strategist": bind(strategist_node),
-        "save_memory": lambda state: save_memory_node(state, config),
+        "save_memory": persist,
     }
     for name, node in nodes.items():
         graph.add_node(name, node)

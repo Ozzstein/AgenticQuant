@@ -549,3 +549,44 @@ def test_configured_role_disable_is_visible_abstention(
     assert result.action == AgentAction.ABSTAIN
     technical = next(r for r in result.reports if r.role == "technical")
     assert "disabled" in technical.reasoning and not any(role == "technical" for role, _ in calls)
+
+
+@pytest.mark.parametrize("qualitative_veto", [False, True])
+def test_history_failure_preserves_full_reports_and_qualitative_veto(
+    tmp_path,
+    desk_config,
+    decision_context,
+    decision_instrument,
+    desk_sources,
+    desk_hmm,
+    desk_portfolio,
+    monkeypatch,
+    qualitative_veto,
+):
+    def fail_save(*args):
+        raise OSError("fixture persistence failure must not disclose private details")
+
+    monkeypatch.setattr("src.agents.graph.save_memory_node", fail_save)
+
+    class QualitativeRiskFixture(GenerativeFixture):
+        def invoke(self, messages):
+            result = super().invoke(messages)
+            if qualitative_veto and self.role == "risk_manager":
+                result["parsed"] = result["parsed"].model_copy(update={"action": AgentAction.VETO})
+            return result
+
+    result = analyze_instrument(
+        decision_instrument,
+        decision_context,
+        sources=desk_sources,
+        hmm_context=desk_hmm,
+        portfolio_context=desk_portfolio,
+        config=desk_config,
+        decision_service=jev_service(tmp_path),
+        llm_factory=lambda role: QualitativeRiskFixture(role, []),
+    )
+    assert result.action == (AgentAction.VETO if qualitative_veto else AgentAction.ABSTAIN)
+    assert result.risk_veto is qualitative_veto and result.new_exposure_blocked
+    assert len(result.reports) == 7 and result.debate_transcript
+    assert "decision_persistence_unavailable" in result.risk_flags
+    assert "private details" not in result.reasoning
