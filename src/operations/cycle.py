@@ -1556,6 +1556,14 @@ class PaperCycleService:
                 receipt = self.operations.artifact(prior["stages"]["completion"]["output_hash"])
                 return CycleResult.model_validate(receipt)
             try:
+                # Recovery cannot inherit an earlier freshness approval. This
+                # check precedes every resumed mutation, even when the pure
+                # verified_inputs stage already has a durable cached result.
+                age = (start - plan.inputs.context.as_of).total_seconds()
+                if prior["stages"]["verified_inputs"].get("state") == "completed" and (
+                    age < 0 or age > self.config.operations.max_cycle_age_seconds
+                ):
+                    raise ValueError("future or stale operating input cutoff")
 
                 def verify():
                     if cycle_config_hash(self.config) != plan.inputs.context.config_hash:

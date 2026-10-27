@@ -1511,3 +1511,47 @@ def test_desk_boundary_preserves_passive_quantity_and_explicit_exit_or_reduce(ac
                 assert row.target_weight == min(current, proposed)
             else:
                 assert row.target_weight == current
+
+
+def test_partial_resume_rechecks_freshness_before_any_mutation_but_completed_replay_survives(
+    runtime, completed
+):
+    plan, result = completed
+    changed = plan.model_copy(
+        update={
+            "inputs": plan.inputs.model_copy(
+                update={
+                    "context": plan.inputs.context.model_copy(update={"run_id": "stale-recovery"})
+                }
+            ),
+            "scheduled_for": plan.scheduled_for - timedelta(microseconds=1),
+        }
+    )
+    manifest = runtime.ops.manifest(result.run_id).model_copy(
+        update={
+            "context": changed.inputs.context,
+            "input_hash": changed.content_hash(),
+            "scheduled_for": changed.scheduled_for,
+        }
+    )
+    runtime.ops.admit(manifest, changed.model_dump(mode="json"))
+    # A real committed pure verification checkpoint from an earlier invocation.
+    runtime.ops.stage(
+        changed.inputs.context.run_id,
+        "verified_inputs",
+        {"plan_hash": changed.content_hash()},
+        lambda: {"inputs_hash": changed.inputs.content_hash()},
+        recoverable=True,
+    )
+    calls = len(runtime.calls)
+    late = plan.inputs.context.as_of + timedelta(
+        seconds=runtime.service.config.operations.max_cycle_age_seconds + 1
+    )
+    replay = runtime.service.run(changed, now=late)
+    assert replay.status == "blocked"
+    assert "stale operating input cutoff" in replay.reason
+    assert (
+        runtime.ops.status(changed.inputs.context.run_id)["stages"]["account"]["state"] == "pending"
+    )
+    assert len(runtime.calls) == calls
+    assert runtime.service.run(plan, now=late) == result
