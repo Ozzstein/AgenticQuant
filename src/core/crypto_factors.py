@@ -44,7 +44,10 @@ class CryptoFactorEngine:
         funding_df: pd.DataFrame,
         window: int = 30,
     ) -> pd.Series:
-        """Z-score of 8h funding rate vs rolling mean (contrarian signal).
+        """Z-score of reported funding-event rates (contrarian signal).
+
+        A row is an actual source event or explicitly sampled feature value;
+        this calculation does not assume or normalize an eight-hour interval.
 
         Computes z-score = (funding_rate - rolling_mean) / rolling_std.
         Negated because high positive funding -> overleveraged longs -> bearish.

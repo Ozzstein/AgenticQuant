@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import importlib.metadata
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 from src.data.adapters.base import FetchResult, ProviderError, store_observation
 from src.data.evidence.store import EvidenceStore, canonical_bytes
@@ -14,9 +13,10 @@ from src.domain.market import MarketBar
 class CCXTAdapter:
     """Only observation methods are reachable; no generic exchange dispatch."""
 
-    def __init__(self, store: EvidenceStore, exchange):
+    def __init__(self, store: EvidenceStore, exchange, *, clock=None):
         self.store, self.exchange = store, exchange
         self.version = f"ccxt-{importlib.metadata.version('ccxt')}:capture-v1"
+        self.clock = clock
 
     def bars(self, instrument: Instrument, context: RunContext, *, ingested_at: datetime,
              start: datetime, end: datetime, timeframe: str = "1d", market_type: str = "spot",
@@ -83,35 +83,37 @@ class CCXTAdapter:
             raise ProviderError("ccxt", "pagination_budget_exhausted")
         return FetchResult("available" if records else "missing", tuple(records), "capture-time availability")
 
-    def derivatives(self, instrument: Instrument, context: RunContext, *, ingested_at: datetime,
-                    capability: str, since: datetime, limit: int = 1000) -> FetchResult:
-        operations = {"funding": "fetch_funding_rate_history", "open_interest": "fetch_open_interest_history"}
-        if capability not in operations or ":" not in instrument.symbol or not 1 <= limit <= 1000:
-            raise ProviderError("ccxt", "explicit_perpetual_symbol_and_supported_capability_required")
-        try:
-            rows = getattr(self.exchange, operations[capability])(instrument.symbol, since=int(_utc(since).timestamp() * 1000), limit=limit)
-        except Exception:
-            raise ProviderError("ccxt", f"{capability}_unavailable") from None
-        raw = canonical_bytes(rows)
-        records = []
-        for row in rows:
-            try:
-                observed = datetime.fromtimestamp(row["timestamp"] / 1000, timezone.utc)
-                if capability == "funding":
-                    value, units = row["fundingRate"], "fraction-per-funding-period"
-                else:
-                    value, units = row["openInterestAmount"], "contracts-or-base-as-declared-by-exchange"
-                if value is None or not Decimal(str(value)).is_finite():
-                    raise ValueError()
-            except (KeyError, TypeError, ValueError):
-                raise ProviderError("ccxt", "malformed_derivative_observation") from None
-            records.append(store_observation(self.store, raw=raw,
-                           normalized={"value": str(value), "market_type": "perpetual", "symbol": instrument.symbol},
-                           provider=f"ccxt:{self.exchange.id}", version=self.version,
-                           source_uri=f"ccxt://{self.exchange.id}/{capability}/{instrument.symbol}",
-                           kind=capability, logical_key=f"{instrument.instrument_id}:{capability}:{observed.isoformat()}",
-                           context=context, ingested_at=ingested_at, instrument=instrument, observed_at=observed, units=units))
-        return FetchResult("available" if records else "missing", tuple(records))
+    def derivatives(
+        self,
+        instrument: Instrument,
+        context: RunContext,
+        *,
+        capability: str,
+        since: datetime,
+        end: datetime | None = None,
+        timeframe: str = "1h",
+        limit: int | None = None,
+        max_pages: int = 100,
+        ingested_at: datetime | None = None,
+    ) -> FetchResult:
+        """Closed native GET history, measured AFTER each response.
+
+        ``ingested_at`` is retained only for legacy call compatibility and never
+        controls source availability. New refreshes must use the actual store.
+        """
+        from src.data.adapters.crypto_context import derivative_history
+
+        return derivative_history(
+            self,
+            instrument,
+            context,
+            capability=capability,
+            since=since,
+            end=end,
+            timeframe=timeframe,
+            limit=limit,
+            max_pages=max_pages,
+        )
 
 
 class YFinanceAdapter:
