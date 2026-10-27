@@ -297,7 +297,7 @@ def test_bundle_is_archived_before_completed_refresh_and_keeps_exact_eight_sourc
     )
     bindings = dict(value["economic_sources"])
     assert set(bindings) == {
-        "execution_bars",
+        "opening_events",
         "instrument_metadata",
         "universe_history",
         "corporate_actions",
