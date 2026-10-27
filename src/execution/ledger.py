@@ -643,6 +643,11 @@ class PortfolioLedger:
 
         return receivables(self, account)
 
+    def apply_paper_dividend_distribution(self, account, distribution, *, policy, as_of):
+        from src.execution.dividends import apply_paper_distribution
+
+        return apply_paper_distribution(self, account, distribution, policy=policy, as_of=as_of)
+
     def position_opened_at(self, account: str, instrument_id: str) -> datetime | None:
         """Derive holding age from actual economics visible in this transaction.
 

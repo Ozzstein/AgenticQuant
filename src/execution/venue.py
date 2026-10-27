@@ -245,6 +245,10 @@ class VenueExecution:
             sort_keys=True,
         )
         with ledger.atomic():
+            if owner != "direct" or set(adapters) != {"paper"}:
+                from src.execution.dividends import require_remote_income_account
+
+                require_remote_income_account(ledger, account_id)
             row = ledger.db.execute(
                 "SELECT owner,configuration FROM execution_books WHERE account=?", (account_id,)
             ).fetchone()

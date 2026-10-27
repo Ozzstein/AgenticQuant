@@ -286,7 +286,8 @@ class DividendPayment(VersionedContract):
     action_id: NonEmptyString
     terms_hash: Sha256
     entitlement_hash: Sha256
-    origin: Literal["posted-account", "replay-distribution"]
+    origin: Literal["posted-account", "replay-distribution", "paper-distribution"]
+    sizing_policy_hash: Sha256 | None = None
     effective_date: date
     observed_at: UtcTimestamp
     available_at: UtcTimestamp
@@ -302,6 +303,8 @@ class DividendPayment(VersionedContract):
 
     @model_validator(mode="after")
     def reconciled_payment(self):
+        if (self.origin == "paper-distribution") != (self.sizing_policy_hash is not None):
+            raise ValueError("only local paper sizing requires an explicit policy hash")
         if self.gross_amount != exact_decimal_sum(
             [self.net_amount, self.fee, self.withholding_tax]
         ):
@@ -314,9 +317,29 @@ class DividendPayment(VersionedContract):
             raise ValueError("actual deductions require explicit source bindings")
         return self
 
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.sizing_policy_hash is None:
+            result.pop("sizing_policy_hash", None)
+        return result
+
+
+class PaperDividendPolicy(VersionedContract):
+    """Explicit local simulation policy; never proof of a broker account credit."""
+
+    policy_id: NonEmptyString
+    account_id: NonEmptyString
+    distribution_hash: Sha256
+    convention: Literal["source-confirmed-paper-distribution-1"]
+    fee_tax_convention: Literal["source-confirmed-per-unit-deductions-1"]
+    available_at: UtcTimestamp
+    source_id: NonEmptyString
+    source_hash: Sha256
+
 
 class DividendDistribution(VersionedContract):
-    """Actual published per-unit distribution, sized from each replay's entitlement."""
+    """Actual paid-per-unit notice, sized only under an explicit simulation policy."""
 
     distribution_id: NonEmptyString
     action_id: NonEmptyString
@@ -334,14 +357,25 @@ class DividendDistribution(VersionedContract):
     source_id: NonEmptyString
     source_hash: Sha256
 
-    def payment(self, entitlement: DividendEntitlement) -> DividendPayment:
+    def payment(
+        self, entitlement: DividendEntitlement, *, paper_policy: PaperDividendPolicy | None = None
+    ) -> DividendPayment:
+        if paper_policy is not None and (
+            paper_policy.account_id != entitlement.account_id
+            or paper_policy.distribution_hash != self.content_hash()
+            or paper_policy.available_at > self.available_at
+        ):
+            raise ValueError(
+                "paper dividend policy differs from account, distribution or availability"
+            )
         return DividendPayment(
             payment_id="distribution:" + self.distribution_id,
             account_id=entitlement.account_id,
             action_id=self.action_id,
             terms_hash=self.terms_hash,
             entitlement_hash=entitlement.content_hash(),
-            origin="replay-distribution",
+            origin="replay-distribution" if paper_policy is None else "paper-distribution",
+            sizing_policy_hash=paper_policy.content_hash() if paper_policy else None,
             effective_date=self.effective_date,
             observed_at=self.observed_at,
             available_at=self.available_at,

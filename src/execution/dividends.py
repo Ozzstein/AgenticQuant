@@ -19,6 +19,7 @@ from src.domain.portfolio import (
     DividendPayment,
     DividendReceivable,
     Fill,
+    PaperDividendPolicy,
     exact_decimal_product,
     exact_decimal_sum,
 )
@@ -274,13 +275,38 @@ def verify_payment(ledger, payment, *, as_of):
         or original.content_hash() != payment.entitlement_hash
         or payment.available_at > as_of
         or payment.available_at < original.at
+        or payment.effective_date < original.at.date()
         or (terms.payable_date is not None and payment.effective_date < terms.payable_date)
         or (spec.mode == "backtest") != (payment.origin == "replay-distribution")
+        or (payment.origin == "paper-distribution" and spec.mode != "paper")
     ):
         raise LedgerError("payment differs from actual entitlement, mode, terms or source clocks")
-    if payment.origin == "replay-distribution":
+    if payment.origin in ("replay-distribution", "paper-distribution"):
         from src.domain.portfolio import DividendDistribution
 
+        policy = None
+        if payment.origin == "paper-distribution":
+            require_local_paper(ledger, payment.account_id)
+            policy_row = ledger.db.execute(
+                "SELECT payload FROM events WHERE account=? AND id=?",
+                (payment.account_id, "paper-dividend-policy:" + payment.sizing_policy_hash),
+            ).fetchone()
+            policy = PaperDividendPolicy.model_validate_json(policy_row[0]) if policy_row else None
+            identity = (
+                ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?",
+                    (payment.account_id, "paper-dividend-policy-id:" + policy.policy_id),
+                ).fetchone()
+                if policy
+                else None
+            )
+            if (
+                policy is None
+                or policy.content_hash() != payment.sizing_policy_hash
+                or identity is None
+                or PaperDividendPolicy.model_validate_json(identity[0]) != policy
+            ):
+                raise LedgerError("local paper distribution requires exact retained sizing policy")
         source = ledger.db.execute(
             "SELECT payload FROM events WHERE account=? AND id=?",
             (
@@ -290,10 +316,77 @@ def verify_payment(ledger, payment, *, as_of):
         ).fetchone()
         if (
             source is None
-            or DividendDistribution.model_validate_json(source[0]).payment(original) != payment
+            or DividendDistribution.model_validate_json(source[0]).payment(
+                original, paper_policy=policy
+            )
+            != payment
         ):
-            raise LedgerError("replay payment requires the exact actual per-unit distribution")
+            raise LedgerError("simulation payment requires the exact actual per-unit distribution")
+    elif ledger.db.execute(
+        "SELECT 1 FROM events WHERE account=? AND id LIKE 'paper-dividend-policy:%' LIMIT 1",
+        (payment.account_id,),
+    ).fetchone():
+        raise LedgerError("local paper distribution account cannot mix broker-posted credits")
     return original
+
+
+def require_local_paper(ledger, account):
+    if (
+        ledger.spec(account).mode != "paper"
+        or ledger.db.execute(
+            "SELECT 1 FROM events WHERE account=? AND id LIKE 'remote-binding:%' LIMIT 1",
+            (account,),
+        ).fetchone()
+    ):
+        raise LedgerError("per-unit paper sizing requires an exclusively local paper account")
+    if ledger.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_books'"
+    ).fetchone():
+        book = ledger.db.execute(
+            "SELECT owner,configuration FROM execution_books WHERE account=?", (account,)
+        ).fetchone()
+        if book and (
+            book["owner"] != "direct" or json.loads(book["configuration"])["venues"] != ["paper"]
+        ):
+            raise LedgerError("per-unit paper sizing requires the local PaperVenue owner")
+    for row in ledger.db.execute(
+        "SELECT payload FROM dividend_payments WHERE account=?", (account,)
+    ):
+        if DividendPayment.model_validate_json(row[0]).origin != "paper-distribution":
+            raise LedgerError("local paper sizing cannot mix actual broker-posted credits")
+
+
+def require_remote_income_account(ledger, account):
+    if ledger.db.execute(
+        "SELECT 1 FROM events WHERE account=? AND id LIKE 'paper-dividend-policy:%' LIMIT 1",
+        (account,),
+    ).fetchone():
+        raise LedgerError(
+            "local paper distribution account cannot acquire a remote execution owner"
+        )
+
+
+def apply_paper_distribution(ledger, account, distribution, *, policy, as_of):
+    from src.domain.portfolio import DividendDistribution
+
+    policy = PaperDividendPolicy.model_validate(policy.model_dump())
+    distribution = DividendDistribution.model_validate(distribution.model_dump())
+    with ledger.atomic():
+        require_local_paper(ledger, account)
+        original = entitlement(ledger, account, distribution.action_id)
+        payment = distribution.payment(original, paper_policy=policy)
+        ledger.record_event(
+            account, "paper-dividend-policy-id:" + policy.policy_id, policy.model_dump_json()
+        )
+        ledger.record_event(
+            account, "paper-dividend-policy:" + policy.content_hash(), policy.model_dump_json()
+        )
+        ledger.record_event(
+            account,
+            "dividend-distribution:" + distribution.distribution_id,
+            distribution.model_dump_json(),
+        )
+        return apply_payment(ledger, payment, as_of=as_of)
 
 
 def apply_distribution(ledger, account, distribution, *, as_of):

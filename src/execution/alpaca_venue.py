@@ -124,6 +124,9 @@ class AlpacaVenue:
             else "https://api.alpaca.markets"
         )
         with ledger.atomic():
+            from src.execution.dividends import require_remote_income_account
+
+            require_remote_income_account(ledger, account_id)
             ledger.record_event(
                 account_id,
                 "remote-binding:alpaca",

@@ -619,6 +619,15 @@ class SleeveBook:
             self.sync()
             return result
 
+    def apply_paper_dividend_distribution(self, distribution, *, policy, as_of):
+        with self.ledger.atomic():
+            self.sync()
+            result = self.ledger.apply_paper_dividend_distribution(
+                self.account_id, distribution, policy=policy, as_of=as_of
+            )
+            self.sync()
+            return result
+
     def apply_account_fee(
         self, fee: AccountFee, amounts: dict[str, D], *, attribution_source_hash: str
     ):
