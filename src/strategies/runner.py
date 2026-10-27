@@ -104,7 +104,10 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
         raise StrategyInputError("universe was not effective and available at signal cutoff")
     if universe.data_snapshot_id not in {dataset.snapshot_hash, *context.data_snapshot_ids}:
         raise StrategyInputError("universe/data snapshot mismatch")
-    if regime.status != "available" or regime.context.as_of != context.as_of or regime.trained_through >= date:
+    regime_fit_eligible = (regime.trained_through < date if regime.trained_through is not None else False)
+    if current_sampling and regime.vintage_policy == 'captured-vintage-at-fit-1':
+        regime_fit_eligible = regime.fitted_at is not None and regime.fitted_at < context.as_of
+    if regime.status != "available" or regime.context.as_of != context.as_of or not regime_fit_eligible:
         raise StrategyInputError("an eligible authoritative HMM result is required")
     if not holdings.index.is_unique or not np.isfinite(holdings).all() or (holdings < 0).any() or holdings.sum() > 1+1e-10:
         raise StrategyInputError("finite, unique, long-only sleeve holdings required")

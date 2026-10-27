@@ -92,12 +92,13 @@ class MacroRawObservation(VersionedContract):
     at: UtcTimestamp
     # Exact scalar locations in immutable normalized source data, never supplied numbers.
     values: tuple[tuple[str, SourceBinding], ...]
+    availability_policy: Literal['decision-time-vintage-1','captured-vintage-at-fit-1'] = 'decision-time-vintage-1'
 
     @model_validator(mode='after')
     def fields(self):
         if len(self.values) != 7 or set(dict(self.values)) != set(RAW_MACRO_FIELDS):
             raise ValueError('all seven distinct raw macro fields required')
-        if any(source.available_at > self.at for _, source in self.values):
+        if self.availability_policy == 'decision-time-vintage-1' and any(source.available_at > self.at for _, source in self.values):
             raise ValueError('future macro source binding')
         return self
 
@@ -111,6 +112,7 @@ class MacroDatasetSpec(VersionedContract):
     raw: tuple[MacroRawObservation, ...] = Field(min_length=200)
     sources: tuple[FrozenEvidence, ...] = Field(min_length=1)
     max_source_age_seconds: int = Field(default=7*86400, gt=0, le=31*86400)
+    availability_policy: Literal['decision-time-vintage-1','captured-vintage-at-fit-1'] = 'decision-time-vintage-1'
 
     @model_validator(mode='after')
     def chronological(self):
@@ -119,6 +121,10 @@ class MacroDatasetSpec(VersionedContract):
             raise ValueError('unique chronological macro session cutoffs required')
         if dates[-1] > self.breadth_snapshot.context.as_of:
             raise ValueError('macro date exceeds snapshot cutoff')
+        if any(o.availability_policy != self.availability_policy for o in self.raw):
+            raise ValueError('macro row/dataset availability policies differ')
+        if any(source.available_at>self.breadth_snapshot.context.as_of for observation in self.raw for _,source in observation.values):
+            raise ValueError('macro source binding exceeds the actual dataset cutoff')
         return self
 
 
@@ -128,11 +134,17 @@ class CausalMacroData:
     available_at: pd.Series
     source_ids: pd.Series
     evidence: tuple[EvidenceRecord, ...]
+    availability_policy: str = 'decision-time-vintage-1'
 
 
-def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore) -> CausalMacroData:
+def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore, *,
+                              availability_policy: str = 'decision-time-vintage-1') -> CausalMacroData:
     """Rebuild the exact eight signals, including real historical constituent breadth."""
     from src.data.calendars import sessions
+    if availability_policy != spec.availability_policy:
+        raise RegistryError('explicit macro materialization/dataset availability policies differ')
+    captured = availability_policy == 'captured-vintage-at-fit-1'
+    cutoff = spec.breadth_snapshot.context.as_of
     calendar = sessions(spec.raw[0].at.date().isoformat(),spec.raw[-1].at.date().isoformat(),calendar=spec.calendar)
     if [o.at.date().isoformat() for o in spec.raw] != list(calendar):
         raise RegistryError('macro observation schedule has missing or nonexchange sessions')
@@ -166,7 +178,7 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore) -> C
         key = (pd.Timestamp(bar.closed_at), bar.instrument.instrument_id)
         if key in bar_sources:
             raise RegistryError('ambiguous breadth price convention')
-        records[bar.evidence_id].require_available(bar.closed_at)
+        records[bar.evidence_id].require_available(cutoff if captured else bar.closed_at)
         if bar.market_type != 'equity':
             raise RegistryError('US breadth requires equity constituents')
         prices.loc[key] = float(bar.close)
@@ -193,7 +205,7 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore) -> C
             raw.loc[observation.at, name] = value
             ids.add(source.evidence_id)
         eligible = [u for u in spec.universes if u.universe_version == spec.universe_version
-                    and u.effective_at <= observation.at and u.available_at <= observation.at]
+                    and u.effective_at <= observation.at and u.available_at <= (cutoff if captured else observation.at)]
         if not eligible:
             raise RegistryError('historical breadth membership missing')
         selected = max(eligible, key=lambda u: (u.effective_at, u.available_at))
@@ -201,7 +213,7 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore) -> C
             raise RegistryError('historical constituent price coverage missing')
         membership.loc[observation.at, list(selected.instrument_ids)] = True
         for source in spec.universe_sources:
-            if source.available_at <= observation.at:
+            if source.available_at <= (cutoff if captured else observation.at):
                 ids.add(source.evidence_id)
         ids.update(source_id for (at, _), source_id in bar_sources.items() if at == observation.at)
         row_ids.append(ids)
@@ -217,13 +229,13 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore) -> C
     for offset in range(start, len(dates)):
         ids = tuple(sorted(set().union(*row_ids[max(0, offset-199):offset+1])))
         for key in ids:
-            records[key].require_available(dates[offset].to_pydatetime())
+            records[key].require_available(cutoff if captured else dates[offset].to_pydatetime())
         source_ids.append(ids)
         availability.append(max(max(records[key].available_at, records[key].requested_as_of or records[key].available_at) for key in ids))
     signals = signals.iloc[start:]
     used = set().union(*map(set, source_ids))
     return CausalMacroData(signals, pd.Series(availability,index=signals.index),
-                           pd.Series(source_ids,index=signals.index), tuple(records[key] for key in sorted(used)))
+                           pd.Series(source_ids,index=signals.index), tuple(records[key] for key in sorted(used)),availability_policy)
 
 
 class CausalRegimeArtifact(VersionedContract):

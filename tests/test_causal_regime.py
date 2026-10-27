@@ -142,3 +142,71 @@ def test_actual_breadth_and_yield_slope_no_proxy():
     assert signals.iloc[-1].yield_curve_10y2y == -1
     prices.iloc[-2, 0] = np.nan
     assert np.isnan(macro_signals(raw, prices, membership).iloc[-2].sp500_breadth)
+
+
+def test_explicit_current_captured_hmm_never_backdates_state_or_duration(inputs,tmp_path):
+    capture=inputs.raw.index[-1]+pd.Timedelta(hours=1)
+    records=tuple(e.model_copy(update={'available_at':capture.to_pydatetime(),
+        'ingested_at':capture.to_pydatetime()}) for e in inputs.records)
+    available=pd.Series(capture,index=inputs.raw.index)
+    fit_context=RunContext(run_id='captured',mode='paper',as_of=capture+pd.Timedelta(minutes=1),
+        config_hash='0'*64,code_version='test')
+    detector=CausalHMMRegimeDetector(tmp_path/'captured.sqlite',normalization_window=20,n_init=1,n_iter=10,
+        confidence_threshold=0)
+    training=inputs.raw.iloc[:140]
+    kwargs=dict(available_at=available.iloc[:140],evidence=records[:140],source_ids=inputs.sources.iloc[:140])
+    with pytest.raises(RegimeError,match='historical decision'):
+        detector.fit(training,fit_context,**kwargs)
+    detector.fit(training,fit_context,availability_policy='captured-vintage-at-fit-1',**kwargs)
+    original_index=inputs.raw.index.copy()
+    provenance=dict(available_at=available,evidence=records,source_ids=inputs.sources)
+    decision=fit_context.model_copy(update={'as_of':fit_context.as_of+pd.Timedelta(minutes=1)})
+    result=detector.predict(inputs.raw,decision,availability_policy='captured-vintage-at-fit-1',**provenance)
+    assert result.status=='available' and result.vintage_policy=='captured-vintage-at-fit-1'
+    assert result.fitted_at==fit_context.as_of and result.observation_at==inputs.raw.index[-1]
+    assert result.context==decision
+    pd.testing.assert_index_equal(original_index,inputs.raw.index)
+    with detector._db() as db:
+        row=db.execute('SELECT timestamp,held_count,alpha FROM regime_events').fetchone()
+    assert pd.Timestamp(row[0])==decision.as_of  # No state claimed at an old source date.
+    next_context=decision.model_copy(update={'as_of':decision.as_of+pd.Timedelta(minutes=1)})
+    repeated=detector.predict(inputs.raw,next_context,availability_policy='captured-vintage-at-fit-1',**provenance)
+    with detector._db() as db:
+        later=db.execute('SELECT timestamp,held_count,alpha FROM regime_events ORDER BY timestamp').fetchall()
+    assert later[-1][1:]==row[1:] and repeated.state_probabilities==result.state_probabilities
+    path=detector.save(tmp_path/'captured.joblib')
+    restarted=CausalHMMRegimeDetector(tmp_path/'captured.sqlite').load(path)
+    assert restarted.availability_policy=='captured-vintage-at-fit-1'
+    assert restarted.predict(inputs.raw,next_context,availability_policy='captured-vintage-at-fit-1',**provenance)==repeated
+    with pytest.raises(RegimeError,match='historical decision'):
+        restarted.predict(inputs.raw,next_context,**provenance)
+    with pytest.raises((ValueError,RegimeError),match='historical decision|unavailable|future'):
+        CausalHMMRegimeDetector(tmp_path/'past.sqlite',normalization_window=20).fit(training,
+            fit_context.model_copy(update={'as_of':training.index[-1].to_pydatetime()}),
+            availability_policy='captured-vintage-at-fit-1',**kwargs)
+    with pytest.raises(RegimeError,match='stale'):
+        restarted.predict(inputs.raw,next_context.model_copy(update={'as_of':next_context.as_of+pd.Timedelta(days=8)}),
+            availability_policy='captured-vintage-at-fit-1',**provenance)
+
+
+def test_captured_latest_fitted_posterior_is_only_available_after_real_fit(inputs,tmp_path):
+    capture=inputs.raw.index[-1]+pd.Timedelta(hours=1)
+    records=tuple(e.model_copy(update={'available_at':capture.to_pydatetime(),
+        'ingested_at':capture.to_pydatetime()}) for e in inputs.records)
+    available=pd.Series(capture,index=inputs.raw.index)
+    context=RunContext(run_id='current-posterior',mode='paper',as_of=capture,
+        config_hash='0'*64,code_version='test')
+    detector=CausalHMMRegimeDetector(tmp_path/'posterior.sqlite',normalization_window=20,n_init=1,n_iter=5,
+        confidence_threshold=0)
+    proof=dict(available_at=available,evidence=records,source_ids=inputs.sources,
+        availability_policy='captured-vintage-at-fit-1')
+    detector.fit(inputs.raw,context,**proof)
+    with pytest.raises(RegimeError,match='strictly precede'):
+        detector.predict(inputs.raw,context,**proof)
+    decision=context.model_copy(update={'as_of':context.as_of+pd.Timedelta(minutes=1)})
+    result=detector.predict(inputs.raw,decision,**proof)
+    assert result.status=='available' and result.held_reason=='captured_training_posterior'
+    assert result.observation_at==inputs.raw.index[-1] and result.fitted_at==context.as_of
+    assert result.context.as_of>result.fitted_at>result.observation_at
+    with detector._db() as db:
+        assert db.execute('SELECT held_count FROM regime_events').fetchone()[0]==1

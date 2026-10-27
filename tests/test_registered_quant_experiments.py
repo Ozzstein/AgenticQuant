@@ -280,3 +280,54 @@ def test_regime_later_decision_clocks_reuse_exact_causal_session(experiment,tmp_
     with pytest.raises(RegistryError,match='macro session is stale'):
         build_regime_artifact(registry,store,plan.inputs,dataset=strict,variant=artifact.variant,
             fitted_at=artifact.fitted_at,inference_times=(times[1],),work_dir=tmp_path/'stale')
+
+
+def test_captured_macro_keeps_actual_vintages_and_historical_membership(experiment):
+    _,store,_,_,artifact,_=experiment
+    original=artifact.dataset
+    captured_at=original.breadth_snapshot.context.as_of+timedelta(days=1)
+    snapshot_context=original.breadth_snapshot.context.model_copy(update={'as_of':captured_at+timedelta(minutes=1),'mode':'paper'})
+    keys={source.evidence_id:source.evidence_id+'-current-capture' for source in original.sources}
+    records,envelopes={},[]
+    history=original.universes[0].model_copy(update={'available_at':captured_at})
+    for source in original.sources:
+        old=store.get(source.evidence_id)
+        raw=store.raw(source.evidence_id)
+        normalized=store.normalized(source.evidence_id,as_of=original.breadth_snapshot.context.as_of)
+        if source.evidence_id==original.universe_sources[0].evidence_id:
+            normalized=[history.model_dump(mode='json')]
+            raw=canonical_bytes(normalized)
+        record=old.record.model_copy(update={'evidence_id':keys[source.evidence_id],
+            'raw_hash':digest(raw),'ingested_at':captured_at,'available_at':captured_at,'requested_as_of':captured_at})
+        envelope=store.put(record,raw,kind=old.kind,logical_key=keys[source.evidence_id],normalized=normalized)
+        records[source.evidence_id]=record
+        envelopes.append(FrozenEvidence(evidence_id=record.evidence_id,envelope_hash=envelope.content_hash()))
+    snapshot=MarketSnapshot(context=snapshot_context,
+        bars=tuple(b.model_copy(update={'evidence_id':keys[b.evidence_id]}) for b in original.breadth_snapshot.bars),
+        evidence=tuple(records[e.evidence_id] for e in original.breadth_snapshot.evidence))
+    observations=tuple(MacroRawObservation(at=o.at,availability_policy='captured-vintage-at-fit-1',
+        values=tuple((name,source.model_copy(update={'evidence_id':keys[source.evidence_id],
+            'available_at':captured_at})) for name,source in o.values)) for o in original.raw)
+    dataset=MacroDatasetSpec(breadth_snapshot=snapshot,universe_version=original.universe_version,
+        universes=(history,),universe_sources=tuple(s.model_copy(update={'evidence_id':keys[s.evidence_id],
+            'available_at':captured_at}) for s in original.universe_sources),raw=observations,
+        sources=tuple(envelopes),availability_policy='captured-vintage-at-fit-1')
+    with pytest.raises(RegistryError,match='availability policies differ'):
+        materialize_macro_dataset(dataset,store)
+    current=materialize_macro_dataset(dataset,store,availability_policy='captured-vintage-at-fit-1')
+    baseline=materialize_macro_dataset(original,store)
+    pd.testing.assert_frame_equal(current.signals,baseline.signals)
+    assert (current.available_at==captured_at).all()
+    assert (current.available_at>current.signals.index).all()
+    assert current.availability_policy=='captured-vintage-at-fit-1'
+    assert dataset.raw[0].at==original.raw[0].at
+    # A current membership observation cannot become historical breadth, even
+    # under current-vintage training. Its effective date remains authoritative.
+    current_history=history.model_copy(update={'effective_at':captured_at})
+    payload=[current_history.model_dump(mode='json')]
+    envelope=archive(store,'current-members-only',payload,captured_at)
+    changed=dataset.model_copy(update={'universes':(current_history,),
+        'universe_sources':(SourceBinding(evidence_id='current-members-only',available_at=captured_at),),
+        'sources':(*dataset.sources,FrozenEvidence(evidence_id='current-members-only',envelope_hash=envelope.content_hash()))})
+    with pytest.raises(RegistryError,match='historical breadth membership missing'):
+        materialize_macro_dataset(changed,store,availability_policy='captured-vintage-at-fit-1')

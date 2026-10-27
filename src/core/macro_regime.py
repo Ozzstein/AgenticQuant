@@ -631,6 +631,9 @@ class CausalRegimeResult(VersionedContract):
     input_hash: Sha256
     evidence_ids: tuple[str, ...]
     held_reason: str | None = None
+    vintage_policy: Literal['decision-time-vintage-1','captured-vintage-at-fit-1'] = 'decision-time-vintage-1'
+    observation_at: UtcTimestamp | None = None
+    fitted_at: UtcTimestamp | None = None
 
     @model_validator(mode="after")
     def coherent_result(self):
@@ -646,6 +649,12 @@ class CausalRegimeResult(VersionedContract):
                 raise ValueError("state probabilities must sum to one")
             if self.regime is not None and not math.isclose(self.confidence, probabilities[self.regime], abs_tol=1e-8):
                 raise ValueError("confidence is the probability of the effective state")
+        if self.observation_at is not None and self.observation_at > self.context.as_of:
+            raise ValueError('regime observation exceeds the actual decision cutoff')
+        if self.vintage_policy == 'captured-vintage-at-fit-1' and self.status=='available' and (
+            self.fitted_at is None or self.fitted_at >= self.context.as_of or self.observation_at is None
+        ):
+            raise ValueError('captured regime needs actual prior fit and observation clocks')
         return self
 
 
@@ -706,6 +715,7 @@ class CausalHMMRegimeDetector:
         self.fitted_at = None
         self.training_hash = None
         self.training_code_version = None
+        self.availability_policy = 'decision-time-vintage-1'
         self.labels = {}
         self.initial_alpha = None
         with self._db() as db:
@@ -721,14 +731,17 @@ class CausalHMMRegimeDetector:
         finally:
             connection.close()
 
-    def _validate(self, raw, available_at, context, evidence, source_ids):
+    def _validate(self, raw, available_at, context, evidence, source_ids, availability_policy='decision-time-vintage-1'):
+        if availability_policy not in ('decision-time-vintage-1','captured-vintage-at-fit-1'):
+            raise RegimeError('unknown explicit macro availability policy')
+        captured=availability_policy=='captured-vintage-at-fit-1'
         if tuple(raw.columns) != MACRO_SIGNALS or not isinstance(raw.index, pd.DatetimeIndex) or raw.index.tz is None:
             raise RegimeError("all eight ordered macro signals require timezone-aware dates")
         if raw.empty or not raw.index.is_unique or not raw.index.is_monotonic_increasing or raw.index[-1] > context.as_of:
             raise RegimeError("invalid/future macro history")
         if not isinstance(available_at, pd.Series) or not available_at.index.equals(raw.index) or available_at.isna().any():
             raise RegimeError("aligned explicit macro availability required")
-        if any(pd.Timestamp(t).tzinfo is None for t in available_at) or (available_at > raw.index).any():
+        if any(pd.Timestamp(t).tzinfo is None for t in available_at) or (available_at > (context.as_of if captured else raw.index)).any():
             raise RegimeError("macro observation was unavailable at its historical decision time")
         if not evidence:
             raise RegimeError("macro evidence provenance required")
@@ -742,7 +755,7 @@ class CausalHMMRegimeDetector:
                 raise RegimeError("every macro row requires immutable source IDs")
             for source_id in ids:
                 record = records[source_id]
-                record.require_available(timestamp.to_pydatetime())
+                record.require_available(context.as_of if captured else timestamp.to_pydatetime())
                 if available_at.loc[timestamp] < max(record.available_at, record.requested_as_of or record.available_at):
                     raise RegimeError("macro availability precedes its source availability")
 
@@ -772,9 +785,10 @@ class CausalHMMRegimeDetector:
         return np.asarray(result)
 
     def fit(self, raw: pd.DataFrame, context: RunContext, *, available_at: pd.Series,
-            evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series):
+            evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series,
+            availability_policy: str = 'decision-time-vintage-1'):
         from hmmlearn.hmm import GaussianHMM
-        self._validate(raw, available_at, context, evidence, source_ids)
+        self._validate(raw, available_at, context, evidence, source_ids,availability_policy)
         normalized = self.preprocess(raw)
         if len(normalized) < 80:
             raise RegimeError("insufficient eligible macro training history after one-year normalization")
@@ -795,6 +809,7 @@ class CausalHMMRegimeDetector:
         self.labels = {int(state): label for state, label in zip(np.argsort(risk), ("risk_on", "neutral", "risk_off", "crisis"))}
         self.trained_through, self.fitted_at = raw.index[-1].to_pydatetime(), context.as_of
         self.training_code_version = context.code_version
+        self.availability_policy = availability_policy
         self.training_hash = self._input_hash(raw, evidence, available_at, source_ids)
         self.initial_alpha = self._forward(normalized.values)[-1]
         self.model_hash = digest(canonical_bytes({"means": best.means_.tolist(), "covars": best.covars_.tolist(),
@@ -803,16 +818,23 @@ class CausalHMMRegimeDetector:
                                                  "min_days": self.min_days, "threshold": self.threshold,
                                                  "risk_weights": self.risk_weights, "n_init": self.n_init, "n_iter": self.n_iter,
                                                  "fitted_at": self.fitted_at.isoformat(), "code_version": context.code_version,
+                                                 "availability_policy":availability_policy,
                                                  "implementation": "causal-gaussian-hmm-1"}))
         return self
 
     def predict(self, raw: pd.DataFrame, context: RunContext, *, available_at: pd.Series,
-                evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series) -> CausalRegimeResult:
-        self._validate(raw, available_at, context, evidence, source_ids)
+                evidence: tuple[EvidenceRecord, ...], source_ids: pd.Series,
+                availability_policy: str = 'decision-time-vintage-1',
+                max_observation_age_seconds: int = 7*86400) -> CausalRegimeResult:
+        self._validate(raw, available_at, context, evidence, source_ids,availability_policy)
         input_hash = self._input_hash(raw, evidence, available_at, source_ids)
         if self.model is None:
             return CausalRegimeResult(context=context, status="insufficient_data", input_hash=input_hash,
                                      evidence_ids=tuple(e.evidence_id for e in evidence), held_reason="model_unavailable")
+        if availability_policy != self.availability_policy:
+            raise RegimeError('macro fit/inference availability policies differ; use a distinct model namespace')
+        if availability_policy=='captured-vintage-at-fit-1':
+            return self._predict_captured(raw,context,available_at,evidence,source_ids,max_observation_age_seconds)
         normalized = self.preprocess(raw)
         training_raw = raw.loc[:self.trained_through]
         if self._input_hash(training_raw, evidence, available_at.loc[training_raw.index], source_ids.loc[training_raw.index]) != self.training_hash:
@@ -875,6 +897,90 @@ class CausalHMMRegimeDetector:
                 raise RegimeError("no eligible regime inference events")
         return result.model_copy(update={"context": context})
 
+    def _predict_captured(self, raw, context, available_at, evidence, source_ids, max_age):
+        """Filter known vintages, persisting only the actual observation clock.
+
+        Economic session times remain unchanged. Repeated operating cycles do
+        not create an emission or advance duration when no new row is present.
+        """
+        import json
+
+        if context.as_of <= self.fitted_at:
+            raise RegimeError('model fit must strictly precede captured decision')
+        if max_age<=0 or (pd.Timestamp(context.as_of)-raw.index[-1]).total_seconds()>max_age:
+            raise RegimeError('captured macro observation is stale at actual decision')
+        training=raw.loc[:self.trained_through]
+        if self._input_hash(training,evidence,available_at.loc[training.index],source_ids.loc[training.index])!=self.training_hash:
+            raise RegimeError('training history changed or is incomplete')
+        normalized=self.preprocess(raw)
+        if normalized.empty or normalized.index[-1]!=raw.index[-1]:
+            raise RegimeError('captured macro inference coverage is incomplete')
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            stored=db.execute('SELECT timestamp,input_hash,result,alpha,held_count FROM regime_events WHERE model_hash=? ORDER BY timestamp',
+                              (self.model_hash,)).fetchall()
+            if stored and pd.Timestamp(stored[-1][0])>context.as_of:
+                raise RegimeError('regime state cannot move backwards')
+            for _,previous_hash,payload,_,_ in stored:
+                previous=CausalRegimeResult.model_validate_json(payload)
+                if previous.vintage_policy!='captured-vintage-at-fit-1' or previous.observation_at is None:
+                    raise RegimeError('regime namespace mixes availability policies')
+                prefix=raw.loc[:previous.observation_at]
+                if self._input_hash(prefix,evidence,available_at.loc[prefix.index],source_ids.loc[prefix.index])!=previous_hash:
+                    raise RegimeError('historical regime inputs changed; use a new model/run namespace')
+            last=stored[-1] if stored else None
+            previous=CausalRegimeResult.model_validate_json(last[2]) if last else None
+            after=pd.Timestamp(previous.observation_at if previous else self.trained_through)
+            pending=normalized.loc[normalized.index>after]
+            if not pending.index.equals(raw.index[raw.index>after]):
+                raise RegimeError('macro coverage gap in captured inference history')
+            alpha=np.array(json.loads(last[3])) if last else self.initial_alpha.copy()
+            effective=previous.regime if previous else None
+            held=last[4] if last else 0
+            reason=previous.held_reason if previous else None
+
+            def accept(probability):
+                nonlocal effective,held,reason
+                winner=int(probability.argmax())
+                proposed=self.labels[winner]
+                reason=None
+                if probability[winner]<self.threshold:
+                    reason='confidence_below_threshold'
+                elif effective is not None and proposed!=effective and held<self.min_days:
+                    reason='minimum_duration'
+                else:
+                    if proposed!=effective:
+                        held=0
+                    effective=proposed
+                held=held+1 if effective is not None else 0
+
+            if not last and pending.empty:
+                # This is the actual fitted posterior, not a fabricated OOS
+                # emission or a state claimed available at its old session.
+                accept(alpha)
+                if reason is None:
+                    reason='captured_training_posterior'
+            for _,row in pending.iterrows():
+                alpha=self._forward([row.values],alpha)[0]
+                accept(alpha)
+            used={key for ids in source_ids for key in ids}
+            actual_records=tuple(e for e in evidence if e.evidence_id in used)
+            input_hash=self._input_hash(raw,actual_records,available_at,source_ids)
+            probabilities=tuple((self.labels[i],float(p)) for i,p in enumerate(alpha))
+            result=CausalRegimeResult(context=context,status='available' if effective is not None else 'insufficient_data',
+                regime=effective,state_probabilities=probabilities,
+                confidence=dict(probabilities)[effective] if effective else None,
+                model_hash=self.model_hash,trained_through=self.trained_through,fitted_at=self.fitted_at,
+                input_hash=input_hash,evidence_ids=tuple(sorted(used)),held_reason=reason,
+                observation_at=raw.index[-1].to_pydatetime(),vintage_policy='captured-vintage-at-fit-1')
+            if last and pd.Timestamp(last[0])==context.as_of:
+                if input_hash!=last[1]:
+                    raise RegimeError('same decision cutoff cannot change captured regime inputs')
+                return previous.model_copy(update={'context':context})
+            db.execute('INSERT INTO regime_events VALUES (?,?,?,?,?,?)',
+                (self.model_hash,context.as_of.isoformat(),input_hash,result.model_dump_json(),json.dumps(alpha.tolist()),held))
+        return result
+
     def save(self, path: str | Path):
         import importlib.metadata
         import os
@@ -899,6 +1005,7 @@ class CausalHMMRegimeDetector:
             "schema_version": "1.0", "implementation": "causal-gaussian-hmm-1", "model_hash": self.model_hash,
             "payload_hash": payload_hash, "training_input_hash": self.training_hash,
             "trained_through": self.trained_through.isoformat(), "fitted_at": self.fitted_at.isoformat(),
+            "availability_policy":self.availability_policy,
             "code_version": self.training_code_version, "signals": MACRO_SIGNALS,
             "environment": {name: importlib.metadata.version(name) for name in ("hmmlearn", "numpy", "pandas", "scipy")},
             "normalization_window": self.window, "minimum_duration": self.min_days,
