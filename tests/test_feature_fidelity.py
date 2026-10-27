@@ -62,3 +62,17 @@ def test_duplicate_dates_multi_symbol_preserve_alignment(mock_config):
 def test_unordered_history_fails():
     with pytest.raises(ExpressionError, match="chronological"):
         evaluate_expression("Mean($close,3)", panel().iloc[::-1])
+
+
+def test_static_validator_shares_exact_engine_without_observations():
+    from src.data.features.expressions import validate_expression
+    from src.strategies.specification import baseline_specs
+    fields = ('open','high','low','close','volume','pe','roic','free_cash_flow','benchmark_close','funding_rate','open_interest','btc_dominance')
+    for spec in baseline_specs().values():
+        for feature in spec.features:
+            assert validate_expression(feature.expression, fields) is None
+    for expression in ('Ref(close,-1)', 'close.shift(-2)', 'close.mean()', 'close.rolling(20,center=True).mean()',
+                       '__import__("os")', 'unknown_field / close', 'close ** close', 'close.rolling(0).mean()',
+                       'close.ewm(alpha=0).mean()', '0/0'):
+        with pytest.raises(ExpressionError):
+            validate_expression(expression, fields)

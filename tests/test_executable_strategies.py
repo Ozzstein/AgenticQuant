@@ -192,7 +192,7 @@ def test_netted_sleeves_veto_and_omitted_holdings():
     veto.attrs = {**output.attrs,'strategy':'veto_sleeve'}
     veto.loc[ids[0],'action'] = 'VETO'
     current = pd.Series({ids[0]:.01})
-    merged = blend_sleeves({'agent_consensus':output,'veto_sleeve':veto},{'agent_consensus':.5,'veto_sleeve':.5},snapshot.context,current_weights=current)
+    merged = blend_sleeves({'agent_consensus':output,'veto_sleeve':veto},{'agent_consensus':.5,'veto_sleeve':.5},snapshot.context,current_weights=current,current_contributions={'agent_consensus':current*.5,'veto_sleeve':current*.5})
     assert merged.loc[ids[0],'target_weight'] == .01
     assert sum(merged.attrs['contributions'][s][ids[0]] for s in merged.attrs['contributions']) == pytest.approx(.01)
     with pytest.raises(StrategyInputError, match='omitted'):
@@ -247,3 +247,21 @@ def test_sampling_gaps_never_generate_annualized_sharpe(tmp_path):
     metrics = store.metrics(as_of=end,annualization=365)
     assert not metrics.loc['gap','complete']
     assert np.isnan(metrics.loc['gap','sharpe'])
+
+
+def test_blend_preserves_passive_holdings_and_rejects_mixed_provenance():
+    spec = baseline_specs()['agent_consensus']
+    snapshot, dataset = market_inputs(spec)
+    args = args_for(snapshot, dataset)
+    key = args['universe'].instrument_ids[0]
+    args['holdings'] = pd.Series({key:.04})
+    output = evaluate_strategy(spec,dataset,snapshot.context,**args)  # unavailable consensus => ABSTAIN
+    merged = blend_sleeves({'agent_consensus':output},{'agent_consensus':.1},snapshot.context,current_weights=args['holdings'])
+    assert merged.loc[key,'target_weight'] == .04  # changing allocation does not liquidate ABSTAIN
+    assert merged.attrs['sleeve_provenance']['agent_consensus'] == output.attrs
+    assert merged.attrs['data_snapshot_hash'] == dataset.snapshot_hash
+    other = output.copy(deep=True)
+    other.attrs = {**output.attrs,'strategy':'other','universe_version':'different'}
+    with pytest.raises(StrategyInputError,match='mismatched'):
+        blend_sleeves({'agent_consensus':output,'other':other},{'agent_consensus':.5,'other':.5},snapshot.context,
+                      current_weights=args['holdings'],current_contributions={'agent_consensus':args['holdings'],'other':pd.Series(dtype=float)})

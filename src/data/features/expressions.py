@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import operator
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -179,13 +180,37 @@ class _Interpreter:
         raise ExpressionError(f"unsupported series method: {name}")
 
 
-def evaluate_expression(expression: str, frame: pd.DataFrame) -> pd.Series:
+def _parse_expression(expression: str):
     if not isinstance(expression, str) or not expression.strip() or len(expression) > 8192:
         raise ExpressionError("empty or oversized factor expression")
+    tree = ast.parse(re.sub(r"\$([a-zA-Z][a-zA-Z0-9_]*)", r"\1", expression), mode="eval")
+    if len(list(ast.walk(tree))) > 512:
+        raise ExpressionError("expression exceeds operation budget")
+    return tree
+
+
+def validate_expression(expression: str, allowed_fields: Iterable[str]) -> None:
+    """Check exact syntax/operator/field/causality rules without market samples.
+
+    Zero-length typed Series are symbolic operands for the same interpreter;
+    there are no generated observations or substituted numeric specifications.
+    This validates structure, not data coverage or empirical numerical quality.
+    """
+    fields = tuple(allowed_fields)
+    if not fields or len(fields) > 4096 or len(set(fields)) != len(fields) or any(not isinstance(field, str) or not field for field in fields):
+        raise ExpressionError("unique explicit allowed fields required")
     try:
-        tree = ast.parse(re.sub(r"\$([a-zA-Z][a-zA-Z0-9_]*)", r"\1", expression), mode="eval")
-        if len(list(ast.walk(tree))) > 512:
-            raise ExpressionError("expression exceeds operation budget")
+        interpreter = _Interpreter(pd.DataFrame({field: pd.Series(dtype=float) for field in fields}))
+        interpreter.series(interpreter.visit(_parse_expression(expression).body))
+    except ExpressionError:
+        raise
+    except (ValueError, TypeError, SyntaxError, RecursionError, KeyError, OverflowError, ZeroDivisionError) as exc:
+        raise ExpressionError(f"invalid factor expression: {type(exc).__name__}") from None
+
+
+def evaluate_expression(expression: str, frame: pd.DataFrame) -> pd.Series:
+    try:
+        tree = _parse_expression(expression)
         result = pd.Series(np.nan, index=frame.index, dtype=float)
         for positions in panel_groups(frame):
             part = frame.iloc[positions]
@@ -195,5 +220,5 @@ def evaluate_expression(expression: str, frame: pd.DataFrame) -> pd.Series:
         return result.replace([np.inf, -np.inf], np.nan)
     except ExpressionError:
         raise
-    except (ValueError, TypeError, SyntaxError, RecursionError, KeyError, OverflowError) as exc:
+    except (ValueError, TypeError, SyntaxError, RecursionError, KeyError, OverflowError, ZeroDivisionError) as exc:
         raise ExpressionError(f"invalid factor expression: {type(exc).__name__}") from None
