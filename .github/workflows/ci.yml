@@ -26,7 +26,9 @@ jobs:
       - run: uv pip check
       - run: uv run --locked --no-sync ruff check src scripts
       - run: uv run --locked --no-sync python scripts/check_environment.py
-      - run: uv run --locked --no-sync pytest tests/ -m 'not integration' --disable-socket
+      # Async provider boundaries use Unix self-pipes/socketpairs; external TCP
+      # remains disabled. Local MCP explicitly allows loopback in its own test.
+      - run: uv run --locked --no-sync pytest tests/ -m 'not integration' --disable-socket --allow-unix-socket
       - run: uv build
 
   container:
