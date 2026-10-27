@@ -12,8 +12,8 @@ import math
 import os
 import tempfile
 from collections import defaultdict
-from datetime import datetime, timedelta
-from decimal import ROUND_DOWN, Decimal
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -28,7 +28,6 @@ from src.domain.portfolio import (
     ExecutionBar,
     FillPolicy,
     InstrumentRisk,
-    OrderIntent,
     PortfolioSnapshot,
     PortfolioTarget,
     RankedSignal,
@@ -250,6 +249,8 @@ def recorded_replay_inputs(ledger: PortfolioLedger, result: ReplayResult) -> dic
             decision_recipe_hash=manifest["decision_recipe_hash"],
             decision_times=[datetime.fromisoformat(t) for t in manifest["decision_times"]],
         )
+    if "sleeve_capital" in manifest:
+        inputs["sleeve_capital"] = {k: D(v) for k, v in manifest["sleeve_capital"].items()}
     return inputs
 
 
@@ -289,9 +290,34 @@ def recorded_decisions(ledger: PortfolioLedger, result: ReplayResult) -> list[Re
     return records
 
 
+def _same_replay_economics(left: ReplayResult, right: ReplayResult) -> bool:
+    # Fold/IC annotations belong to research/WF and may be added after replay.
+    # Every input and economic value remains independently reproducible.
+    fields = (
+        "schema_version",
+        "engine",
+        "run_id",
+        "account_id",
+        "manifest",
+        "metrics",
+        "daily_returns",
+        "timestamps",
+        "equity_curve",
+        "snapshots",
+        "trades",
+        "decisions",
+        "reconciliation",
+    )
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
 def verify_decision_trace(ledger: PortfolioLedger, result: ReplayResult, inputs: dict) -> None:
     records = recorded_decisions(ledger, result)
     if "decision_recipe_hash" not in result.manifest:
+        if "sleeve_capital" in result.manifest:
+            reproduced = PortfolioReplay(":memory:").run(**inputs)
+            if not _same_replay_economics(reproduced, result):
+                raise BacktestError("sleeve target replay does not reproduce exact economics")
         return
     if [r.target for r in records if r.target is not None] != inputs["targets"]:
         raise BacktestError("generated target events differ from recorded callback outputs")
@@ -306,7 +332,7 @@ def verify_decision_trace(ledger: PortfolioLedger, result: ReplayResult, inputs:
     reproduced = PortfolioReplay(":memory:").run(
         **{**inputs, "targets": None, "decision_provider": checked_provider}
     )
-    if reproduced.model_dump(mode="json") != result.model_dump(mode="json"):
+    if not _same_replay_economics(reproduced, result):
         raise BacktestError("recorded decision trace does not reproduce exact replay economics")
 
 
@@ -374,6 +400,10 @@ def require_matching_inputs(result: ReplayResult, inputs: dict) -> None:
     if times is None:
         times = sorted({b.closed_at for b in inputs["bars"]})
     expected["valuation_times"] = [t.isoformat() for t in times]
+    if "sleeve_capital" in result.manifest:
+        expected["sleeve_capital"] = {
+            k: str(D(str(v))) for k, v in (inputs.get("sleeve_capital") or {}).items()
+        }
     if "decision_recipe_hash" in result.manifest:
         expected["decision_recipe_hash"] = inputs.get("decision_recipe_hash")
         expected["decision_times"] = [t.isoformat() for t in inputs.get("decision_times") or []]
@@ -447,6 +477,7 @@ class PortfolioReplay:
         decision_provider: DecisionProvider | None = None,
         decision_times: list[datetime] | None = None,
         decision_recipe_hash: str | None = None,
+        sleeve_capital: dict[str, Decimal] | None = None,
     ) -> ReplayResult:
         if (
             context.mode != "backtest"
@@ -600,6 +631,10 @@ class PortfolioReplay:
                 decision_recipe_hash=decision_recipe_hash,
                 decision_times=[at.isoformat() for at in decision_times],
             )
+        if sleeve_capital is not None:
+            manifest["sleeve_capital"] = {
+                k: str(D(str(v))) for k, v in sorted(sleeve_capital.items())
+            }
         manifest_hash = canonical_hash(manifest)
         request_manifest, request_hash = dict(manifest), manifest_hash
         # Finished evidence is immutable, including SQLite file bytes. An
@@ -684,6 +719,11 @@ class PortfolioReplay:
                             record.model_dump_json(),
                         )
             engine = PaperExecution(ledger, account.account_id, policy, risk)
+            sleeve_book = None
+            if sleeve_capital is not None:
+                from src.execution.sleeves import SleeveBook
+
+                sleeve_book = SleeveBook(ledger, account.account_id).initialize(sleeve_capital)
             if not ledger.history(account.account_id):
                 ledger.snapshot(account.account_id, account.opened_at, risk.max_price_age_seconds)
             timeline = defaultdict(lambda: defaultdict(list))
@@ -737,6 +777,13 @@ class PortfolioReplay:
                         snapshot = ledger.snapshot(
                             account.account_id, at, risk.max_price_age_seconds, persist=False
                         )
+                        if sleeve_book is not None:
+                            snapshot = PortfolioSnapshot.model_validate(
+                                {
+                                    **snapshot.model_dump(),
+                                    "sleeves": sleeve_book.snapshot(at, risk.max_price_age_seconds),
+                                }
+                            )
                         target = decision_provider(at, snapshot)
                         if target is not None:
                             # model_copy can bypass Pydantic validation; validate
@@ -767,6 +814,8 @@ class PortfolioReplay:
                         self._rebalance(engine, target, meta, identities, per_instrument)
                     if event["valuation"]:
                         ledger.snapshot(account.account_id, at, risk.max_price_age_seconds)
+                        if sleeve_book is not None:
+                            sleeve_book.snapshot(at, risk.max_price_age_seconds)
             # The evaluation ends with marked holdings; unfilled remainders expire,
             # without fabricated liquidation proceeds or resetting fold cash.
             with ledger.atomic():
@@ -778,6 +827,13 @@ class PortfolioReplay:
                         "evaluation cutoff",
                     )
             reconciliation = ledger.reconcile(account.account_id)
+            if sleeve_book is not None:
+                reconciliation["sleeves"] = {
+                    name: view.model_dump(mode="json")
+                    for name, view in sleeve_book.snapshot(
+                        context.as_of, risk.max_price_age_seconds
+                    ).items()
+                }
             snapshots = ledger.history(account.account_id)
             nav = [float(s.nav) for s in snapshots]
             metrics = performance_metrics(nav, samples_per_year)
@@ -952,80 +1008,41 @@ class PortfolioReplay:
         for pending in ledger.pending(account):
             ledger.cancel(account, pending["intent"].intent_id, at, "superseded target")
         snap = ledger.snapshot(account, at, engine.risk_policy.max_price_age_seconds, persist=False)
-        held = {p.instrument.instrument_id: p.quantity for p in snap.positions}
-        weights = {w.instrument.instrument_id: w.weight for w in target.weights}
-        candidates, diagnostics = [], []
-        for key in sorted(set(held) | set(weights)):
-            mark_row = ledger.db.execute(
-                "SELECT payload FROM marks WHERE account=? AND instrument=?", (account, key)
-            ).fetchone()
-            if mark_row is None or key not in metadata:
-                raise BacktestError(f"target lacks observed price or risk metadata: {key}")
-            from src.domain.portfolio import PriceMark
+        from src.domain.portfolio import PriceMark
+        from src.execution.routing import target_to_intents
 
-            mark = PriceMark.model_validate_json(mark_row[0])
-            if (
-                not 0
-                <= (at - mark.as_of).total_seconds()
-                <= engine.risk_policy.max_price_age_seconds
-            ):
-                raise BacktestError(f"target uses stale/future price: {key}")
-            meta = metadata[key]
-            unit = mark.price * mark.fx_rate
-            desired = (snap.nav * weights.get(key, D(0)) / unit / meta.lot_size).to_integral_value(
-                rounding=ROUND_DOWN
-            ) * meta.lot_size
-            delta = desired - held.get(key, D(0))
-            if delta == 0:
-                continue
+        marks = {
+            mark.instrument.instrument_id: mark
+            for mark in (
+                PriceMark.model_validate_json(row[0])
+                for row in ledger.db.execute(
+                    "SELECT payload FROM marks WHERE account=?", (account,)
+                )
+            )
+        }
+        if target.sleeve_contributions:
+            from src.execution.sleeves import SleeveBook
+
+            candidates = SleeveBook(ledger, account).net_target(
+                target,
+                metadata,
+                engine.policy,
+                max_price_age_seconds=engine.risk_policy.max_price_age_seconds,
+            )
+        else:
+            candidates = target_to_intents(
+                target,
+                snap,
+                marks,
+                metadata,
+                engine.policy,
+                max_price_age_seconds=engine.risk_policy.max_price_age_seconds,
+            )
+        diagnostics = []
+        for order in candidates:
+            key = order.instrument.instrument_id
             if not any(b.opened_at > at and b.tradable for b in bars[key]):
                 raise BacktestError(f"target has no subsequent executable event: {key}")
-            side = "buy" if delta > 0 else "sell"
-            qty = abs(delta)
-            # Leave room for explicitly modeled fees/slippage at allocation boundary.
-            price = mark.price * (
-                1 + engine.policy.slippage_bps / 10000 * (1 if side == "buy" else -1)
-            )
-            if side == "buy":
-                bps = (
-                    engine.policy.crypto_cost_bps
-                    if identities[key].asset_class == "crypto"
-                    else engine.policy.equity_cost_bps
-                )
-                budget = snap.nav * weights.get(key, D(0))
-                qty = max(
-                    D(0),
-                    (
-                        (budget - engine.policy.minimum_commission)
-                        / (
-                            price * mark.fx_rate * (1 + bps / 10000)
-                            + engine.policy.commission_per_unit
-                        )
-                        - held.get(key, D(0))
-                    )
-                    / meta.lot_size,
-                )
-                qty = qty.to_integral_value(rounding=ROUND_DOWN) * meta.lot_size
-            if qty <= 0:
-                continue
-            intent = OrderIntent(
-                intent_id=target.target_id + ":" + key,
-                account_id=account,
-                run_id=target.target_id,
-                instrument=identities[key],
-                side=side,
-                quantity=qty,
-                decision_at=at,
-                eligible_at=at + timedelta(microseconds=1),
-                reference_price=price,
-                fx_rate=mark.fx_rate,
-                estimated_fee=engine.policy.fee(identities[key], qty, price, mark.fx_rate),
-                strategy_id=target.strategy_id,
-            )
-            candidates.append(intent)
-        for order in sorted(
-            candidates, key=lambda o: (o.side != "sell", o.instrument.instrument_id)
-        ):
             try:
                 engine.submit(order, metadata)
                 outcome = "submitted"

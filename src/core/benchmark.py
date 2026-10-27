@@ -87,6 +87,7 @@ def require_matched_replay(baseline: ReplayResult, candidate: ReplayResult, *, c
         "cost_convention",
     ]
     if cost_variant:
+        keys.append("sleeve_capital")
         if "decision_recipe_hash" in baseline.manifest:
             # Holdings change with fees; rerun the same causal recipe, not its
             # old target stream. Each candidate's actual trace is verified.

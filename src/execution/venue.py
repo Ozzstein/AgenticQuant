@@ -197,6 +197,85 @@ class VenueExecution:
             raise LedgerError("intent has no durable venue route")
         return dict(row)
 
+    def prepare_target(self, target, metadata, *, sleeve_book=None):
+        """Canonical target sizing/netting into this account's durable outbox.
+
+        Superseded remote orders must be reconciled/cancelled by the caller;
+        preparation never assumes their reserved cash has been released.
+        """
+        from src.domain.portfolio import OrderIntent, PortfolioTarget, PriceMark
+        from src.execution.routing import target_to_intents
+
+        target = PortfolioTarget.model_validate(target.model_dump())
+        event_id = "venue-target:" + target.target_id
+        with self.ledger.atomic():
+            previous = self.ledger.db.execute(
+                "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, event_id)
+            ).fetchone()
+            if previous:
+                payload = json.loads(previous[0])
+                if payload["target"] != target.model_dump(mode="json"):
+                    raise LedgerError("venue target identity changed")
+                intents = [OrderIntent.model_validate(o) for o in payload["intents"]]
+            else:
+                if self.ledger.pending(self.account_id):
+                    raise LedgerError("reconcile/cancel outstanding orders before target routing")
+                if target.sleeve_contributions:
+                    if (
+                        sleeve_book is None
+                        or sleeve_book.ledger is not self.ledger
+                        or sleeve_book.account_id != self.account_id
+                    ):
+                        raise LedgerError(
+                            "blended target requires its canonical account SleeveBook"
+                        )
+                    intents = sleeve_book.net_target(
+                        target,
+                        metadata,
+                        self.fill_policy,
+                        max_price_age_seconds=self.risk_policy.max_price_age_seconds,
+                    )
+                else:
+                    if sleeve_book is not None:
+                        raise LedgerError("sleeve book requires explicit target contributions")
+                    snapshot = self.ledger.snapshot(
+                        self.account_id,
+                        target.decision_at,
+                        self.risk_policy.max_price_age_seconds,
+                        persist=False,
+                    )
+                    marks = {
+                        m.instrument.instrument_id: m
+                        for m in (
+                            PriceMark.model_validate_json(row[0])
+                            for row in self.ledger.db.execute(
+                                "SELECT payload FROM marks WHERE account=?", (self.account_id,)
+                            )
+                        )
+                    }
+                    intents = target_to_intents(
+                        target,
+                        snapshot,
+                        marks,
+                        metadata,
+                        self.fill_policy,
+                        max_price_age_seconds=self.risk_policy.max_price_age_seconds,
+                    )
+                self.ledger.record_event(
+                    self.account_id,
+                    event_id,
+                    json.dumps(
+                        {
+                            "target": target.model_dump(mode="json"),
+                            "intents": [o.model_dump(mode="json") for o in intents],
+                        },
+                        sort_keys=True,
+                    ),
+                )
+        # Remote rules/funding reads happen outside the plan transaction. Each
+        # intent's own prepare still atomically rechecks aggregate pending risk.
+        return [self.prepare(order, metadata, as_of=target.decision_at) for order in intents]
+
     @staticmethod
     def client_id(account_id: str, intent_id: str) -> str:
         # Kraken accepts UUIDs, Binance up to 36 characters, Alpaca up to 48.

@@ -268,3 +268,33 @@ def test_wrong_target_clock_is_not_accepted(tmp_path):
     inputs = inputs_for(lambda at, snapshot: target(at + timedelta(seconds=1), 1))
     with pytest.raises(BacktestError, match="actual decision clock"):
         PortfolioReplay(tmp_path / "wrong.sqlite3").run(**inputs)
+
+
+def test_research_annotations_do_not_replace_or_break_economic_trace_verification(tmp_path):
+    inputs = inputs_for(
+        lambda at, snapshot: target(at, D(".5")) if not snapshot.positions else None
+    )
+    path = tmp_path / "annotations.sqlite3"
+    result = PortfolioReplay(path).run(**inputs)
+    enriched = result.model_copy(
+        update={
+            "cross_sectional_ic": {"2024-01-02": 0.17},
+            "diagnostics": ["actual research annotation"],
+        }
+    )
+    ledger = PortfolioLedger(path)
+    ledger.save_run(
+        result.account_id,
+        result.run_id,
+        {
+            "status": "complete",
+            "manifest": result.manifest,
+            "manifest_hash": canonical_hash(result.manifest),
+            "result": enriched.model_dump(mode="json"),
+        },
+    )
+    ledger.close()
+    assert (
+        ValidationSuite().validate(enriched, ledger_path=path, _accounting_only=True).overall
+        == "RELIABLE"
+    )

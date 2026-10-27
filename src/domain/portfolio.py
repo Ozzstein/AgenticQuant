@@ -12,13 +12,28 @@ from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from src.domain.common import Instrument, NonEmptyString, UtcTimestamp, VersionedContract
 
 Positive = Annotated[Decimal, Field(gt=0)]
 NonNegative = Annotated[Decimal, Field(ge=0)]
 Fraction = Annotated[Decimal, Field(ge=0, le=1)]
+
+
+class _FrozenDict(dict):
+    """JSON-compatible immutable nested contract mapping."""
+
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("contract mappings are immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
 
 
 class AccountSpec(VersionedContract):
@@ -152,6 +167,13 @@ class Holding(VersionedContract):
     # None denotes unknown age in an older externally supplied snapshot.
     opened_at: UtcTimestamp | None = None
 
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.opened_at is None:
+            result.pop("opened_at", None)
+        return result
+
 
 class PortfolioSnapshot(VersionedContract):
     account_id: NonEmptyString
@@ -164,6 +186,34 @@ class PortfolioSnapshot(VersionedContract):
     fees: NonNegative
     turnover_today: NonNegative
     positions: tuple[Holding, ...] = ()
+    sleeves: dict[str, "SleeveSnapshot"] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def immutable_sleeves(self):
+        object.__setattr__(self, "sleeves", _FrozenDict(self.sleeves))
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if not self.sleeves:
+            result.pop("sleeves", None)
+        return result
+
+
+class SleeveSnapshot(VersionedContract):
+    """Reconciled reporting projection; never an independent execution account."""
+
+    portfolio: PortfolioSnapshot
+    net_capital_flow: Decimal
+    last_rebalanced_at: UtcTimestamp | None
+    source_hash: str
+    source_event_ids: tuple[str, ...]
+    # Exact remainder of finite Decimal portfolio valuation, assigned once.
+    valuation_rounding: Decimal = Decimal(0)
+
+
+PortfolioSnapshot.model_rebuild()
 
 
 class InstrumentRisk(VersionedContract):
@@ -242,6 +292,13 @@ class PortfolioTarget(VersionedContract):
     artifact_version: NonEmptyString
     data_snapshot_id: NonEmptyString
     weights: tuple[TargetWeight, ...]
+    preserve_quantities: dict[str, NonNegative] = Field(default_factory=dict)
+    # Each contribution is a fraction of total book NAV, after sleeve blending.
+    sleeve_contributions: dict[str, dict[str, Fraction]] = Field(default_factory=dict)
+    sleeve_sources: dict[str, str] = Field(default_factory=dict)
+    # Preserve actions carry exact actual quantity, avoiding float weight/lot
+    # round trips. These may only preserve existing ownership, never create it.
+    sleeve_preserve_quantities: dict[str, dict[str, NonNegative]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def coherent(self):
@@ -249,7 +306,58 @@ class PortfolioTarget(VersionedContract):
             raise ValueError("duplicate target instrument")
         if sum((w.weight for w in self.weights), Decimal(0)) > 1:
             raise ValueError("target is leveraged")
+        if set(self.preserve_quantities) - {w.instrument.instrument_id for w in self.weights}:
+            raise ValueError("preserved quantities must be represented in target weights")
+        if self.preserve_quantities and self.sleeve_contributions:
+            raise ValueError("blended targets require sleeve-specific preservation")
+        if self.sleeve_contributions:
+            if set(self.sleeve_contributions) != set(self.sleeve_sources):
+                raise ValueError("each sleeve contribution needs its immutable source hash")
+            for source in self.sleeve_sources.values():
+                if len(source) != 64 or any(c not in "0123456789abcdef" for c in source):
+                    raise ValueError("sleeve source must be SHA256")
+            weights = {w.instrument.instrument_id: w.weight for w in self.weights}
+            keys = set(weights) | {k for c in self.sleeve_contributions.values() for k in c}
+            if any(
+                sum((c.get(k, Decimal(0)) for c in self.sleeve_contributions.values()), Decimal(0))
+                != weights.get(k, Decimal(0))
+                for k in keys
+            ):
+                raise ValueError(
+                    "sleeve contributions must sum exactly to aggregate target weights"
+                )
+        elif self.sleeve_sources:
+            raise ValueError("sleeve sources require actual contributions")
+        if set(self.sleeve_preserve_quantities) - self.sleeve_contributions.keys() or any(
+            set(values) - self.sleeve_contributions[name].keys()
+            for name, values in self.sleeve_preserve_quantities.items()
+        ):
+            raise ValueError("preserved quantities require their sleeve contributions")
+        object.__setattr__(
+            self,
+            "sleeve_contributions",
+            _FrozenDict({k: _FrozenDict(v) for k, v in self.sleeve_contributions.items()}),
+        )
+        object.__setattr__(self, "preserve_quantities", _FrozenDict(self.preserve_quantities))
+        object.__setattr__(self, "sleeve_sources", _FrozenDict(self.sleeve_sources))
+        object.__setattr__(
+            self,
+            "sleeve_preserve_quantities",
+            _FrozenDict({k: _FrozenDict(v) for k, v in self.sleeve_preserve_quantities.items()}),
+        )
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if not self.preserve_quantities:
+            result.pop("preserve_quantities", None)
+        if not self.sleeve_contributions:
+            result.pop("sleeve_contributions", None)
+            result.pop("sleeve_sources", None)
+        if not self.sleeve_preserve_quantities:
+            result.pop("sleeve_preserve_quantities", None)
+        return result
 
 
 class UniverseEligibility(VersionedContract):
