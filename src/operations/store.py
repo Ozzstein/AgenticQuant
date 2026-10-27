@@ -226,14 +226,40 @@ class OperationsStore:
     def status(self, run_id: str) -> dict:
         manifest = self.manifest(run_id)
         with self.connection() as db:
-            stages = {stage:dict(row) if (row:=self._latest(db,run_id,stage)) else {'state':'pending'}
-                      for stage in manifest.stages}
+            return self._status(db, run_id, manifest)
+
+    def _status(self, db, run_id: str, manifest: RunManifest) -> dict:
+        stages = {stage:dict(row) if (row:=self._latest(db,run_id,stage)) else {'state':'pending'}
+                  for stage in manifest.stages}
         states = {row['state'] for row in stages.values()}
         status = 'completed' if states == {'completed'} else ('failed' if 'failed' in states else
                   'uncertain' if 'uncertain' in states else 'in_progress' if 'running' in states else 'pending')
         return {'run_id':run_id,'kind':manifest.kind,'account_id':manifest.context.account_id,
                 'as_of':manifest.context.as_of.isoformat(),'manifest_hash':manifest.content_hash(),
                 'status':status,'stages':stages}
+
+    def account_runs(self, account_id: str, kind: str = 'paper_cycle') -> list[dict]:
+        """Complete account history, newest admission first, in one read snapshot.
+
+        Recovery/attribution must not depend on a global dashboard page limit.
+        Caller retains its account lock when using this read to admit new work.
+        """
+        if not account_id or kind not in ('paper_cycle','research','data','evaluation'):
+            raise ValueError('explicit account and known operation kind required')
+        with self.connection() as db:
+            db.execute('BEGIN')
+            rows = db.execute("""SELECT id,hash,manifest FROM runs
+                WHERE json_extract(manifest,'$.context.account_id')=?
+                  AND json_extract(manifest,'$.kind')=? ORDER BY created_at DESC,id DESC""",
+                (account_id,kind)).fetchall()
+            results = []
+            for row in rows:
+                manifest = RunManifest.model_validate_json(row['manifest'])
+                if (manifest.content_hash()!=row['hash'] or manifest.context.run_id!=row['id']
+                        or manifest.context.account_id!=account_id or manifest.kind!=kind):
+                    raise OperationError('account operation manifest identity differs')
+                results.append(self._status(db,row['id'],manifest))
+            return results
 
     def recent(self, limit: int = 100) -> list[dict]:
         if not 1 <= limit <= 1000:

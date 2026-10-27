@@ -121,3 +121,21 @@ def test_alerts_dedupe_and_timeout_requires_delivery_reconciliation(tmp_path):
     with pytest.raises(RecoveryRequired):
         store.deliver(key,'email',sender)
     assert len(sent) == 1
+
+
+def test_account_history_is_not_truncated_by_other_accounts(tmp_path):
+    store, manifest = admitted(tmp_path, ('data',))
+    store.stage('cycle-one', 'data', {}, lambda: {'anchor':'original'})
+    payload = {'snapshot':'actual-fixture-identity'}
+    for number in range(1002):
+        context = manifest.context.model_copy(update={'run_id':f'other-{number}', 'account_id':'paper:other'})
+        store.admit(manifest.model_copy(update={'context':context}), payload)
+    own = manifest.model_copy(update={'context':manifest.context.model_copy(update={'run_id':'cycle-two'})})
+    store.admit(own, payload)
+    assert not any(r['run_id']=='cycle-one' for r in store.recent(1000))
+    history = OperationsStore(store.path,read_only=True).account_runs('paper:test')
+    assert [(r['run_id'],r['status']) for r in history] == [('cycle-two','pending'),('cycle-one','completed')]
+    assert history[1]['stages']['data']['output_hash'] == store.status('cycle-one')['stages']['data']['output_hash']
+    assert store.account_runs('paper:test',kind='research') == []
+    with pytest.raises(ValueError):
+        store.account_runs('',kind='paper_cycle')
