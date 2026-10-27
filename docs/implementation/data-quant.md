@@ -76,3 +76,12 @@ PYTHONPATH="$PWD" /tmp/quantagentlab-data-quant-venv/bin/python -m pytest tests/
 ```
 
 Outstanding full-plan evidence: real authenticated provider/MCP calls and deployed pins, historical US/crypto coverage including delistings and adjustments, complete text-feature integration, native RD-Agent US overlay and independent validation, D causal HMM/six strategies/allocation, actual historical comparative performance and all I prospective gates. No paid accounts, live orders, external deployments, push or PR were performed.
+
+## Offline socket permissions checkpoint
+
+The actual MCP protocol test permits only localhost/127.0.0.1 connections via `pytest.mark.allow_hosts` and asserts external TCP is rejected. The async permission test uses a per-test Unix-only fixture (pytest-socket 0.7 has no Unix-only marker) and asserts AF_INET socket creation is rejected. No suite-wide network exception is introduced.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" /tmp/quantagentlab-data-quant-venv/bin/python -m pytest tests/test_direct_evidence_adapters.py tests/test_mcp_local_transport.py tests/test_mcp_evidence_permissions.py -q --disable-socket --basetemp=/tmp/quantagentlab-data-quant-socket
+# 23 passed; actual MCP SDK localhost transport, offline provider parsing, permission/cache/budget invariants
+```

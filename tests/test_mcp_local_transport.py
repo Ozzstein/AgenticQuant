@@ -10,7 +10,15 @@ from src.data.evidence.store import EvidenceStore, canonical_bytes, digest
 from src.domain.common import RunContext
 
 
-def test_actual_sdk_http_evidence_roundtrip(tmp_path):
+@pytest.mark.allow_hosts(["localhost", "127.0.0.1"])
+def test_actual_sdk_http_evidence_roundtrip(tmp_path, pytestconfig):
+    # The host allowlist also permits creation of the event loop's AF_UNIX
+    # socketpair. Outbound TCP connect remains restricted to loopback.
+    if pytestconfig.pluginmanager.hasplugin("socket"):
+        import pytest_socket
+        with socket.socket() as blocked:
+            with pytest.raises(pytest_socket.SocketConnectBlockedError):
+                blocked.connect(("203.0.113.1", 443))
     pytest.importorskip("mcp.server.mcpserver")
     import uvicorn
     from mcp.server.mcpserver import MCPServer

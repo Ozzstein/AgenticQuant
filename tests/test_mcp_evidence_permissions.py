@@ -36,6 +36,22 @@ def test_manifest_cannot_authorize_mutation():
         ServerManifest(**{**manifest().model_dump(exclude={"tools"}), "tools": (tool,)})
 
 
+@pytest.fixture
+def unix_event_loop_only(pytestconfig):
+    """pytest-socket 0.7 has no per-test Unix marker; keep TCP disabled."""
+    if pytestconfig.pluginmanager.hasplugin("socket"):
+        import pytest_socket
+
+        # Replace the plugin's already installed guard instead of subclassing
+        # it (the earlier guard would continue rejecting AF_UNIX).
+        pytest_socket.enable_socket()
+        pytest_socket.disable_socket(allow_unix_socket=True)
+        import socket
+        with pytest.raises(pytest_socket.SocketBlockedError):
+            socket.socket(socket.AF_INET)
+
+
+@pytest.mark.usefixtures("unix_event_loop_only")
 def test_schema_verification_cache_and_budget(tmp_path):
     async def run():
         manager = MCPManager(EvidenceStore(tmp_path / "db"), (manifest(),))
