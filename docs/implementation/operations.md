@@ -347,3 +347,30 @@ The root editable package was reinstalled offline from the existing lock after
 the full audit; the installed `aiquant` entry point now imports packaged scripts
 without a PYTHONPATH override. No dependency versions changed. Root source Ruff
 and diff checks pass. These focused counts are not a whole-repository green claim.
+### Dated dominance refresh and configured credentials
+
+The closed CoinGecko dispatch now exposes `current_dominance` (optional
+`tier="demo"|"pro"`) and `dominance_history` (`tier="pro"`, optional `days` from
+`"1"|"7"|"14"|"30"|"90"|"180"|"365"|"max"`, default `"30"`). These are global
+tasks without an instrument. Keys, URLs and arbitrary method arguments cannot
+enter task manifests. Both history requests share the admitted HTTP budget and
+the adapter writes to the underlying EvidenceStore, retaining its measured
+capture clocks and exact transitive source hashes. A historical observation
+captured now does not become historical decision-time knowledge.
+
+Read transports now consume the documented application configuration:
+`AIQUANT_FMP_API_KEY`, `AIQUANT_FRED_API_KEY`, `AIQUANT_FINNHUB_API_KEY`,
+`AIQUANT_COINGECKO_API_KEY`, `AIQUANT_SEC_USER_AGENT`, and nested
+`AIQUANT_ALPACA__API_KEY` / `AIQUANT_ALPACA__API_SECRET`. Existing unprefixed vendor
+environment names remain fallback inputs. Resolved values enter only the native
+transport; they are not added to tasks, evidence manifests or operation receipts.
+
+Root integration on top of `0f0cac9`: 87 tests passed in 10.83s with
+`tests/test_operations_dominance_refresh.py`, `test_operations_refresh.py`,
+`test_operations_operating_refresh.py`, `test_operations_crypto_refresh.py`,
+`test_config_resolution.py`, and `test_crypto_dominance_bindings.py`, using
+`--disable-socket --allow-unix-socket`. Actual adapters/stores ran over synthetic
+HTTP transport. Evidence includes both native origins/header keys, exact cap
+ratios and clocks, request-budget exhaustion retaining raw evidence, immutable
+restart, configured FMP/Alpaca credentials and receipt redaction. No provider
+access or source sufficiency is claimed.

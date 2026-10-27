@@ -93,6 +93,60 @@ def test_actual_adapter_refresh_restarts_without_refetch_and_advances_clock(tmp_
         client.close()
 
 
+def test_configured_key_reaches_fmp_without_entering_persisted_receipts(tmp_path, monkeypatch):
+    calls, client = real_adapter_fetcher(monkeypatch)
+    monkeypatch.setenv('AIQUANT_FMP_API_KEY', 'configured-read-only-fixture')
+    ops = OperationsStore(tmp_path/'ops.db')
+    store = EvidenceStore(tmp_path/'sources.db')
+    ctx = context()
+    try:
+        receipt = RefreshService(ops, store, fetcher=refresh._fetch).run(
+            RefreshPlan(context=ctx, scheduled_for=ctx.as_of, tasks=(task(),)))
+        assert len(calls) == 1
+        assert calls[0].url.params['apikey'] == 'configured-read-only-fixture'
+        assert 'fixture-not-real' not in str(calls[0].url)
+        source = receipt['result']['fetches']['financials']['sources'][0]
+        envelope = store.get(source['evidence_id'])
+        assert 'configured-read-only-fixture' not in envelope.model_dump_json()
+        assert 'configured-read-only-fixture' not in json.dumps(receipt)
+    finally:
+        client.close()
+
+
+def test_nested_alpaca_credentials_reach_actual_read_transport_only(tmp_path, monkeypatch):
+    calls = []
+
+    def response(request):
+        calls.append(request)
+        return httpx.Response(200, json={'id': 'fixture-account', 'cash': '125.50'})
+
+    client = httpx.Client(transport=httpx.MockTransport(response))
+    monkeypatch.setattr(refresh, 'ReadHTTP',
+        lambda provider, base, **kw: ReadHTTP(provider, base, client=client, **kw))
+    monkeypatch.setenv('AIQUANT_ALPACA__API_KEY', 'configured-fixture-id')
+    monkeypatch.setenv('AIQUANT_ALPACA__API_SECRET', 'configured-fixture-secret')
+    monkeypatch.setenv('ALPACA_API_KEY', 'legacy-fixture-id')
+    monkeypatch.setenv('ALPACA_API_SECRET', 'legacy-fixture-secret')
+    ctx = context()
+    store = EvidenceStore(tmp_path/'sources.db')
+    selected = FetchTask(task_id='account', provider='alpaca', operation='account')
+    try:
+        receipt = RefreshService(OperationsStore(tmp_path/'ops.db'), store,
+                                 fetcher=refresh._fetch).run(
+            RefreshPlan(context=ctx, scheduled_for=ctx.as_of, tasks=(selected,)))
+        assert len(calls) == 1 and calls[0].method == 'GET'
+        assert calls[0].url.host == 'paper-api.alpaca.markets'
+        assert calls[0].url.path == '/v2/account' and not calls[0].url.query
+        assert calls[0].headers['APCA-API-KEY-ID'] == 'configured-fixture-id'
+        assert calls[0].headers['APCA-API-SECRET-KEY'] == 'configured-fixture-secret'
+        for source in receipt['result']['fetches']['account']['sources']:
+            envelope = store.get(source['evidence_id'])
+            assert 'configured-fixture-secret' not in envelope.model_dump_json()
+        assert 'configured-fixture-secret' not in json.dumps(receipt)
+    finally:
+        client.close()
+
+
 def test_unavailable_required_data_cannot_complete_or_silently_retry(tmp_path):
     ops=OperationsStore(tmp_path/'ops.db')
     store=EvidenceStore(tmp_path/'sources.db')

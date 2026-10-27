@@ -27,6 +27,7 @@ from src.domain.common import (
     VersionedContract,
     _utc,
 )
+from src.operations.credentials import provider_credential
 from src.operations.store import OperationError, OperationsStore, RunManifest, canonical, digest
 
 
@@ -85,6 +86,8 @@ class FetchTask(VersionedContract):
                 raise ValueError('Binance reference needs explicit instrument, native network and integer window')
         if self.provider=='ccxt' and self.operation in ('funding','open_interest'):
             _derivative_arguments(self,arguments)
+        if self.provider=='coingecko' and self.operation in ('current_dominance','dominance_history'):
+            _dominance_arguments(self,arguments)
         if self.provider=='mcp':
             if self.mcp_manifest is None:
                 raise ValueError('MCP fetch needs an exact deployed manifest')
@@ -200,6 +203,21 @@ def _derivative_arguments(task,arguments):
     return result
 
 
+def _dominance_arguments(task,arguments):
+    from src.data.adapters.coingecko_context import DAYS, ORIGINS
+
+    allowed={'tier','days'} if task.operation=='dominance_history' else {'tier'}
+    tier=arguments.get('tier','demo')
+    if task.instrument is not None or set(arguments)-allowed or not isinstance(tier,str) or tier not in ORIGINS:
+        raise ValueError('dominance requires closed global scope and explicit supported tier')
+    if task.operation=='dominance_history' and (
+        tier!='pro' or not isinstance(arguments.get('days','30'),str)
+        or arguments.get('days','30') not in DAYS
+    ):
+        raise ValueError('dominance history requires Pro tier and a documented days string')
+    return dict(arguments)
+
+
 def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
     """Closed dispatch; neither models nor MCP servers choose endpoints/methods."""
     capture=CaptureStore(store)
@@ -224,30 +242,42 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
         elif task.provider=='fmp':
             from src.data.adapters.fundamentals import FMPAdapter
             args=_arguments(task,('year','quarter','limit'))
-            adapter=FMPAdapter(capture,os.getenv('FMP_API_KEY'),http=http('fmp','https://financialmodelingprep.com/stable'))
+            adapter=FMPAdapter(capture,provider_credential('fmp'),http=http('fmp','https://financialmodelingprep.com/stable'))
             result=adapter.fetch(task.operation,instrument(),context,ingested_at=now,**args)
         elif task.provider=='fred' and task.operation=='observations':
             from src.data.adapters.fundamentals import FredAdapter
             args=_arguments(task,('series_id','start','end','units'),('series_id','start','end'))
-            adapter=FredAdapter(capture,os.getenv('FRED_API_KEY'),http=http('fred','https://api.stlouisfed.org/fred'))
+            adapter=FredAdapter(capture,provider_credential('fred'),http=http('fred','https://api.stlouisfed.org/fred'))
             result=adapter.observations(context=context,ingested_at=now,**args)
         elif task.provider=='finnhub' and task.operation=='news':
             from src.data.adapters.context import FinnhubAdapter
             args=_arguments(task,('start','end'),('start','end'))
-            adapter=FinnhubAdapter(capture,os.getenv('FINNHUB_API_KEY'),http=http('finnhub','https://finnhub.io/api/v1'))
+            adapter=FinnhubAdapter(capture,provider_credential('finnhub'),http=http('finnhub','https://finnhub.io/api/v1'))
             result=adapter.news(instrument(),context,ingested_at=now,**args)
         elif task.provider=='coingecko' and task.operation in ('global','token'):
             from src.data.adapters.context import CoinGeckoAdapter
-            adapter=CoinGeckoAdapter(capture,http=http('coingecko','https://api.coingecko.com/api/v3'))
+            adapter=CoinGeckoAdapter(capture,api_key=provider_credential('coingecko'),http=http('coingecko','https://api.coingecko.com/api/v3'))
             if task.operation=='global':
                 _arguments(task,())
                 result=adapter.global_context(context,ingested_at=now)
             else:
                 args=_arguments(task,('coin_id',),('coin_id',))
                 result=adapter.token(args['coin_id'],instrument(),context,ingested_at=now)
+        elif task.provider=='coingecko' and task.operation in ('current_dominance','dominance_history'):
+            from src.data.adapters.coingecko_context import ORIGINS
+            from src.data.adapters.context import CoinGeckoAdapter
+
+            args=_dominance_arguments(task,json.loads(task.arguments_json))
+            tier=args.pop('tier','demo')
+            # Native source manifests bind the adapter's own measured clocks.
+            # CaptureStore would rewrite the transitive envelope identities.
+            adapter=CoinGeckoAdapter(store,tier=tier,api_key=provider_credential('coingecko'),
+                                    http=http('coingecko',ORIGINS[tier]))
+            result=(adapter.current_dominance(context) if task.operation=='current_dominance'
+                    else adapter.dominance_history(context,**args))
         elif task.provider=='sec' and task.operation in ('submissions','filing'):
             from src.data.adapters.context import SECAdapter
-            adapter=SECAdapter(capture,os.getenv('SEC_USER_AGENT',''),http=http('sec','https://data.sec.gov',min_interval=.2))
+            adapter=SECAdapter(capture,provider_credential('sec'),http=http('sec','https://data.sec.gov',min_interval=.2))
             if task.operation=='submissions':
                 args=_arguments(task,('cik',),('cik',))
                 result=adapter.submissions(instrument=instrument(),context=context,ingested_at=now,**args)
@@ -269,7 +299,7 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
             if not isinstance(paper,bool):
                 raise ProviderError('alpaca','paper_flag_must_be_boolean')
             base='https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
-            adapter=AlpacaReadAdapter(capture,os.getenv('ALPACA_API_KEY'),os.getenv('ALPACA_API_SECRET'),paper=paper,http=http('alpaca',base))
+            adapter=AlpacaReadAdapter(capture,provider_credential('alpaca_key'),provider_credential('alpaca_secret'),paper=paper,http=http('alpaca',base))
             result=adapter.inspect(task.operation,context,ingested_at=now)
         elif task.provider=='yfinance' and task.operation=='bars':
             from src.data.adapters.market import YFinanceAdapter

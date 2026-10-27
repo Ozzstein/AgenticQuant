@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 
 from src.data.adapters.base import ProviderError, ReadHTTP
@@ -17,6 +16,7 @@ from src.data.adapters.operating import (
 )
 from src.data.evidence.service import EvidenceService
 from src.domain.common import Instrument
+from src.operations.credentials import provider_credential
 
 
 def load_operating_sources(operations, store, refresh_run_id):
@@ -250,8 +250,8 @@ def fetch_operating(task, context, store):
 
                 adapter = AlpacaDividendAdapter(
                     store,
-                    os.getenv("ALPACA_API_KEY", ""),
-                    os.getenv("ALPACA_API_SECRET", ""),
+                    provider_credential("alpaca_key"),
+                    provider_credential("alpaca_secret"),
                     data_http=transports.make("alpaca", "https://data.alpaca.markets"),
                     trading_http=transports.make("alpaca", "https://paper-api.alpaca.markets"),
                 )
@@ -260,9 +260,9 @@ def fetch_operating(task, context, store):
             elif family == "alpaca":
                 adapter = AlpacaOperatingAdapter(
                     store,
-                    os.getenv("ALPACA_API_KEY", ""),
-                    os.getenv("ALPACA_API_SECRET", ""),
-                    fmp_key=os.getenv("FMP_API_KEY", ""),
+                    provider_credential("alpaca_key"),
+                    provider_credential("alpaca_secret"),
+                    fmp_key=provider_credential("fmp"),
                     data_http=transports.make("alpaca", "https://data.alpaca.markets"),
                     trading_http=transports.make("alpaca", "https://paper-api.alpaca.markets"),
                     profile_http=transports.make("fmp", "https://financialmodelingprep.com"),

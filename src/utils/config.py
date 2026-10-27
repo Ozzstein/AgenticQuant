@@ -280,6 +280,8 @@ class AppConfig(BaseSettings):
     finnhub_api_key: str = ""
     coingecko_api_key: str = ""
     fmp_api_key: str = ""
+    fred_api_key: str = ""
+    sec_user_agent: str = ""
 
     qlib: QlibConfig = Field(default_factory=QlibConfig)
     agents: AgentConfig = Field(default_factory=AgentConfig)
