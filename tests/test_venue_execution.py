@@ -58,14 +58,14 @@ def test_real_paper_venue_round_trip_partial_duplicate_and_restart(tmp_path):
     ledger, adapter, engine, order = setup(tmp_path)
     engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
     assert engine.dispatch(order.intent_id, as_of=order.eligible_at)["state"] == "new"
-    opening = bar(at=order.eligible_at, opening_volume="500")
+    opening = bar(at=order.eligible_at + timedelta(seconds=1), opening_volume="500")
     fills = adapter.advance_open(opening, {A.instrument_id: metadata()})
     assert sum(f.quantity for f in fills) == 5
-    assert engine.reconcile_all(as_of=order.eligible_at)[0]["state"] == "partial"
+    assert engine.reconcile_all(as_of=opening.opened_at)[0]["state"] == "partial"
     assert ledger.quantity(order.account_id, A.instrument_id) == 5
-    engine.reconcile_all(as_of=order.eligible_at)
+    engine.reconcile_all(as_of=opening.opened_at)
     assert len(ledger.fills(order.account_id)) == 1
-    assert engine.reconcile_balances(as_of=order.eligible_at)["reconciled"]
+    assert engine.reconcile_balances(as_of=opening.opened_at)["reconciled"]
     ledger.close()
     ledger, adapter, engine, same = setup(tmp_path)
     assert engine.prepare(same, {A.instrument_id: metadata()}, as_of=T)["state"] == "partial"
@@ -240,8 +240,9 @@ engine.dispatch(order.intent_id,as_of=order.eligible_at)
         ).fetchone()[0]
         == 1
     )
-    adapter.advance_open(bar(at=order.eligible_at), {A.instrument_id: metadata()})
-    engine.reconcile_all(as_of=order.eligible_at)
+    opening = bar(at=order.eligible_at + timedelta(seconds=1))
+    adapter.advance_open(opening, {A.instrument_id: metadata()})
+    engine.reconcile_all(as_of=opening.opened_at)
     assert len(ledger.fills(order.account_id)) == 1
     assert ledger.reconcile(order.account_id)["reconciled"]
     ledger.close()
@@ -261,8 +262,9 @@ def test_typed_factory_connects_owned_ledger_risk_and_market_runtime(tmp_path):
     )
     service.prepare(order, {A.instrument_id: metadata()}, as_of=T)
     service.dispatch(order.intent_id, as_of=order.eligible_at)
-    service.adapters["paper"].advance_open(bar(at=order.eligible_at), {A.instrument_id: metadata()})
-    assert service.reconcile_all(as_of=order.eligible_at)[0]["state"] == "filled"
+    opening = bar(at=order.eligible_at + timedelta(seconds=1))
+    service.adapters["paper"].advance_open(opening, {A.instrument_id: metadata()})
+    assert service.reconcile_all(as_of=opening.opened_at)[0]["state"] == "filled"
     service.ledger.close()
 
 
@@ -421,4 +423,106 @@ engine.ingest(order.intent_id,report)
     assert engine.state(order.intent_id)["state"] == "filled"
     assert len(ledger.fills(order.account_id)) == 1
     assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()
+
+
+def test_observed_opening_receipt_uses_actual_print_and_frozen_admission_after_capture(tmp_path):
+    import json
+
+    from src.execution.venue import ObservedOpenReceipt
+
+    ledger, adapter, engine, order = setup(tmp_path)
+    original_metadata = {A.instrument_id: metadata()}
+    engine.prepare(order, original_metadata, as_of=T)
+    engine.dispatch(order.intent_id, as_of=order.eligible_at)
+    opening = bar(at=order.eligible_at + timedelta(seconds=1), opening_volume="500")
+    observed = opening.closed_at + timedelta(seconds=1)
+    available = observed + timedelta(seconds=1)
+    cutoff = available + timedelta(minutes=1)
+    kwargs = dict(
+        observed_at=observed,
+        available_at=available,
+        as_of=cutoff,
+        evidence_id="actual-test-print",
+        evidence_hash="a" * 64,
+    )
+    frozen = {order.intent_id: engine.admission_metadata(order.intent_id)}
+    assert frozen[order.intent_id] == original_metadata
+    assert order.intent_id not in adapter.accepted_intent_ids_before(order.eligible_at)
+    assert order.intent_id in adapter.accepted_intent_ids_before(opening.opened_at)
+    changed = {order.intent_id: {A.instrument_id: metadata(sector="changed")}}
+    with pytest.raises(LedgerError, match="differs from durable admission"):
+        adapter.settle_open(opening, changed, **kwargs)
+    with pytest.raises(ValueError, match="receipt clocks"):
+        adapter.settle_open(
+            opening, frozen, **{**kwargs, "available_at": observed - timedelta(seconds=1)}
+        )
+    with pytest.raises(ValueError, match="receipt clocks"):
+        adapter.settle_open(
+            opening, frozen, **{**kwargs, "as_of": available - timedelta(seconds=1)}
+        )
+    fills = adapter.settle_open(opening, frozen, **kwargs)
+    assert len(fills) == 1 and fills[0].quantity == 5 and fills[0].executed_at == opening.opened_at
+    receipt = ObservedOpenReceipt.model_validate_json(
+        ledger.db.execute(
+            "SELECT payload FROM events WHERE id=?", ("paper-observed-open:" + opening.event_id,)
+        ).fetchone()[0]
+    )
+    assert receipt.occurred_at < receipt.observed_at < receipt.available_at < receipt.as_of
+    assert receipt.event_hash == opening.content_hash()
+    assert json.loads(receipt.model_dump_json())["evidence_hash"] == "a" * 64
+    adapter.advance_close(opening)
+    snap = ledger.snapshot(order.account_id, cutoff, 86400)
+    assert snap.positions[0].opened_at == opening.opened_at
+    assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()
+    ledger, adapter, engine, _ = setup(tmp_path)
+    assert (
+        adapter.settle_open(opening, frozen, **{**kwargs, "as_of": cutoff + timedelta(seconds=1)})
+        == []
+    )
+    assert len(ledger.fills(order.account_id)) == 1
+    with pytest.raises(LedgerError, match="receipt changed"):
+        adapter.settle_open(opening, frozen, **{**kwargs, "evidence_hash": "b" * 64})
+    ledger.close()
+
+
+def test_acceptance_at_open_and_later_cycles_cannot_consume_past_prints(tmp_path):
+    ledger, adapter, engine, order = setup(tmp_path)
+    engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
+    engine.dispatch(order.intent_id, as_of=order.eligible_at)
+    opening = bar(at=order.eligible_at)
+    frozen = {order.intent_id: engine.admission_metadata(order.intent_id)}
+    kwargs = dict(
+        observed_at=opening.closed_at,
+        available_at=opening.closed_at,
+        as_of=opening.closed_at,
+        evidence_id="fixture",
+        evidence_hash="c" * 64,
+    )
+    with pytest.raises(LedgerError, match="coverage"):
+        adapter.settle_open(opening, frozen, **kwargs)
+    assert adapter.settle_open(opening, {}, **kwargs) == []
+    assert not ledger.fills(order.account_id)
+    ledger.snapshot(order.account_id, opening.closed_at, 86400)
+    later = bar(at=opening.opened_at + timedelta(seconds=1))
+    with pytest.raises(LedgerError, match="published NAV"):
+        adapter.settle_open(
+            later,
+            frozen,
+            **{
+                **kwargs,
+                "observed_at": later.closed_at,
+                "available_at": later.closed_at,
+                "as_of": later.closed_at,
+            },
+        )
+    # A caller cannot backdate a new acknowledgement behind committed cycle state.
+    with pytest.raises(LedgerError, match="backwards"):
+        adapter.submit(
+            order,
+            engine.client_id(order.account_id, order.intent_id),
+            adapter.rules(A, T),
+            order.eligible_at,
+        )
     ledger.close()

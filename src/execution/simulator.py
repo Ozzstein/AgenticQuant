@@ -65,6 +65,7 @@ class PaperExecution:
         metadata: dict[str, InstrumentRisk],
         *,
         eligible_intent_ids: set[str] | None = None,
+        intent_metadata: dict[str, dict[str, InstrumentRisk]] | None = None,
     ) -> list[Fill]:
         """At the open, fill market/marketable-limit/triggered-stop orders only.
 
@@ -72,6 +73,8 @@ class PaperExecution:
         Capacity is a fraction of an explicitly supplied opening volume. Replays
         of the same event cannot reuse its liquidity, including after restart.
         """
+        if self.ledger.spec(self.account_id).mode == "live":
+            raise LedgerError("live accounts cannot receive simulated executions")
         with self.ledger.atomic():
             if not self.ledger.record_event(
                 self.account_id, "open:" + bar.event_id, bar.model_dump_json()
@@ -107,6 +110,9 @@ class PaperExecution:
                     continue
                 if order.instrument != bar.instrument:
                     raise LedgerError("bar instrument differs from order identity")
+                order_metadata = (
+                    metadata if intent_metadata is None else intent_metadata[order.intent_id]
+                )
                 price = bar.open * (
                     1 + self.policy.slippage_bps / 10000 * (1 if order.side == "buy" else -1)
                 )
@@ -123,7 +129,7 @@ class PaperExecution:
                         if order.side == "buy"
                         else bar.open <= order.stop_price
                     )
-                meta = metadata.get(bar.instrument.instrument_id)
+                meta = order_metadata.get(bar.instrument.instrument_id)
                 if meta is None:
                     raise LedgerError("missing execution metadata")
                 qty = (min(state["remaining"], capacity) / meta.lot_size).to_integral_value(
@@ -155,7 +161,7 @@ class PaperExecution:
                         projected,
                         snap,
                         self.ledger.pending(self.account_id),
-                        metadata,
+                        order_metadata,
                         self.risk_policy,
                     )
                     if not risk.passed:

@@ -266,11 +266,10 @@ def test_typed_paper_target_to_outbox_to_real_fill_to_sleeve_nav(tmp_path):
     )
     order = ledger.order(original.account_id, prepared[0]["intent"])["intent"]
     service.dispatch(order.intent_id, as_of=order.eligible_at)
-    adapter.advance_open(
-        bar(at=order.eligible_at, opening_volume="500"), {A.instrument_id: metadata()}
-    )
-    service.reconcile_all(as_of=order.eligible_at)
-    parts = book.snapshot(order.eligible_at)
+    opening = bar(at=order.eligible_at + timedelta(seconds=1), opening_volume="500")
+    adapter.advance_open(opening, {A.instrument_id: metadata()})
+    service.reconcile_all(as_of=opening.opened_at)
+    parts = book.snapshot(opening.opened_at)
     assert [p.portfolio.positions[0].quantity for p in parts.values()] == [2, 3]
     assert exact_sum(p.portfolio.nav for p in parts.values()) == 100000
     assert ledger.reconcile(original.account_id)["reconciled"]

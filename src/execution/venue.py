@@ -15,12 +15,53 @@ from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
 
-from src.domain.common import Instrument, NonEmptyString, UtcTimestamp, VersionedContract, _utc
+from src.domain.common import (
+    Instrument,
+    NonEmptyString,
+    Sha256,
+    UtcTimestamp,
+    VersionedContract,
+    _utc,
+)
 from src.domain.portfolio import Fill, FillPolicy, InstrumentRisk, OrderIntent, Positive, RiskPolicy
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.simulator import PaperExecution
 
 D = Decimal
+
+
+class ObservedOpenReceipt(VersionedContract):
+    policy: Literal["paper-observed-opening-print-1"] = "paper-observed-opening-print-1"
+    account_id: NonEmptyString
+    event_id: NonEmptyString
+    event_hash: Sha256
+    occurred_at: UtcTimestamp
+    available_at: UtcTimestamp
+    observed_at: UtcTimestamp
+    as_of: UtcTimestamp
+    evidence_id: NonEmptyString
+    evidence_hash: Sha256
+    admission_metadata_hashes: tuple[tuple[str, Sha256], ...]
+
+    @model_validator(mode="after")
+    def chronological(self):
+        if not self.occurred_at <= self.observed_at <= self.available_at <= self.as_of:
+            raise ValueError("opening print requires actual causal receipt clocks")
+        if self.admission_metadata_hashes != tuple(sorted(set(self.admission_metadata_hashes))):
+            raise ValueError("sorted unique admission metadata bindings required")
+        return self
+
+
+def _metadata_hash(metadata):
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(
+            {key: value.model_dump(mode="json") for key, value in metadata.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 class VenueRules(VersionedContract):
@@ -204,6 +245,17 @@ class VenueExecution:
         ).fetchone():
             raise LedgerError("recover durable unapplied venue receipts before new risk")
 
+    def admission_metadata(self, intent_id: str) -> dict[str, InstrumentRisk]:
+        row = self.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?",
+            (self.account_id, "venue-admission-metadata:" + intent_id),
+        ).fetchone()
+        if row is None:
+            raise LedgerError("intent lacks retained admission metadata")
+        return {
+            key: InstrumentRisk.model_validate(value) for key, value in json.loads(row[0]).items()
+        }
+
     def prepare_target(self, target, metadata, *, sleeve_book=None):
         """Canonical target sizing/netting into this account's durable outbox.
 
@@ -342,6 +394,14 @@ class VenueExecution:
                     raise LedgerError("insufficient available funding at the routed venue")
             PaperExecution(self.ledger, self.account_id, self.fill_policy, self.risk_policy).submit(
                 intent, metadata
+            )
+            self.ledger.record_event(
+                self.account_id,
+                "venue-admission-metadata:" + intent.intent_id,
+                json.dumps(
+                    {key: value.model_dump(mode="json") for key, value in metadata.items()},
+                    sort_keys=True,
+                ),
             )
             self.ledger.db.execute(
                 "INSERT INTO venue_outbox(account,intent,venue,client_id,state,rules) VALUES (?,?,?,?,?,?)",
@@ -698,8 +758,17 @@ class PaperVenue:
     def submit(self, intent, client_order_id, rules, as_of):
         rules.require_order(intent, as_of)
         with self.ledger.atomic():
+            self.ledger._clock(self.account_id, as_of)
             self.ledger.record_event(
                 self.account_id, "paper-accepted:" + intent.intent_id, intent.content_hash()
+            )
+            self.ledger.record_event(
+                self.account_id,
+                "paper-accepted-time:" + intent.intent_id,
+                json.dumps(
+                    {"at": _utc(as_of).isoformat(), "intent_hash": intent.content_hash()},
+                    sort_keys=True,
+                ),
             )
         return self._report(intent, client_order_id, as_of)
 
@@ -721,8 +790,102 @@ class PaperVenue:
             )
         }
 
+    def accepted_intent_ids_before(self, at) -> frozenset[str]:
+        """Actual durable acceptance strictly before an observed market instant."""
+        at = _utc(at)
+        eligible = set()
+        for row in self.ledger.db.execute(
+            "SELECT id,payload FROM events WHERE account=? AND id LIKE 'paper-accepted-time:%'",
+            (self.account_id,),
+        ):
+            key, receipt = row["id"][len("paper-accepted-time:") :], json.loads(row["payload"])
+            order = self.ledger.order(self.account_id, key)["intent"]
+            if receipt["intent_hash"] != order.content_hash():
+                raise LedgerError("paper acceptance intent hash changed")
+            if datetime.fromisoformat(receipt["at"]) < at:
+                eligible.add(key)
+        return frozenset(eligible)
+
     def advance_open(self, bar, metadata):
-        return self.engine.open_bar(bar, metadata, eligible_intent_ids=self._accepted())
+        return self.engine.open_bar(
+            bar, metadata, eligible_intent_ids=self.accepted_intent_ids_before(bar.opened_at)
+        )
+
+    def settle_open(
+        self,
+        bar,
+        metadata_by_intent,
+        *,
+        available_at,
+        observed_at,
+        as_of,
+        evidence_id,
+        evidence_hash,
+    ):
+        """Settle a documented opening print for previously accepted paper orders.
+
+        Documentary receipt time can follow occurrence. This cannot change a
+        historical research availability gate or rewrite published accounting.
+        """
+        receipt = ObservedOpenReceipt(
+            account_id=self.account_id,
+            event_id=bar.event_id,
+            event_hash=bar.content_hash(),
+            occurred_at=bar.opened_at,
+            available_at=available_at,
+            observed_at=observed_at,
+            as_of=as_of,
+            evidence_id=evidence_id,
+            evidence_hash=evidence_hash,
+            admission_metadata_hashes=tuple(
+                sorted((key, _metadata_hash(value)) for key, value in metadata_by_intent.items())
+            ),
+        )
+        with self.ledger.atomic():
+            key = "paper-observed-open:" + bar.event_id
+            existing = self.ledger.db.execute(
+                "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, key)
+            ).fetchone()
+            if existing:
+                previous = ObservedOpenReceipt.model_validate_json(existing[0])
+                if (
+                    previous.model_dump(exclude={"as_of"}) != receipt.model_dump(exclude={"as_of"})
+                    or previous.as_of > receipt.as_of
+                ):
+                    raise LedgerError("observed opening receipt changed")
+                return []
+            if self.ledger.db.execute(
+                "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
+                (self.account_id, bar.opened_at.isoformat()),
+            ).fetchone():
+                raise LedgerError("observed opening print conflicts with published NAV")
+            accepted = self.accepted_intent_ids_before(bar.opened_at)
+            expected = {
+                state["intent"].intent_id
+                for state in self.ledger.pending(self.account_id)
+                if state["intent"].intent_id in accepted
+                and state["intent"].instrument == bar.instrument
+                and state["intent"].eligible_at <= bar.opened_at
+            }
+            if set(metadata_by_intent) != expected:
+                raise LedgerError(
+                    "exact per-order admission metadata coverage required for opening print"
+                )
+            for intent_id, metadata in metadata_by_intent.items():
+                row = self.ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?",
+                    (self.account_id, "venue-admission-metadata:" + intent_id),
+                ).fetchone()
+                if row is None or json.loads(row[0]) != {
+                    k: v.model_dump(mode="json") for k, v in metadata.items()
+                }:
+                    raise LedgerError("opening settlement metadata differs from durable admission")
+                if any(value.as_of > bar.opened_at for value in metadata.values()):
+                    raise LedgerError("opening settlement cannot use future risk metadata")
+            self.ledger.record_event(self.account_id, key, receipt.model_dump_json())
+            return self.engine.open_bar(
+                bar, {}, eligible_intent_ids=expected, intent_metadata=metadata_by_intent
+            )
 
     def advance_close(self, bar):
         return self.engine.close_bar(bar)
