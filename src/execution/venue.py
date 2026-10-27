@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from src.domain.common import (
     Instrument,
@@ -33,6 +33,7 @@ from src.domain.portfolio import (
     OrderIntent,
     Positive,
     RiskPolicy,
+    exact_decimal_product,
 )
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.simulator import PaperExecution
@@ -77,6 +78,37 @@ def _metadata_hash(metadata):
     ).hexdigest()
 
 
+class VenueNotionalReference(VersionedContract):
+    """Actual native reference used by a venue's market-order notional filters."""
+
+    price: Positive
+    kind: Literal["venue-reference", "weighted-average", "last-trade"]
+    average_minutes: int | None = Field(ge=0)
+    observed_at: UtcTimestamp
+    available_at: UtcTimestamp
+    source_hash: Sha256
+    # A native reference can override VWAP/last trade. Its absence must also be
+    # established by source evidence before using the documented fallback.
+    reference_price_absence_hash: Sha256 | None
+
+    @model_validator(mode="after")
+    def exact_basis(self):
+        if self.observed_at > self.available_at:
+            raise ValueError("native notional reference availability precedes observation")
+        if self.kind == "venue-reference":
+            if self.average_minutes is not None or self.reference_price_absence_hash is not None:
+                raise ValueError("native reference cannot claim a fallback averaging basis")
+        elif (
+            self.reference_price_absence_hash is None
+            or (self.kind == "last-trade" and self.average_minutes != 0)
+            or (self.kind == "weighted-average" and not self.average_minutes)
+        ):
+            raise ValueError(
+                "native fallback requires exact averaging basis and reference absence proof"
+            )
+        return self
+
+
 class VenueRules(VersionedContract):
     venue: NonEmptyString
     instrument: Instrument
@@ -87,12 +119,64 @@ class VenueRules(VersionedContract):
     minimum_quantity: Decimal = Field(default=D(0), ge=0)
     minimum_notional: Decimal = Field(default=D(0), ge=0)
     maximum_quantity: Positive | None = None
+    maximum_notional: Positive | None = None
+    minimum_notional_applies_to_market: bool = True
+    maximum_notional_applies_to_market: bool = True
+    market_notional_average_minutes: int | None = Field(default=None, ge=0)
+    market_notional_reference: VenueNotionalReference | None = None
+    market_reference_max_age_seconds: int = Field(default=30, ge=0)
+    minimum_price: Positive | None = None
+    maximum_price: Positive | None = None
+    market_quantity_step: Positive | None = None
+    market_minimum_quantity: Positive | None = None
+    market_maximum_quantity: Positive | None = None
     order_types: tuple[Literal["market", "limit", "stop"], ...] = ("market", "limit")
     time_in_force: tuple[Literal["GTC", "DAY", "IOC", "FOK"], ...] = ("GTC",)
     market_type: Literal["equity", "spot"]
     active: bool
 
+    @model_validator(mode="after")
+    def coherent_limits(self):
+        for minimum, maximum in (
+            (self.minimum_quantity, self.maximum_quantity),
+            (self.minimum_notional, self.maximum_notional),
+            (self.minimum_price, self.maximum_price),
+            (self.market_minimum_quantity, self.market_maximum_quantity),
+        ):
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError("venue minimum exceeds maximum")
+        if (
+            self.market_notional_reference is not None
+            and self.market_notional_average_minutes is None
+        ):
+            raise ValueError(
+                "native market notional reference requires the filter's declared window"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        # Existing frozen admission hashes retain their original shape.
+        for key, default in (
+            ("maximum_notional", None),
+            ("minimum_notional_applies_to_market", True),
+            ("maximum_notional_applies_to_market", True),
+            ("market_notional_average_minutes", None),
+            ("market_notional_reference", None),
+            ("market_reference_max_age_seconds", 30),
+            ("minimum_price", None),
+            ("maximum_price", None),
+            ("market_quantity_step", None),
+            ("market_minimum_quantity", None),
+            ("market_maximum_quantity", None),
+        ):
+            if getattr(self, key) == default:
+                result.pop(key, None)
+        return result
+
     def require_order(self, intent: OrderIntent, as_of: datetime):
+        as_of = _utc(as_of)
         if not self.active or self.instrument != intent.instrument or self.available_at > as_of:
             raise LedgerError("inactive, mismatched or future venue rules")
         if (as_of - self.available_at).total_seconds() > 86400:
@@ -106,10 +190,59 @@ class VenueRules(VersionedContract):
         ):
             raise LedgerError("venue quantity increment or range violated")
         for price in (intent.limit_price, intent.stop_price):
-            if price is not None and price % self.price_tick:
-                raise LedgerError("venue tick increment violated")
-        if intent.quantity * intent.reference_price < self.minimum_notional:
+            if price is not None and (
+                price % self.price_tick
+                or (self.minimum_price is not None and price < self.minimum_price)
+                or (self.maximum_price is not None and price > self.maximum_price)
+            ):
+                raise LedgerError("venue tick increment or price range violated")
+        market = intent.order_type == "market"
+        if market and (
+            (self.market_quantity_step is not None and intent.quantity % self.market_quantity_step)
+            or (
+                self.market_minimum_quantity is not None
+                and intent.quantity < self.market_minimum_quantity
+            )
+            or (
+                self.market_maximum_quantity is not None
+                and intent.quantity > self.market_maximum_quantity
+            )
+        ):
+            raise LedgerError("venue market quantity increment or range violated")
+        check_min = not market or self.minimum_notional_applies_to_market
+        check_max = not market or self.maximum_notional_applies_to_market
+        price = (
+            intent.limit_price
+            if intent.order_type == "limit"
+            else intent.stop_price
+            if intent.order_type == "stop"
+            else intent.reference_price
+        )
+        if (
+            market
+            and ((check_min and self.minimum_notional) or (check_max and self.maximum_notional))
+            and self.market_notional_average_minutes is not None
+        ):
+            reference = self.market_notional_reference
+            if (
+                reference is None
+                or reference.available_at > as_of
+                or not 0
+                <= (as_of - reference.observed_at).total_seconds()
+                <= self.market_reference_max_age_seconds
+            ):
+                raise LedgerError("actual current native market notional reference required")
+            if (
+                reference.kind != "venue-reference"
+                and reference.average_minutes != self.market_notional_average_minutes
+            ):
+                raise LedgerError("native market notional averaging window differs from filter")
+            price = reference.price
+        notional = exact_decimal_product(intent.quantity, price)
+        if check_min and notional < self.minimum_notional:
             raise LedgerError("venue minimum quote notional violated")
+        if check_max and self.maximum_notional is not None and notional > self.maximum_notional:
+            raise LedgerError("venue maximum quote notional violated")
         if (self.market_type == "spot") != (intent.instrument.asset_class == "crypto"):
             raise LedgerError("spot/equity venue identity mismatch")
 
