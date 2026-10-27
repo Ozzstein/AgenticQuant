@@ -428,7 +428,7 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
             'trials':registry.trial_count_at_admission(trial_id),'untouched_holdout_id':trial.holdout_id}}
     bars = [b for b in inputs.bars if b.closed_at >= schedule[0]]
     start = min(b.opened_at for b in bars)
-    kwargs = {**inputs.replay_kwargs(),'bars':bars,
+    kwargs = {**inputs.replay_kwargs(),**inputs.income_replay_kwargs(start=start),'bars':bars,
         'account':inputs.account.model_copy(update={'opened_at':start-pd.Timedelta(microseconds=1)}),
         'actions':[a for a in inputs.actions if a.effective_at >= start],
         'decision_provider':decision_provider,'decision_times':[t.to_pydatetime() for t in schedule],
