@@ -14,9 +14,6 @@ from typing import Callable, Mapping
 import numpy as np
 import pandas as pd
 from pydantic import model_validator
-from src.research.datasets import ResearchInputs
-from src.research.evidence import verify_provenance
-from src.research.registry import RegistryError, ResearchRegistry
 
 from src.core.backtester import (
     FoldEvidence,
@@ -33,12 +30,15 @@ from src.data.features.contextual import NumericEvidenceBinding, materialize_evi
 from src.data.features.dataset import FeatureDataset, feature_dataset
 from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
 from src.domain.market import FeatureSpec
+from src.research.datasets import ResearchInputs
+from src.research.evidence import verify_provenance
 from src.research.regime_experiments import (
     CausalRegimeArtifact,
     FrozenEvidence,
     recompute_regime_artifact,
     verify_frozen_evidence,
 )
+from src.research.registry import RegistryError, ResearchRegistry
 from src.strategies.runner import evaluate_strategy, rebalance_due
 from src.strategies.specification import StrategySpec
 

@@ -13,10 +13,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from pydantic import Field, model_validator
-from src.domain.portfolio import UniverseEligibility
-from src.research.datasets import ResearchInputs
-from src.research.evidence import SourceBinding, json_pointer, verify_market_snapshot
-from src.research.registry import RegistryError, ResearchRegistry
 
 from src.core.macro_regime import (
     MACRO_SIGNALS,
@@ -27,6 +23,10 @@ from src.core.macro_regime import (
 from src.data.evidence.store import EvidenceStore, canonical_bytes, digest
 from src.domain.common import EvidenceRecord, Sha256, UtcTimestamp, VersionedContract
 from src.domain.market import MarketSnapshot
+from src.domain.portfolio import UniverseEligibility
+from src.research.datasets import ResearchInputs
+from src.research.evidence import SourceBinding, json_pointer, verify_market_snapshot
+from src.research.registry import RegistryError, ResearchRegistry
 
 
 class HMMVariantSpec(VersionedContract):
