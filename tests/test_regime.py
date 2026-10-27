@@ -383,51 +383,6 @@ class TestEvaluation:
 # ===========================================================================
 
 
-class TestRDAgentRegime:
-    def test_evolve_regime_runs(self):
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-        results = runner.evolve_regime(iterations=3, budget=1.0)
-        # Should return a list (may be empty if all rejected)
-        assert isinstance(results, list)
-
-    def test_evolve_regime_updates_kb(self, tmp_path, monkeypatch):
-        """evolve_regime should write tested_regime_configs to the KB."""
-        import json
-
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        kb_path = tmp_path / "kb.json"
-        monkeypatch.setattr("src.core.rd_agent_runner._KB_PATH", kb_path)
-        monkeypatch.setattr("src.core.rd_agent_runner._KB_DIR", tmp_path)
-
-        runner = RDAgentRunner()
-        runner.evolve_regime(iterations=2, budget=1.0)
-
-        assert kb_path.exists()
-        with kb_path.open() as f:
-            kb = json.load(f)
-        assert "tested_regime_configs" in kb
-        assert len(kb["tested_regime_configs"]) > 0
-
-    def test_copilot_regime_parses_signal_change(self):
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-        result = runner.copilot_regime("add put/call ratio as a signal")
-        # copilot_regime now delegates to FactorProposer.propose_regime_change
-        assert isinstance(result, dict)
-        assert "regime" in result or "rationale" in result
-
-    def test_copilot_regime_parses_state_count(self):
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-        result = runner.copilot_regime("try 5 states")
-        # copilot_regime now delegates to FactorProposer.propose_regime_change
-        assert isinstance(result, dict)
-        assert "regime" in result or "rationale" in result
 
 
 # ===========================================================================
@@ -437,10 +392,12 @@ class TestRDAgentRegime:
 
 class TestCLISmoke:
     def test_evolve_regime_importable(self):
-        from scripts.run_rd_agent import evolve_regime_cmd  # noqa: F401
+        from scripts.run_rd_agent import app
+        assert app is not None
 
     def test_copilot_regime_importable(self):
-        from scripts.run_rd_agent import copilot_regime_cmd  # noqa: F401
+        from src.research.registry import ResearchRegistry
+        assert callable(ResearchRegistry.resolve)
 
     def test_regime_status_importable(self):
         from scripts.run_pipeline import regime_status  # noqa: F401

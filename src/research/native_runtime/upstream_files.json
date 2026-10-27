@@ -1,0 +1,10 @@
+{
+  "scenarios/qlib/experiment/factor_template/conf_baseline.yaml": "b6253e3d9c7512f7066088ae27f5440e4a95cb409292ab9529ecb68847ea8385",
+  "scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml": "0701d5f07df62e448ba603b32152630543fc1312dc11790097a6977c69311c70",
+  "scenarios/qlib/experiment/factor_template/conf_combined_factors_sota_model.yaml": "134f5beedcb811d6b4f935f12f119a3d55cc9f4124a2eb7581da98142b3db228",
+  "scenarios/qlib/experiment/model_template/conf_baseline_factors_model.yaml": "bd3e9338789f8bf4fd72e6f38032fd6a642799d0b38dc83a0ea6f043eff4248c",
+  "scenarios/qlib/experiment/model_template/conf_sota_factors_model.yaml": "134f5beedcb811d6b4f935f12f119a3d55cc9f4124a2eb7581da98142b3db228",
+  "scenarios/qlib/experiment/prompts.yaml": "6325f0366075ffc0519a983ac0049c5bf30714479932a7b4d9ba5651ae86d004",
+  "scenarios/qlib/factor_experiment_loader/prompts.yaml": "c17fd202fac3fa8c47b1850f6d350207db01ee258a2cc3e1bab46a3ec83f77c4",
+  "scenarios/qlib/experiment/factor_data_template/generate.py": "696803163e0d789dc4575f3783a41cb99c78e81f4755f1cb6db1cf4c1aafa4a0"
+}

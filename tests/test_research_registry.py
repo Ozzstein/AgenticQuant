@@ -135,3 +135,47 @@ def test_activation_cannot_precede_result(registry):
     registry.record_evaluation(outcome)
     with pytest.raises(RegistryError, match="precedes"):
         registry.activate("factor", "one", policy, expected_generation=0, at=T)
+
+
+def test_development_reader_cannot_expose_holdout_or_unrecorded_outcomes(registry):
+    _,trial,outcome,_ = admitted(registry)
+    # Refusal occurs even without an outcome: the reader cannot probe whether a
+    # holdout succeeded or failed by changing the requested evaluation shape.
+    with pytest.raises(RegistryError,match='holdout'):
+        registry.development_evaluation(trial.trial_id)
+    registry.record_evaluation(outcome)
+    with pytest.raises(RegistryError,match='holdout'):
+        registry.development_evaluation(trial.trial_id)
+    development = trial.model_copy(update={'trial_id':'dev','dataset_hash':registry.archive(b'development-data'),
+                                          'purpose':'development','holdout_id':None})
+    snapshot = registry.register_trial(development)
+    with pytest.raises(RegistryError,match='no recorded outcome'):
+        registry.development_evaluation('dev')
+    result = outcome.model_copy(update={'trial_id':'dev','registry_snapshot_hash':snapshot,'status':'failed',
+                                        'validation_reliable':False})
+    registry.record_evaluation(result)
+    assert registry.development_evaluation('dev') == result
+
+
+def test_family_renaming_does_not_reset_multiplicity_or_mutate_admission(registry):
+    _,_,first,policy = admitted(registry,p_value=.03)
+    assert registry.trial_count_at_admission('one') == 1
+    registry.record_evaluation(first)
+    admitted(registry,'second',family='new-name')
+    assert registry.trial_count_at_admission('one') == 1
+    assert registry.family_count('family') == 2
+    with pytest.raises(RegistryError,match='multiple-trial'):
+        registry.activate('factor','one',policy,expected_generation=0,at=T+timedelta(hours=2))
+
+
+def test_relabeling_dataset_context_cannot_reopen_a_reserved_security_interval(registry):
+    from tests.data_quant_fixtures import archived_snapshot
+    snapshot = archived_snapshot(crypto=True,periods=5)
+    first = registry.archive_contract(snapshot)
+    changed = snapshot.model_copy(update={'context':snapshot.context.model_copy(update={'run_id':'renamed'})})
+    second = registry.archive_contract(changed)
+    assert first != second
+    start,end = snapshot.bars[0].opened_at,snapshot.context.as_of
+    registry.register_holdout(Holdout(holdout_id='market',dataset_hash=first,starts_at=start,ends_at=end,registered_at=T))
+    with pytest.raises(RegistryError,match='overlaps'):
+        registry.register_holdout(Holdout(holdout_id='rename',dataset_hash=second,starts_at=start,ends_at=end,registered_at=T))

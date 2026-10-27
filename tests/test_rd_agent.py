@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,6 @@ def test_eval_result_schema_failed_stage1():
 
 def test_split_folds_is_public_module_function():
     """split_folds must be importable as a module-level function."""
-    import pandas as pd
 
     from src.core.backtester import split_folds
 
@@ -106,7 +104,6 @@ def test_split_folds_is_public_module_function():
 
 
 def test_split_folds_returns_no_folds_for_short_data():
-    import pandas as pd
 
     from src.core.backtester import split_folds
 
@@ -259,156 +256,17 @@ def test_propose_regime_change_fallback():
 # ---------------------------------------------------------------------------
 
 
-def _make_ohlcv_df(n_days: int = 100, n_tickers: int = 5) -> pd.DataFrame:
-    """Build a minimal multi-ticker OHLCV DataFrame for testing."""
-    tickers = [f"TK{i}" for i in range(n_tickers)]
-    records = []
-    rng = np.random.default_rng(42)
-    for ticker in tickers:
-        prices = 100 * np.cumprod(1 + rng.normal(0.0005, 0.015, n_days))
-        for i in range(n_days):
-            records.append({
-                "ticker": ticker,
-                "date": pd.Timestamp("2022-01-01") + pd.Timedelta(days=i),
-                "close": prices[i],
-                "open": prices[i] * (1 - rng.uniform(0, 0.005)),
-                "high": prices[i] * (1 + rng.uniform(0, 0.01)),
-                "low": prices[i] * (1 - rng.uniform(0, 0.01)),
-                "volume": rng.integers(100_000, 1_000_000),
-            })
-    df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"])
-    return df.set_index("date").sort_index()
 
 
-def test_evaluator_stage1_passed():
-    """A factor that generates valid numeric values should pass stage 1 (mocked IC >= 0.02)."""
-    from src.core.factor_evaluator import FactorEvaluator
-    from src.utils.schemas import EvalResult, FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-    factor = FactorDefinition(
-        name="test_mom",
-        expression="close / close.shift(20) - 1",
-        category="momentum",
-    )
-
-    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
-
-    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
-        mock_pipeline = MagicMock()
-        mock_pipeline.yfinance_fallback.return_value = mock_df
-        MockPipeline.return_value = mock_pipeline
-
-        evaluator = FactorEvaluator(cfg)
-        result = evaluator.evaluate_factor(factor, tickers=["TK0", "TK1", "TK2", "TK3", "TK4"])
-
-    assert isinstance(result, EvalResult)
-    assert result.factor_name == "test_mom"
-    assert result.stage1_ic is not None
     # Either passed or failed stage1 — both are valid outcomes with random data
 
 
-def test_evaluator_stage1_no_data():
-    """Empty DataFrame from yfinance_fallback should produce reason='no_data'."""
-    from src.core.factor_evaluator import FactorEvaluator
-    from src.utils.schemas import FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-    factor = FactorDefinition(name="test_factor", expression="close / close.shift(5) - 1", category="momentum")
-
-    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
-        mock_pipeline = MagicMock()
-        mock_pipeline.yfinance_fallback.return_value = pd.DataFrame()
-        MockPipeline.return_value = mock_pipeline
-
-        evaluator = FactorEvaluator(cfg)
-        result = evaluator.evaluate_factor(factor)
-
-    assert result.reason == "no_data"
-    assert result.passed is False
 
 
-def test_evaluator_eval_error():
-    """A factor expression that raises an exception should produce reason='eval_error'."""
-    from src.core.factor_evaluator import FactorEvaluator
-    from src.utils.schemas import FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-    # Invalid expression — references undefined variable 'undefined_var'
-    factor = FactorDefinition(
-        name="bad_factor",
-        expression="close + undefined_var",
-        category="momentum",
-    )
-
-    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
-
-    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
-        mock_pipeline = MagicMock()
-        mock_pipeline.yfinance_fallback.return_value = mock_df
-        MockPipeline.return_value = mock_pipeline
-
-        evaluator = FactorEvaluator(cfg)
-        result = evaluator.evaluate_factor(factor)
-
-    assert result.reason == "eval_error"
-    assert result.passed is False
 
 
-def test_evaluator_stage2_not_entered_when_stage1_fails():
-    """When stage1_passed is False, stage2_ic and stage2_icir must remain None."""
-    from src.core.factor_evaluator import FactorEvaluator
-    from src.utils.schemas import FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-    # Expression that produces near-zero IC (constant signal)
-    factor = FactorDefinition(
-        name="zero_signal",
-        expression="close * 0 + 1",  # constant, IC = 0
-        category="momentum",
-    )
-
-    mock_df = _make_ohlcv_df(n_days=120, n_tickers=10)
-
-    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
-        mock_pipeline = MagicMock()
-        mock_pipeline.yfinance_fallback.return_value = mock_df
-        MockPipeline.return_value = mock_pipeline
-
-        evaluator = FactorEvaluator(cfg)
-        result = evaluator.evaluate_factor(factor)
-
-    # Constant expression produces NaN from spearmanr (raised as ValueError → caught as
-    # eval_error). Both "eval_error" and "low_ic" leave Stage 2 unentered.
-    assert result.stage1_passed is False
-    assert result.stage2_ic is None
-    assert result.stage2_icir is None
 
 
-def test_evaluator_batch():
-    """evaluate_factors_batch returns one EvalResult per factor."""
-    from src.core.factor_evaluator import FactorEvaluator
-    from src.utils.schemas import EvalResult, FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-    factors = [
-        FactorDefinition(name=f"f{i}", expression="close / close.shift(20) - 1", category="momentum")
-        for i in range(3)
-    ]
-
-    mock_df = _make_ohlcv_df(n_days=120, n_tickers=5)
-
-    with patch("src.core.factor_evaluator.DataPipeline") as MockPipeline:
-        mock_pipeline = MagicMock()
-        mock_pipeline.yfinance_fallback.return_value = mock_df
-        MockPipeline.return_value = mock_pipeline
-
-        evaluator = FactorEvaluator(cfg)
-        results = evaluator.evaluate_factors_batch(factors)
-
-    assert len(results) == 3
-    assert all(isinstance(r, EvalResult) for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -508,136 +366,34 @@ def test_research_analyst_llm_path():
 # ---------------------------------------------------------------------------
 
 
-def test_runner_mine_factors_calls_all_components():
-    """mine_factors should call proposer → evaluator → analyst in sequence."""
+
+
+
+
+
+
+
+
+
+# The removed simulator wiring assertions are superseded by actual fitted
+# models/ledger outcomes and tamper tests in test_research_inputs/evaluation.
+def test_runner_requires_registered_experiments(tmp_path, mock_config):
+    import pytest
+
     from src.core.rd_agent_runner import RDAgentRunner
-    from src.utils.schemas import EvalResult, FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-
-    with patch("src.core.rd_agent_runner.FactorProposer") as MockProposer, \
-         patch("src.core.rd_agent_runner.FactorEvaluator") as MockEvaluator, \
-         patch("src.core.rd_agent_runner.ResearchAnalyst") as MockAnalyst:
-
-        mock_proposer = MagicMock()
-        mock_proposer.propose_factors.return_value = [
-            FactorDefinition(name="llm_factor_1", expression="close / close.shift(20) - 1", category="momentum"),
-        ]
-        MockProposer.return_value = mock_proposer
-
-        mock_evaluator = MagicMock()
-        mock_evaluator.evaluate_factors_batch.return_value = [
-            EvalResult(factor_name="llm_factor_1", stage1_ic=0.04, stage1_passed=True,
-                       stage2_ic=0.03, stage2_icir=0.45, passed=True, reason="passed"),
-        ]
-        MockEvaluator.return_value = mock_evaluator
-
-        mock_analyst = MagicMock()
-        mock_analyst.write_memo.return_value = "Test memo."
-        mock_analyst.load_memo.return_value = ""
-        MockAnalyst.return_value = mock_analyst
-
-        runner = RDAgentRunner(config=cfg)
-        results = runner.mine_factors(iterations=1)
-
-    assert mock_proposer.propose_factors.called
-    assert mock_evaluator.evaluate_factors_batch.called
-    assert mock_analyst.write_memo.called
-    assert mock_analyst.save_memo.called
-    assert isinstance(results, list)  # Valid result is always a list (may be empty)
+    runner = RDAgentRunner(mock_config, registry_path=tmp_path/"registry.db", evidence_path=tmp_path/"evidence.db")
+    with pytest.raises(TypeError):
+        runner.run_factor_search()
+    with pytest.raises(TypeError):
+        runner.run_model_search()
+    assert runner.library_status()["counts"]["trials"] == 0
+    assert runner.library_status()["active"] == []
 
 
-def test_runner_library_status_returns_dict():
-    """library_status should return a dict with expected keys."""
-    from src.core.rd_agent_runner import RDAgentRunner
+def test_evaluator_requires_archived_context():
+    import pytest
 
-    cfg = _mock_full_config(with_api_key=False)
-
-    with patch("src.core.rd_agent_runner.FactorProposer"), \
-         patch("src.core.rd_agent_runner.FactorEvaluator"), \
-         patch("src.core.rd_agent_runner.ResearchAnalyst"):
-        runner = RDAgentRunner(config=cfg)
-
-    status = runner.library_status()
-    assert "factor_count" in status
-    assert "avg_ic" in status
-    assert "last_run_date" in status
-
-
-def test_runner_kb_persistence(tmp_path):
-    """KB should be saved and loaded correctly across runner instances."""
-    from src.core.rd_agent_runner import RDAgentRunner
-
-    cfg = _mock_full_config(with_api_key=False)
-
-    with patch("src.core.rd_agent_runner.FactorProposer"), \
-         patch("src.core.rd_agent_runner.FactorEvaluator"), \
-         patch("src.core.rd_agent_runner.ResearchAnalyst"), \
-         patch("src.core.rd_agent_runner._KB_PATH", tmp_path / "kb.json"), \
-         patch("src.core.rd_agent_runner._KB_DIR", tmp_path):
-        runner = RDAgentRunner(config=cfg)
-        kb = runner._load_kb()
-        kb["tested_factors"] = ["test_factor"]
-        runner._save_kb(kb)
-
-        kb2 = runner._load_kb()
-        assert "test_factor" in kb2["tested_factors"]
-
-
-def test_runner_copilot_factor():
-    """copilot_factor should return a result dict with 'description' key."""
-    from src.core.rd_agent_runner import RDAgentRunner
-    from src.utils.schemas import EvalResult, FactorDefinition
-
-    cfg = _mock_full_config(with_api_key=False)
-
-    with patch("src.core.rd_agent_runner.FactorProposer") as MockProposer, \
-         patch("src.core.rd_agent_runner.FactorEvaluator") as MockEvaluator, \
-         patch("src.core.rd_agent_runner.ResearchAnalyst") as MockAnalyst:
-
-        mock_proposer = MagicMock()
-        mock_proposer.propose_factors.return_value = [
-            FactorDefinition(name="copilot_f1", expression="close / close.shift(5) - 1", category="momentum"),
-        ]
-        MockProposer.return_value = mock_proposer
-
-        mock_evaluator = MagicMock()
-        mock_evaluator.evaluate_factors_batch.return_value = [
-            EvalResult(factor_name="copilot_f1", stage1_ic=0.05, stage1_passed=True,
-                       stage2_ic=0.04, stage2_icir=0.5, passed=True, reason="passed"),
-        ]
-        MockEvaluator.return_value = mock_evaluator
-
-        MockAnalyst.return_value = MagicMock()
-
-        runner = RDAgentRunner(config=cfg)
-        result = runner.copilot_factor("momentum strategy with 5-day lookback")
-
-    assert "description" in result
-    assert "factors_accepted" in result
-
-
-def test_runner_reset_knowledge(tmp_path):
-    """reset_knowledge should reinitialise the KB to an empty state."""
-    import src.core.rd_agent_runner as rdmod
-    from src.core.rd_agent_runner import RDAgentRunner
-
-    original_kb_path = rdmod._KB_PATH
-    original_kb_dir = rdmod._KB_DIR
-    rdmod._KB_PATH = tmp_path / "kb.json"
-    rdmod._KB_DIR = tmp_path
-
-    try:
-        cfg = _mock_full_config(with_api_key=False)
-        with patch("src.core.rd_agent_runner.FactorProposer"), \
-             patch("src.core.rd_agent_runner.FactorEvaluator"), \
-             patch("src.core.rd_agent_runner.ResearchAnalyst"):
-            runner = RDAgentRunner(config=cfg)
-            runner.reset_knowledge()
-            kb = runner._load_kb()
-    finally:
-        rdmod._KB_PATH = original_kb_path
-        rdmod._KB_DIR = original_kb_dir
-
-    assert kb["tested_factors"] == []
-    assert kb["discoveries"] == []
+    from src.core.factor_evaluator import FactorEvaluator
+    from src.utils.schemas import FactorDefinition
+    with pytest.raises(TypeError):
+        FactorEvaluator().evaluate_factor(FactorDefinition(name="old",expression="$close"))

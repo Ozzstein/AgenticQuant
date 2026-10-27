@@ -87,7 +87,11 @@ full = [
 aiquant = "src.utils.cli:app"
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["src*", "scripts*"]
+
+[tool.setuptools.package-data]
+"src.strategies" = ["specifications/*.json"]
+"src.research.native_runtime" = ["upstream_files.json"]
 
 [tool.ruff]
 line-length = 100

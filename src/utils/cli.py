@@ -7,6 +7,11 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from scripts.run_agents import analyze as analyze_command
+from scripts.run_agents import app as agents_app
+from scripts.run_backtest import app as backtest_app
+from scripts.run_rd_agent import app as rdagent_app
+
 app = typer.Typer(
     name="aiquant",
     help="AI Quant Stack — LangGraph multi-agent quantitative trading platform",
@@ -37,78 +42,27 @@ def setup(
         console.print("[dim]Skipping data download. Use --download to fetch Qlib data.[/dim]")
 
 
-@app.command()
-def backtest(
-    model: str = typer.Option("LightGBM", "--model", "-m", help="Model name (LightGBM, Linear, CatBoost, XGBoost, Ensemble)"),
-    topk: int = typer.Option(30, "--topk", "-k", help="Top K stocks to hold"),
-    start: str = typer.Option("2020-01-01", "--start", help="Backtest start date"),
-    end: str = typer.Option("2023-12-31", "--end", help="Backtest end date"),
-    output: str = typer.Option("rich", "--output", "-o", help="Output format: rich, json"),
-    validate: bool = typer.Option(True, "--validate/--no-validate", help="Run validation checks"),
-    benchmark: bool = typer.Option(True, "--benchmark/--no-benchmark", help="Run benchmarks"),
-):
-    """Run walk-forward backtest with validation and benchmarks."""
-    from src.core.backtester import WalkForwardBacktester
-    from src.core.data_pipeline import DataPipeline
-    from src.core.ensemble import create_model
-    from src.utils.config import get_config
-
-    config = get_config()
-    console.print(f"[cyan]Running backtest: {model} top-{topk} ({start} to {end})[/cyan]")
-
-    pipeline = DataPipeline(config)
-    backtester = WalkForwardBacktester(config)
-    model_wrapper = create_model(model, config)
-
-    features, labels = pipeline.get_features(start, end)
-    result = backtester.run(features, labels, model_wrapper, topk=topk)
-
-    if output == "json":
-        console.print(result.model_dump_json(indent=2))
-    else:
-        _print_backtest_result(result)
-
-    if validate:
-        from src.core.backtester import BacktestValidator
-
-        validator = BacktestValidator()
-        validation = validator.validate(result)
-        console.print(f"\n[bold]Validation: {validation.verdict.value}[/bold]")
-
-    if benchmark:
-        from src.core.benchmark import BenchmarkRunner
-
-        runner = BenchmarkRunner(config)
-        comparison = runner.compare(result, start, end)
-        console.print(f"[dim]Monte Carlo percentile: {comparison.monte_carlo_percentile:.1f}%[/dim]")
+# One replay/validation CLI for direct scripts and the installed application.
+# Old label-only backtests are intentionally not retained as a parallel route.
+app.add_typer(backtest_app, name="backtest")
 
 
-@app.command()
-def analyze(
-    ticker: str = typer.Argument(..., help="Ticker symbol to analyze"),
-    provider: str = typer.Option("anthropic", "--provider", "-p", help="LLM provider"),
-    output: str = typer.Option("rich", "--output", "-o", help="Output format: rich, json"),
-):
-    """Run multi-agent analysis on a ticker."""
-    from src.agents.graph import build_trading_desk_graph
-    from src.utils.config import get_config
+app.add_typer(agents_app, name="agents")
+app.command("analyze")(analyze_command)
 
-    config = get_config()
-    console.print(f"[cyan]Analyzing {ticker} with {provider}...[/cyan]")
 
-    graph = build_trading_desk_graph(config)
-    result = graph.invoke({"ticker": ticker, "asset_class": "EQUITY"})
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, add_help_option=False)
+def data(ctx: typer.Context):
+    """Archive, query, train, infer and export US Qlib through the shared data CLI."""
+    from src.data.__main__ import main
+    raise typer.Exit(main(ctx.args))
 
-    if result.get("final_decision"):
-        decision = result["final_decision"]
-        if output == "json":
-            console.print(decision.model_dump_json(indent=2))
-        else:
-            _print_analysis_result(decision)
-    else:
-        console.print("[red]Analysis failed. Check errors.[/red]")
-        for err in result.get("errors", []):
-            console.print(f"  [red]{err}[/red]")
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, add_help_option=False)
+def decision(ctx: typer.Context):
+    """Bounded Jev service with persistent observations and exact replay."""
+    from src.decision.__main__ import main
+    raise typer.Exit(main(ctx.args))
 
 
 @app.command()
@@ -235,80 +189,6 @@ def _print_analysis_result(result) -> None:
     console.print(Panel(panel_content, title=f"Analysis: {result.ticker}"))
 
 
-# ---------------------------------------------------------------------------
-# RD-Agent sub-app
-# ---------------------------------------------------------------------------
+# Canonical and direct research commands share one implementation.
 
-rdagent_app = typer.Typer(name="rd-agent", help="RD-Agent factor and model discovery")
-app.add_typer(rdagent_app)
-
-
-@rdagent_app.command("mine-factors")
-def rdagent_mine_factors(
-    iterations: int = typer.Option(50, "--iterations", "-n", help="Number of factor iterations"),
-    min_ic: float = typer.Option(0.02, "--min-ic", help="Minimum IC threshold to accept a factor"),
-) -> None:
-    """Discover new alpha factors using RD-Agent."""
-    from src.utils.config_loader import get_full_config
-
-    cfg = get_full_config()
-    rd = cfg.rd_agent
-    console.print("[cyan]RD-Agent: mine-factors[/cyan]")
-    console.print(f"  enabled           : {rd.enabled}")
-    console.print(f"  factor_library_dir: {rd.factor_library_dir}")
-    console.print(f"  iterations        : {iterations}")
-    console.print(f"  min_ic            : {min_ic}")
-    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
-
-
-@rdagent_app.command("optimize-model")
-def rdagent_optimize_model(
-    iterations: int = typer.Option(20, "--iterations", "-n", help="Number of model iterations"),
-    budget: int = typer.Option(10, "--budget", "-b", help="Compute budget"),
-) -> None:
-    """Optimize ML model configuration using RD-Agent."""
-    from src.utils.config_loader import get_full_config
-
-    cfg = get_full_config()
-    rd = cfg.rd_agent
-    console.print("[cyan]RD-Agent: optimize-model[/cyan]")
-    console.print(f"  enabled                 : {rd.enabled}")
-    console.print(f"  best_model_config_path  : {rd.best_model_config_path}")
-    console.print(f"  iterations              : {iterations}")
-    console.print(f"  budget                  : {budget}")
-    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
-
-
-@rdagent_app.command("library-status")
-def rdagent_library_status() -> None:
-    """Show factor library contents and statistics."""
-    from pathlib import Path
-
-    from src.utils.config_loader import get_full_config
-
-    cfg = get_full_config()
-    lib_dir = Path(cfg.rd_agent.factor_library_dir)
-    console.print("[cyan]RD-Agent: library-status[/cyan]")
-    console.print(f"  factor_library_dir: {lib_dir}")
-    console.print(f"  exists            : {lib_dir.exists()}")
-    if lib_dir.exists():
-        entries = list(lib_dir.iterdir())
-        console.print(f"  entries           : {len(entries)}")
-    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
-
-
-@rdagent_app.command("validate-library")
-def rdagent_validate_library(
-    min_ic: float = typer.Option(0.02, "--min-ic", help="Minimum IC threshold for validation"),
-    min_icir: float = typer.Option(0.3, "--min-icir", help="Minimum ICIR threshold for validation"),
-) -> None:
-    """Validate factor library entries against IC threshold."""
-    from src.utils.config_loader import get_full_config
-
-    cfg = get_full_config()
-    rd = cfg.rd_agent
-    console.print("[cyan]RD-Agent: validate-library[/cyan]")
-    console.print(f"  factor_library_dir: {rd.factor_library_dir}")
-    console.print(f"  min_ic            : {min_ic}")
-    console.print(f"  min_icir          : {min_icir}")
-    console.print("[dim](Stub — no real RD-Agent implementation yet.)[/dim]")
+app.add_typer(rdagent_app, name="rd-agent")

@@ -101,6 +101,7 @@ class Evaluation(VersionedContract):
     status: Literal["complete", "failed"]
     validation_reliable: bool
     actual_model_hashes: tuple[Sha256, ...]
+    regime_evaluation_hash: Sha256 | None = None
     observations: int = Field(ge=0)
     sharpe: float | None = None
     ic: float | None = None
@@ -217,13 +218,13 @@ class ResearchRegistry:
                     raise RegistryError("holdout ID is immutable")
                 return
             # Renaming a consumed interval cannot manufacture an untouched holdout.
-            for row in db.execute("SELECT payload FROM holdouts WHERE dataset=?", (holdout.dataset_hash,)):
+            for row in db.execute("SELECT payload FROM holdouts"):
                 prior = Holdout.model_validate_json(row[0])
-                if max(prior.starts_at, holdout.starts_at) < min(prior.ends_at, holdout.ends_at):
+                if self._datasets_overlap(db,prior.dataset_hash,holdout.dataset_hash) and max(prior.starts_at, holdout.starts_at) < min(prior.ends_at, holdout.ends_at):
                     raise RegistryError("holdout overlaps a previously registered interval")
             for row in db.execute("SELECT payload FROM trials"):
                 trial = Trial.model_validate_json(row[0])
-                if trial.dataset_hash == holdout.dataset_hash and (
+                if self._datasets_overlap(db,trial.dataset_hash,holdout.dataset_hash) and (
                     max(trial.evaluation_start, holdout.starts_at) < min(trial.evaluation_end, holdout.ends_at)
                 ):
                     raise RegistryError("holdout was already exposed by a research trial")
@@ -231,6 +232,26 @@ class ResearchRegistry:
                 raise RegistryError("holdout dataset manifest is missing")
             db.execute("INSERT INTO holdouts VALUES (?,?,?)", (holdout.holdout_id, holdout.dataset_hash,
                                                               holdout.model_dump_json()))
+
+    @staticmethod
+    def _datasets_overlap(db, first: str, second: str) -> bool:
+        if first == second:
+            return True
+        scopes = []
+        for key in (first,second):
+            row = db.execute('SELECT content FROM blobs WHERE hash=?',(key,)).fetchone()
+            if row is None:
+                raise RegistryError('dataset artifact is missing')
+            try:
+                data = json.loads(row[0])
+                scope = {bar['instrument']['instrument_id'] for bar in data.get('bars',[])}
+            except (ValueError,TypeError,AttributeError,KeyError):
+                scope = set()
+            scopes.append(scope)
+        # Changing run context, source revision or feature recipe cannot make
+        # the same security/time interval untouched. Opaque non-market inputs
+        # still require exact content identity and their own domain verifier.
+        return bool(scopes[0] & scopes[1])
 
     def register_trial(self, trial: Trial) -> str:
         """Register before execution; failed and incomplete trials still count."""
@@ -262,15 +283,15 @@ class ResearchRegistry:
                 if db.execute("SELECT 1 FROM trials WHERE holdout=?", (trial.holdout_id,)).fetchone():
                     raise RegistryError("holdout has already been consumed by an attempted trial")
             else:
-                for hrow in db.execute("SELECT payload FROM holdouts WHERE dataset=?", (trial.dataset_hash,)):
+                for hrow in db.execute("SELECT payload FROM holdouts"):
                     holdout = Holdout.model_validate_json(hrow[0])
-                    if max(trial.evaluation_start, holdout.starts_at) < min(trial.evaluation_end, holdout.ends_at):
+                    if self._datasets_overlap(db,trial.dataset_hash,holdout.dataset_hash) and max(trial.evaluation_start, holdout.starts_at) < min(trial.evaluation_end, holdout.ends_at):
                         raise RegistryError("development trial touches a reserved holdout")
             db.execute("INSERT INTO trials VALUES (?,?,?,?,?)", (trial.trial_id, trial.candidate_id,
                                                                trial.family_id, trial.holdout_id, trial.model_dump_json()))
             # Snapshot at admission is immutable. Later trials can only increase
             # the multiplicity penalty checked again at activation.
-            count = db.execute("SELECT count(*) FROM trials WHERE family=?", (trial.family_id,)).fetchone()[0]
+            count = db.execute("SELECT count(*) FROM trials").fetchone()[0]
             snapshot = canonical({"trial": trial.model_dump(mode="json"), "candidate_hash": row[0],
                                   "family_trials_at_admission": count})
             key = self._blob(db, snapshot)
@@ -299,8 +320,12 @@ class ResearchRegistry:
         return row[0]
 
     def family_count(self, family_id: str) -> int:
+        """Conservative registry-wide multiplicity; renaming a family cannot reset it."""
         with self._connection() as db:
-            return db.execute("SELECT count(*) FROM trials WHERE family=?", (family_id,)).fetchone()[0]
+            return db.execute("SELECT count(*) FROM trials").fetchone()[0]
+
+    def trial_count_at_admission(self, trial_id: str) -> int:
+        return int(json.loads(self.blob(self.trial_snapshot(trial_id)))['family_trials_at_admission'])
 
     def record_evaluation(self, evaluation: Evaluation) -> None:
         """Persist independently computed outcome, with exact referenced evidence."""
@@ -321,11 +346,36 @@ class ResearchRegistry:
                     or evaluation.registry_snapshot_hash != snapshot_hash or evaluation.completed_at < trial.registered_at):
                 raise RegistryError("evaluation lineage/time mismatch")
             for key in (evaluation.replay_hash, evaluation.manifest_hash, evaluation.validation_hash,
-                        *evaluation.actual_model_hashes):
+                        *evaluation.actual_model_hashes,
+                        *((evaluation.regime_evaluation_hash,) if evaluation.regime_evaluation_hash else ())):
                 if not db.execute("SELECT 1 FROM blobs WHERE hash=?", (key,)).fetchone():
                     raise RegistryError("evaluation evidence/model artifact is missing")
             db.execute("INSERT INTO outcomes VALUES (?,?,?)", (evaluation.trial_id, evaluation.content_hash(),
                                                              evaluation.model_dump_json()))
+
+    def development_evaluation(self, trial_id: str) -> Evaluation:
+        """Read a verified development outcome without exposing held-out results."""
+        trial = self.trial(trial_id)
+        if trial.purpose != 'development':
+            raise RegistryError('research memos cannot read holdout outcomes')
+        with self._connection() as db:
+            row = db.execute('SELECT hash,payload FROM outcomes WHERE trial=?',(trial_id,)).fetchone()
+        if row is None:
+            raise RegistryError('development trial has no recorded outcome')
+        value = Evaluation.model_validate_json(row[1])
+        candidate = self.candidate(trial.candidate_id)
+        if (value.content_hash() != row[0] or value.trial_id != trial_id
+                or value.candidate_hash != candidate.content_hash()
+                or value.inputs_hash != trial.inputs_hash
+                or value.registry_snapshot_hash != self.trial_snapshot(trial_id)
+                or value.completed_at < trial.registered_at):
+            raise RegistryError('development outcome identity or chronology differs')
+        for key in (candidate.payload_hash,candidate.code_hash,candidate.environment_hash,
+                    value.inputs_hash,value.registry_snapshot_hash,value.replay_hash,
+                    value.manifest_hash,value.validation_hash,*value.actual_model_hashes,
+                    *((value.regime_evaluation_hash,) if value.regime_evaluation_hash else ())):
+            self.blob(key)
+        return value
 
     def _eligible(self, db, trial_id: str, policy: PromotionPolicy):
         trow = db.execute("SELECT payload FROM trials WHERE id=?", (trial_id,)).fetchone()
@@ -350,7 +400,7 @@ class ResearchRegistry:
             or abs(evaluation.max_factor_correlation) >= policy.max_factor_correlation
         ):
             raise RegistryError("factor IC/ICIR/correlation gate failed")
-        trials = db.execute("SELECT count(*) FROM trials WHERE family=?", (trial.family_id,)).fetchone()[0]
+        trials = db.execute("SELECT count(*) FROM trials").fetchone()[0]
         if evaluation.unadjusted_p_value is None or evaluation.unadjusted_p_value > policy.familywise_alpha / trials:
             raise RegistryError("multiple-trial significance gate failed")
         return candidate, evaluation
@@ -432,7 +482,8 @@ class ResearchRegistry:
             raise RegistryError("active candidate/evaluation identity or eligibility mismatch")
         for key in (candidate.code_hash, candidate.environment_hash, candidate.payload_hash,
                     activation.policy_hash, evaluation.inputs_hash, evaluation.replay_hash,
-                    evaluation.manifest_hash, evaluation.validation_hash, *evaluation.actual_model_hashes):
+                    evaluation.manifest_hash, evaluation.validation_hash, *evaluation.actual_model_hashes,
+                    *((evaluation.regime_evaluation_hash,) if evaluation.regime_evaluation_hash else ())):
             self.blob(key)
         return activation
 

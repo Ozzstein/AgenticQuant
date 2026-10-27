@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import builtins
-import json
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-import yaml
-
-from src.utils.schemas import FactorDefinition
 
 # Capture the real built-in import so side-effect helpers can delegate to it.
 _real_import = builtins.__import__
@@ -303,73 +299,3 @@ class TestDataPipelineWithMockConfig:
 # ---------------------------------------------------------------------------
 # RDAgentRunner — stub mode
 # ---------------------------------------------------------------------------
-
-
-class TestRDAgentRunnerStub:
-    def test_rdagent_runner_stub_mode(self):
-        """run_factor_search returns [] when rdagent is not installed."""
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        with patch.dict("sys.modules", {"rdagent": None}):
-            with patch("builtins.__import__", side_effect=_import_blocker("rdagent")):
-                runner = RDAgentRunner()
-
-        assert runner._rd_agent_available is False
-        assert runner.run_factor_search() == []
-
-    def test_rdagent_runner_stub_model_search(self):
-        """run_model_search returns {} when rdagent is not installed."""
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        with patch.dict("sys.modules", {"rdagent": None}):
-            with patch("builtins.__import__", side_effect=_import_blocker("rdagent")):
-                runner = RDAgentRunner()
-
-        assert runner.run_model_search() == {}
-
-    def test_rdagent_runner_save_factor_library(self, tmp_path):
-        """save_factor_library writes a valid JSON file."""
-        from src.core.rd_agent_runner import RDAgentRunner
-        from src.utils.config_loader import FullAppConfig
-
-        lib_dir = tmp_path / "factor_library"
-        cfg = FullAppConfig(
-            rd_agent={"factor_library_dir": str(lib_dir), "best_model_config_path": str(tmp_path / "model.yaml")}
-        )
-
-        runner = RDAgentRunner(config=cfg)
-        factors = [
-            FactorDefinition(name="momentum_5d", expression="Ref($close,5)/$close-1", ic_mean=0.03),
-            FactorDefinition(name="vol_20d", expression="Std($close,20)", ic_mean=0.01),
-        ]
-        runner.save_factor_library(factors)
-
-        json_path = lib_dir / "factor_library.json"
-        assert json_path.exists()
-        loaded = json.loads(json_path.read_text())
-        assert len(loaded) == 2
-        assert loaded[0]["name"] == "momentum_5d"
-
-    def test_rdagent_runner_save_model_config(self, tmp_path):
-        """save_model_config writes a valid YAML file."""
-        from src.core.rd_agent_runner import RDAgentRunner
-        from src.utils.config_loader import FullAppConfig
-
-        yaml_path = tmp_path / "best_model_config.yaml"
-        cfg = FullAppConfig(
-            rd_agent={
-                "factor_library_dir": str(tmp_path / "factors"),
-                "best_model_config_path": str(yaml_path),
-            }
-        )
-
-        runner = RDAgentRunner(config=cfg)
-        model_cfg = {"model": "LightGBM", "n_estimators": 300, "learning_rate": 0.05}
-        runner.save_model_config(model_cfg)
-
-        assert yaml_path.exists()
-        loaded = yaml.safe_load(yaml_path.read_text())
-        assert loaded["model"] == "LightGBM"
-        assert loaded["n_estimators"] == 300
-
-

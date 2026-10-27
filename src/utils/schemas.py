@@ -323,7 +323,7 @@ class EvalResult(BaseModel):
     """Two-stage factor evaluation result from FactorEvaluator."""
 
     factor_name: str
-    stage1_ic: float
+    stage1_ic: float | None
     stage1_passed: bool
     stage2_ic: float | None = None
     stage2_icir: float | None = None
