@@ -18,95 +18,34 @@ logger = get_logger(__name__)
 # ------------------------------------------------------------------
 
 
-def _eval_factor_expression(
-    expr: str, name: str, close: pd.Series, volume: pd.Series | None
-) -> pd.Series | None:
-    """Evaluate a factor expression using pandas operations.
-
-    Args:
-        expr: Factor expression string (lowercase).
-        name: Factor name (lowercase).
-        close: Close price Series.
-        volume: Volume Series (may be None).
-
-    Returns:
-        Computed factor values as pd.Series, or None if unrecognized.
-    """
-    import re
-
-    try:
-        if "momentum" in expr or "pct_change" in expr or "mom" in name:
-            match = re.search(r"(\d+)", name)
-            window = int(match.group(1)) if match else 20
-            return close.pct_change(window)
-        elif "rsi" in expr or "rsi" in name:
-            match = re.search(r"(\d+)", name)
-            period = int(match.group(1)) if match else 14
-            delta = close.diff()
-            gain = delta.clip(lower=0).rolling(period).mean()
-            loss = (-delta.clip(upper=0)).rolling(period).mean()
-            rs = gain / loss.replace(0, float("inf"))
-            return 100 - (100 / (1 + rs))
-        elif "macd" in expr or "macd" in name:
-            ema12 = close.ewm(span=12, adjust=False).mean()
-            ema26 = close.ewm(span=26, adjust=False).mean()
-            return ema12 - ema26
-        elif "bb" in expr or "bollinger" in name:
-            sma = close.rolling(20).mean()
-            std = close.rolling(20).std()
-            bb_upper = sma + 2 * std
-            bb_lower = sma - 2 * std
-            band_width = bb_upper - bb_lower
-            return (close - bb_lower) / band_width.replace(0, float("nan"))
-        elif "atr" in expr or "atr" in name:
-            return close.rolling(14).std() / close
-        elif "obv" in expr or "obv" in name:
-            if volume is None:
-                return None
-            direction = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-            obv = (volume * direction).cumsum()
-            return obv.pct_change(20)
-        elif "volume" in expr or "vol_ratio" in name:
-            if volume is None:
-                return None
-            return volume / volume.rolling(20).mean()
-        else:
-            # Default: 20-day momentum
-            return close.pct_change(20)
-    except Exception:
-        return None
+def _eval_factor_expression(expr: str, name: str, close: pd.Series, volume: pd.Series | None) -> pd.Series:
+    """Compatibility adapter to the exact shared expression interpreter."""
+    from src.data.features.expressions import evaluate_expression
+    frame = pd.DataFrame({"close": close})
+    if volume is not None:
+        frame["volume"] = volume
+    return evaluate_expression(expr, frame).rename(name)
 
 
-def _compute_factor(df: pd.DataFrame, factor: "Any") -> pd.Series | None:
-    """Compute a factor from OHLCV data based on expression keywords.
+def _compute_factor(df: pd.DataFrame, factor: Any) -> pd.Series:
+    from src.data.features.expressions import evaluate_expression
+    return evaluate_expression(factor.expression, df).rename(factor.name)
 
-    Args:
-        df: OHLCV DataFrame with columns: open, high, low, close, volume, ticker.
-        factor: FactorDefinition with name and expression attributes.
 
-    Returns:
-        pd.Series with factor values, or None if computation fails.
-    """
-    expr = factor.expression.lower()
-    name = factor.name.lower()
-
-    # For multi-ticker DataFrames, compute per ticker and concatenate
-    if "ticker" in df.columns:
-        frames = []
-        for _ticker, grp in df.groupby("ticker"):
-            close = grp["close"]
-            volume = grp["volume"] if "volume" in grp.columns else None
-
-            val = _eval_factor_expression(expr, name, close, volume)
-            if val is not None:
-                frames.append(val)
-        if frames:
-            return pd.concat(frames)
-        return None
-    else:
-        close = df["close"]
-        volume = df.get("volume")
-        return _eval_factor_expression(expr, name, close, volume)
+def instrument_index(frame: pd.DataFrame) -> pd.DataFrame:
+    """Construct an unambiguous date/instrument join key; never join by date alone."""
+    if isinstance(frame.index, pd.MultiIndex):
+        if not frame.index.is_unique:
+            raise DataPipelineError("duplicate date/instrument rows")
+        return frame
+    identity = next((c for c in ("instrument_id", "instrument", "ticker") if c in frame), None)
+    if identity is None:
+        raise DataPipelineError("instrument identity is required for panel joins")
+    result = frame.copy()
+    result.index = pd.MultiIndex.from_arrays([frame.index, frame[identity]], names=["datetime", "instrument"])
+    if not result.index.is_unique:
+        raise DataPipelineError("duplicate date/instrument rows")
+    return result
 
 
 class DataPipeline:
@@ -146,7 +85,7 @@ class DataPipeline:
                 self.config.qlib.region,
             )
         except ImportError:
-            logger.warning("pyqlib not installed — running without Qlib.")
+            raise DataPipelineError("pyqlib is required for the configured Qlib scenario") from None
         except Exception as exc:
             raise DataPipelineError(f"Qlib initialisation failed: {exc}") from exc
 
@@ -164,14 +103,14 @@ class DataPipeline:
             A Qlib ``DatasetH`` instance, or ``None`` when Qlib is unavailable.
         """
         if not self._qlib_initialized:
-            logger.warning("Qlib not initialised — get_dataset returns None.")
-            return None
+            raise DataPipelineError("Qlib must be initialized with an explicit verified US bundle")
 
         try:
             from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
             from qlib.data.dataset import DatasetH  # noqa: PLC0415
-            from qlib.data.dataset.handler import DataHandlerLP  # noqa: PLC0415
 
+            if dataset_type not in ("Alpha158", "Alpha360"):
+                raise DataPipelineError(f"Unsupported Qlib dataset: {dataset_type}")
             handler_cls = Alpha158
             if dataset_type == "Alpha360":
                 from qlib.contrib.data.handler import Alpha360  # noqa: PLC0415
@@ -184,7 +123,8 @@ class DataPipeline:
                 end_time=self.config.qlib.test_end,
                 fit_start_time=self.config.qlib.train_start,
                 fit_end_time=self.config.qlib.train_end,
-                infer_processors=[DataHandlerLP.IS_DEPEND],
+                infer_processors=[{"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+                                  {"class": "Fillna", "kwargs": {"fields_group": "feature"}}],
             )
             dataset = DatasetH(
                 handler=handler,
@@ -197,8 +137,7 @@ class DataPipeline:
             logger.info("Qlib DatasetH ({}) created.", dataset_type)
             return dataset
         except Exception as exc:
-            logger.warning("get_dataset failed: {} — returning None.", exc)
-            return None
+            raise DataPipelineError(f"Qlib dataset construction failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Feature retrieval
@@ -242,7 +181,7 @@ class DataPipeline:
                 )
                 return df
             except Exception as exc:
-                logger.warning("Qlib feature fetch failed ({}). Falling back to yfinance.", exc)
+                raise DataPipelineError(f"Qlib feature fetch failed: {exc}") from exc
 
         logger.info("Using yfinance fallback for features: start={}, end={}", start, end)
         return self.yfinance_fallback(start=start, end=end)
@@ -276,7 +215,8 @@ class DataPipeline:
         """
         import yfinance as yf  # noqa: PLC0415
 
-        tickers = tickers or ["SPY", "QQQ", "IWM"]
+        if not tickers:
+            raise DataPipelineError("explicit instruments required; no benchmark-universe substitution")
 
         logger.info(
             "yfinance download: tickers={}, interval={}, start={}, end={}, period={}",
@@ -288,11 +228,11 @@ class DataPipeline:
         )
 
         if period is not None:
-            raw = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+            raw = yf.download(tickers, period=period, interval=interval, auto_adjust=False, progress=False)
         else:
             start = start or self.config.qlib.test_start
             end = end or self.config.qlib.test_end
-            raw = yf.download(tickers, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
+            raw = yf.download(tickers, start=start, end=end, interval=interval, auto_adjust=False, progress=False)
 
         if raw.empty:
             logger.warning("yfinance returned empty DataFrame.")
@@ -324,7 +264,7 @@ class DataPipeline:
     # Custom factor integration
     # ------------------------------------------------------------------
 
-    def load_factor_library(self) -> pd.DataFrame:
+    def load_factor_library(self, base_df: pd.DataFrame | None = None) -> pd.DataFrame:
         """Load factor library from outputs/factor_library.json and compute factor values.
 
         Loads the JSON file produced by RDAgentRunner.save_factor_library().
@@ -349,15 +289,14 @@ class DataPipeline:
             with factor_library_path.open() as fh:
                 raw = json.load(fh)
         except Exception as exc:
-            logger.warning("Could not load factor library: {}", exc)
-            return pd.DataFrame()
+            raise DataPipelineError(f"Invalid factor library: {exc}") from exc
 
         factors: list[FactorDefinition] = []
         for item in raw:
             try:
                 factors.append(FactorDefinition(**item))
-            except Exception:
-                continue
+            except Exception as exc:
+                raise DataPipelineError(f"Invalid factor definition: {exc}") from exc
 
         if not factors:
             logger.info("Factor library loaded but empty.")
@@ -366,7 +305,9 @@ class DataPipeline:
         logger.info("Factor library loaded: {} factors.", len(factors))
 
         # Get base OHLCV data to compute factors on
-        base_df = self.yfinance_fallback()  # uses default test window
+        if base_df is None:
+            base_df = self.get_features()
+        base_df = instrument_index(base_df)
         if base_df.empty:
             return pd.DataFrame()
 
@@ -381,8 +322,7 @@ class DataPipeline:
                 if factor_col is not None:
                     factor_frames.append(factor_col.rename(factor.name))
             except Exception as exc:
-                logger.debug("Factor {} computation failed: {}", factor.name, exc)
-                continue
+                raise DataPipelineError(f"Factor {factor.name} failed exactly as specified: {exc}") from exc
 
         if not factor_frames:
             return pd.DataFrame()
@@ -408,38 +348,20 @@ class DataPipeline:
             Qlib DatasetH when Qlib is available, else a plain DataFrame
             with base features merged with any custom factors.
         """
+        base_df = instrument_index(self.get_features())
         if custom_factors is None:
-            logger.info("Loading factor library from disk...")
-            custom_factors = self.load_factor_library()
-
-        # When Qlib is available, try to use it (factors passed as extra context for now)
-        if self._qlib_initialized:
-            if custom_factors is not None and not custom_factors.empty:
-                logger.info(
-                    "Custom factors provided (shape={}); using Qlib dataset.", custom_factors.shape
-                )
-            return self.get_dataset(self.config.qlib.dataset)
-
-        # Fallback: get base features and merge custom factors
-        base_df = self.get_features()
-        if custom_factors is None or custom_factors.empty:
-            logger.info(
-                "create_dataset_with_custom_factors: no custom factors, returning base features."
-            )
+            custom_factors = self.load_factor_library(base_df)
+        if custom_factors.empty:
             return base_df
-
-        logger.info(
-            "Merging base features ({} rows) with custom factors ({} rows).",
-            len(base_df),
-            len(custom_factors),
-        )
+        custom_factors = instrument_index(custom_factors) if not isinstance(custom_factors.index, pd.MultiIndex) else custom_factors
+        if not custom_factors.index.is_unique:
+            raise DataPipelineError("custom factors contain duplicate instrument/date keys")
+        if not custom_factors.index.isin(base_df.index).all():
+            raise DataPipelineError("custom factors contain observations outside base data")
         try:
-            merged = base_df.join(custom_factors, how="left")
-            logger.info("Merged dataset: {} rows × {} cols.", len(merged), merged.shape[1])
-            return merged
+            return base_df.join(custom_factors, how="left", validate="one_to_one")
         except Exception as exc:
-            logger.warning("Factor merge failed ({}). Returning base features.", exc)
-            return base_df
+            raise DataPipelineError(f"Custom factor join failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Crypto / equity merge

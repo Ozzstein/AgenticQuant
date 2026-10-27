@@ -90,8 +90,8 @@ class CryptoFactorEngine:
         """
         self._require_columns(oi_df, ["open_interest"])
         self._require_columns(price_df, ["close"])
-        oi_chg = oi_df["open_interest"].pct_change()
-        price_chg = price_df["close"].pct_change()
+        oi_chg = oi_df["open_interest"].pct_change(fill_method=None)
+        price_chg = price_df["close"].pct_change(fill_method=None)
         combined = pd.concat([oi_chg, price_chg], axis=1).dropna()
         corr = combined.iloc[:, 0].rolling(window).corr(combined.iloc[:, 1])
         return corr
@@ -143,16 +143,8 @@ class CryptoFactorEngine:
         r = returns.loc[common_idx]
         b = btc_returns.loc[common_idx]
 
-        def rolling_beta(i: int) -> float:
-            if i < window:
-                return np.nan
-            y = r.iloc[i - window : i]
-            x = b.iloc[i - window : i]
-            cov = np.cov(x, y)[0, 1]
-            var = np.var(x)
-            return cov / var if var > 0 else 0.0
-
-        betas = pd.Series([rolling_beta(i) for i in range(len(r))], index=r.index)
+        # Same sample covariance/variance convention, fit strictly before day t.
+        betas = r.rolling(window).cov(b).shift(1) / b.rolling(window).var().shift(1).replace(0, np.nan)
         residuals = r - betas * b
         return residuals.rolling(window).sum()
 
@@ -177,7 +169,7 @@ class CryptoFactorEngine:
             pd.Series of percentile ranks in [0, 1], NaN for first (window+lookback) rows.
         """
         log_returns = np.log(prices / prices.shift(1))
-        realized_vol = log_returns.rolling(window).std() * np.sqrt(252)
+        realized_vol = log_returns.rolling(window).std() * np.sqrt(365)
         percentile = realized_vol.rolling(lookback).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
         )

@@ -74,6 +74,8 @@ class MarketSnapshot(VersionedContract):
         records = {e.evidence_id: e for e in self.evidence}
         if len(records) != len(self.evidence):
             raise ValueError("duplicate evidence IDs")
+        for record in self.evidence:
+            record.require_available(self.context.as_of)
         keys = set()
         for bar in self.bars:
             key = (bar.instrument.instrument_id, bar.closed_at, bar.price_basis, bar.market_type)

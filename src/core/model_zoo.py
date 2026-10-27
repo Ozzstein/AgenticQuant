@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +14,13 @@ import joblib
 import numpy as np
 import pandas as pd
 import yaml
-from scipy.stats import spearmanr
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 
+from src.data.evidence.store import canonical_bytes, digest
+from src.data.features.metrics import prediction_metrics
+from src.domain.common import RunContext
+from src.domain.market import ModelArtifact
 from src.utils.config import PROJECT_ROOT, AppConfig, get_config
 from src.utils.exceptions import ModelError
 from src.utils.logger import get_logger
@@ -82,6 +90,11 @@ class ModelWrapper:
         self.config = config or get_config()
         self.model: Any = None
         self._params: dict[str, Any] = self._load_params()
+        self._feature_names: tuple[str, ...] = ()
+        self._imputer = None
+        self._scaler = None
+        self._provenance = None
+        self.artifact: ModelArtifact | None = None
 
     # ------------------------------------------------------------------
     # Class-level helpers
@@ -149,19 +162,8 @@ class ModelWrapper:
         """
         defaults = dict(DEFAULT_PARAMS.get(self.model_name, {}))
 
-        # Try RD-Agent config
-        rd_cfg = self.load_rd_agent_config()
-        if rd_cfg:
-            rd_model = rd_cfg.get("model_name", "")
-            if rd_model == self.model_name or not rd_model:
-                rd_params = rd_cfg.get("params", rd_cfg.get("model_params", {}))
-                if rd_params:
-                    logger.debug(
-                        "Using RD-Agent params for {}: {}", self.model_name, rd_params
-                    )
-                    defaults.update(rd_params)
-                    return defaults
-
+        # Research candidates cannot mutate active training by dropping a YAML
+        # file into outputs. Only explicit evaluated config is consumed here.
         # Merge config.qlib.model_params when model names match
         try:
             cfg_model = self.config.qlib.model_name
@@ -199,84 +201,96 @@ class ModelWrapper:
     # Public API
     # ------------------------------------------------------------------
 
-    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> "ModelWrapper":
-        """Fit the model on training data.
+    @staticmethod
+    def _dates(index: pd.Index) -> pd.DatetimeIndex:
+        if isinstance(index, pd.MultiIndex):
+            level = next((name for name in ("datetime", "date", "timestamp") if name in index.names), None)
+            if level is None:
+                raise ModelError("date index level is required")
+            index = index.get_level_values(level)
+        if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+            raise ModelError("temporal training requires timezone-aware dates")
+        return index
 
-        Args:
-            X_train: Feature matrix.
-            y_train: Target labels.
-
-        Returns:
-            ``self`` for chaining.
-
-        Raises:
-            ModelError: On any training failure.
-        """
-        logger.info("Training {} on {} samples × {} features", self.model_name, *X_train.shape)
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series, *, context: RunContext | None = None,
+              feature_available_at: pd.Series | None = None, label_available_at: pd.Series | None = None,
+              feature_spec_hash: str | None = None, data_snapshot_hash: str | None = None) -> "ModelWrapper":
+        if not isinstance(X_train, pd.DataFrame) or not isinstance(y_train, pd.Series):
+            raise ModelError("training requires indexed DataFrame/Series")
+        if X_train.empty or not X_train.index.is_unique or not X_train.index.equals(y_train.index):
+            raise ModelError("training data/label identity must match exactly and be unique/nonempty")
+        if not X_train.columns.is_unique or not all(isinstance(c, str) for c in X_train.columns):
+            raise ModelError("unique string feature names required")
+        if not np.isfinite(y_train.to_numpy(dtype=float)).all():
+            raise ModelError("unrealized or invalid training labels")
+        provenance = None
+        if context is not None:
+            dates = self._dates(X_train.index)
+            for availability in (feature_available_at, label_available_at):
+                if availability is None or not availability.index.equals(X_train.index) or availability.isna().any():
+                    raise ModelError("explicit aligned feature and label availability required")
+                if any(pd.Timestamp(t).tzinfo is None for t in availability):
+                    raise ModelError("availability requires a timezone")
+                if (availability > context.as_of).any():
+                    raise ModelError("future observations cannot enter training")
+            if (dates > context.as_of).any() or (feature_available_at.to_numpy() > dates.to_numpy()).any():
+                raise ModelError("revised/future features unavailable at their historical decision date")
+            if not feature_spec_hash or not data_snapshot_hash:
+                raise ModelError("feature and snapshot hashes required for temporal training")
+            provenance = dict(feature_spec_hash=feature_spec_hash, training_data_hash=data_snapshot_hash,
+                              fitted_at=context.as_of, training_start=dates.min().to_pydatetime(),
+                              training_end=dates.max().to_pydatetime(),
+                              labels_available_through=pd.Timestamp(label_available_at.max()).to_pydatetime(),
+                              code_version=context.code_version)
         try:
+            clean = X_train.astype(float).replace([np.inf, -np.inf], np.nan)
+            if clean.isna().all().any():
+                raise ModelError("required feature has no eligible training coverage")
+            self._feature_names = tuple(X_train.columns)
+            self._imputer = SimpleImputer(strategy="median")
+            self._scaler = StandardScaler()
+            values = self._scaler.fit_transform(self._imputer.fit_transform(clean))
+            transformed = pd.DataFrame(values, index=X_train.index, columns=self._feature_names)
             self.model = self._instantiate_model()
-            self.model.fit(X_train, y_train)
-            logger.info("{} training complete.", self.model_name)
+            self.model.fit(transformed, y_train)
+            self._provenance = provenance
+            self.artifact = None
         except ModelError:
             raise
         except Exception as exc:
             raise ModelError(f"{self.model_name} training failed: {exc}") from exc
         return self
 
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        """Generate predictions for *X*.
-
-        Args:
-            X: Feature matrix with the same columns used during training.
-
-        Returns:
-            Prediction Series indexed identically to *X*.
-
-        Raises:
-            ModelError: If the model has not been trained yet.
-        """
-        if self.model is None:
+    def predict(self, X: pd.DataFrame, *, context: RunContext | None = None,
+                feature_available_at: pd.Series | None = None) -> pd.Series:
+        if self.model is None or self._imputer is None:
             raise ModelError(f"{self.model_name} has not been trained. Call train() first.")
+        if tuple(X.columns) != self._feature_names or not X.index.is_unique:
+            raise ModelError("prediction feature schema/order or instrument/date identity mismatch")
+        if context is not None:
+            if self._provenance is None:
+                raise ModelError("unversioned model cannot perform temporal inference")
+            dates = self._dates(X.index)
+            if (dates <= self._provenance["fitted_at"]).any() or (dates > context.as_of).any():
+                raise ModelError("inference observations must follow model fit and precede cutoff")
+            if feature_available_at is None or not feature_available_at.index.equals(X.index) or feature_available_at.isna().any():
+                raise ModelError("explicit prediction feature availability required")
+            if (feature_available_at > context.as_of).any() or (feature_available_at.to_numpy() > dates.to_numpy()).any():
+                raise ModelError("future feature in inference")
         try:
-            preds = self.model.predict(X)
+            clean = X.astype(float).replace([np.inf, -np.inf], np.nan)
+            transformed = pd.DataFrame(self._scaler.transform(self._imputer.transform(clean)), index=X.index, columns=self._feature_names)
+            preds = self.model.predict(transformed)
+            if not np.isfinite(preds).all():
+                raise ModelError("model produced invalid predictions")
             return pd.Series(preds, index=X.index, name="prediction")
+        except ModelError:
+            raise
         except Exception as exc:
             raise ModelError(f"{self.model_name} prediction failed: {exc}") from exc
 
     def evaluate(self, X: pd.DataFrame, y: pd.Series) -> dict[str, float]:
-        """Compute evaluation metrics on a hold-out set.
-
-        Metrics:
-        - **ic**: Spearman rank correlation between predictions and *y*.
-        - **icir**: IC / std(IC) — approximated as the Spearman statistic itself
-          (single-period; callers aggregate over time for a true ICIR).
-        - **mse**: Mean squared error.
-        - **r2**: Coefficient of determination.
-
-        Args:
-            X: Feature matrix.
-            y: True labels.
-
-        Returns:
-            Dict with keys ``ic``, ``icir``, ``mse``, ``r2``.
-
-        Raises:
-            ModelError: If the model has not been trained.
-        """
-        preds = self.predict(X)
-        y_arr = np.asarray(y)
-        p_arr = np.asarray(preds)
-
-        corr, _ = spearmanr(p_arr, y_arr)
-        ic = float(corr) if not np.isnan(corr) else 0.0
-        mse = float(mean_squared_error(y_arr, p_arr))
-        r2 = float(r2_score(y_arr, p_arr))
-
-        # ICIR approximation: single-period IC / assumed std of 1
-        # (true ICIR requires multiple time-period ICs)
-        icir = ic
-
-        return {"ic": ic, "icir": icir, "mse": mse, "r2": r2}
+        return prediction_metrics(self.predict(X), y)
 
     def get_feature_importance(self) -> pd.Series:
         """Return feature importances (or coefficients for linear models).
@@ -324,43 +338,63 @@ class ModelWrapper:
             return pd.Series(dtype=float)
 
     def save(self, path: str) -> None:
-        """Serialise the trained model to disk using joblib.
+        """Save model+fitted transforms with a hashed, versioned sidecar.
 
-        Args:
-            path: File path to write (created if parent dirs exist).
-
-        Raises:
-            ModelError: If the model has not been trained or saving fails.
+        Only load application-owned artifacts: joblib deserialization is for
+        trusted local files, never raw research/provider downloads.
         """
         if self.model is None:
             raise ModelError("Cannot save an untrained model.")
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = {"schema_version": "2.0", "model_name": self.model_name, "model": self.model,
+                "feature_names": self._feature_names, "imputer": self._imputer, "scaler": self._scaler,
+                "provenance": self._provenance, "params": self._params}
+        fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".model-")
+        os.close(fd)
         try:
-            joblib.dump({"model_name": self.model_name, "model": self.model}, path)
-            logger.info("Saved {} to {}", self.model_name, path)
-        except Exception as exc:
-            raise ModelError(f"Failed to save model to '{path}': {exc}") from exc
+            joblib.dump(data, temporary)
+            payload_hash = digest(Path(temporary).read_bytes())
+            metadata = {"schema_version": "2.0", "payload_hash": payload_hash, "temporal_provenance": self._provenance is not None}
+            if self._provenance:
+                packages = ("numpy", "pandas", "scikit-learn", "joblib", REGISTRY[self.model_name].split(".")[0])
+                environment = []
+                for package in dict.fromkeys(packages):
+                    try:
+                        environment.append((package, importlib.metadata.version(package)))
+                    except importlib.metadata.PackageNotFoundError:
+                        pass
+                self.artifact = ModelArtifact(model_name=self.model_name, payload_hash=payload_hash,
+                                              feature_names=self._feature_names, environment=tuple(environment),
+                                              parameters_json=canonical_bytes(self._params).decode(), **self._provenance)
+                metadata["artifact"] = self.artifact.model_dump(mode="json")
+            # Content mismatch during a concurrent read fails closed. Activation
+            # is a coordinator-owned atomic manifest pointer, not these files.
+            os.replace(temporary, target)
+            sidecar = Path(str(target) + ".json")
+            side_temp = Path(str(sidecar) + ".tmp")
+            side_temp.write_bytes(canonical_bytes(metadata))
+            os.replace(side_temp, sidecar)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def load(self, path: str) -> "ModelWrapper":
-        """Load a previously saved model from disk.
-
-        Args:
-            path: File path produced by :meth:`save`.
-
-        Returns:
-            ``self`` with the restored model.
-
-        Raises:
-            ModelError: If loading fails.
-        """
         try:
+            metadata = json.loads(Path(str(path) + ".json").read_text())
+            if metadata.get("schema_version") != "2.0" or digest(Path(path).read_bytes()) != metadata["payload_hash"]:
+                raise ModelError("model artifact version/integrity mismatch")
             data = joblib.load(path)
-            if isinstance(data, dict):
-                self.model = data["model"]
-                self.model_name = data.get("model_name", self.model_name)
-            else:
-                # Legacy / raw pickle
-                self.model = data
-            logger.info("Loaded {} from {}", self.model_name, path)
+            if data.get("schema_version") != "2.0" or data["model_name"] not in REGISTRY:
+                raise ModelError("unsupported model artifact")
+            self.model, self.model_name = data["model"], data["model_name"]
+            self._feature_names = tuple(data["feature_names"])
+            self._imputer, self._scaler = data["imputer"], data["scaler"]
+            self._provenance, self._params = data["provenance"], data["params"]
+            self.artifact = ModelArtifact.model_validate(metadata["artifact"]) if metadata.get("artifact") else None
+            if self.artifact and self.artifact.payload_hash != metadata["payload_hash"]:
+                raise ModelError("model metadata integrity mismatch")
+        except ModelError:
+            raise
         except Exception as exc:
-            raise ModelError(f"Failed to load model from '{path}': {exc}") from exc
+            raise ModelError(f"Failed to load versioned model: {exc}") from exc
         return self

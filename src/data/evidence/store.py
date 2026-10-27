@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -119,10 +120,15 @@ class EvidenceStore:
                     BEGIN SELECT RAISE(ABORT, 'immutable snapshot'); END;
             """)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         db = sqlite3.connect(self.path, timeout=30)
-        db.execute("PRAGMA foreign_keys=ON")
-        return db
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def put(self, record: EvidenceRecord, raw: bytes, *, kind: str,
             logical_key: str, document: str | None = None,

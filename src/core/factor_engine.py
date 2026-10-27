@@ -41,6 +41,7 @@ _FACTOR_NAMES = [
     "garman_klass",
     "parkinson",
     "mean_reversion",
+    "composite_momentum",
 ]
 
 
@@ -89,6 +90,7 @@ class FactorEngine:
         rsi = 100.0 - (100.0 / (1.0 + rs))
         # When avg_loss == 0 (pure up-trend), RSI should be 100
         rsi = rsi.where(avg_loss != 0, 100.0)
+        rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
         return rsi.rename("rsi")
 
     def compute_macd(
@@ -357,14 +359,12 @@ class FactorEngine:
         if unknown:
             raise FactorError(f"Unknown factor names: {sorted(unknown)}")
 
-        if "ticker" in df.columns:
-            parts = []
-            for ticker, grp in df.groupby("ticker", sort=False):
-                part = self._compute_factors_single(grp, requested)
-                parts.append(part)
-            return pd.concat(parts).sort_index()
-
-        return self._compute_factors_single(df, requested)
+        from src.data.features.expressions import panel_groups
+        result = pd.DataFrame(index=df.index, columns=sorted(requested), dtype=float)
+        for positions in panel_groups(df):
+            part = self._compute_factors_single(df.iloc[positions], requested)
+            result.iloc[positions] = part.reindex(columns=result.columns).to_numpy()
+        return result
 
     def _compute_factors_single(
         self, df: pd.DataFrame, requested: set[str]
@@ -374,6 +374,11 @@ class FactorEngine:
 
         def _want(*names: str) -> bool:
             return not requested.isdisjoint(names)
+
+        if _want("composite_momentum"):
+            # Explicit spec: equal-weight 3/6/12-month momentum minus last month.
+            close = df["close"]
+            result["composite_momentum"] = sum(close / close.shift(n) - 1 for n in (63, 126, 252)) / 3 - (close / close.shift(21) - 1)
 
         if _want("rsi"):
             result["rsi"] = self.compute_rsi(df)
