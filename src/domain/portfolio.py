@@ -14,7 +14,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_serializer, model_validator
 
-from src.domain.common import Instrument, NonEmptyString, UtcTimestamp, VersionedContract
+from src.domain.common import Instrument, NonEmptyString, Sha256, UtcTimestamp, VersionedContract
 
 Positive = Annotated[Decimal, Field(gt=0)]
 NonNegative = Annotated[Decimal, Field(ge=0)]
@@ -38,7 +38,7 @@ class _FrozenDict(dict):
 
 class AccountSpec(VersionedContract):
     account_id: NonEmptyString
-    mode: Literal["paper", "backtest"]
+    mode: Literal["paper", "backtest", "live"]
     base_currency: NonEmptyString
     initial_cash: Positive
     opened_at: UtcTimestamp
@@ -46,7 +46,7 @@ class AccountSpec(VersionedContract):
     @model_validator(mode="after")
     def namespace(self):
         if not self.account_id.startswith(self.mode + ":"):
-            raise ValueError("account_id must be namespaced paper: or backtest:")
+            raise ValueError("account_id must be namespaced for its paper/backtest/live mode")
         return self
 
 
@@ -94,6 +94,30 @@ class Fill(VersionedContract):
     fx_rate: Positive = Decimal(1)
     executed_at: UtcTimestamp
     event_id: NonEmptyString
+
+
+class AccountFee(VersionedContract):
+    """Actual separately posted cash fee; no rate estimate or inferred fill fee.
+
+    Amount is account base currency. The provider's effective date is retained
+    separately from first observation/booking, since some feeds omit exact
+    posting instants. Expense belongs to the observed accounting period.
+    """
+
+    fee_id: NonEmptyString
+    account_id: NonEmptyString
+    amount: Positive
+    currency: NonEmptyString
+    effective_date: date
+    observed_at: UtcTimestamp
+    source_hash: Sha256
+    intent_id: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def causal(self):
+        if self.effective_date > self.observed_at.date():
+            raise ValueError("future fee effective date")
+        return self
 
 
 class PriceMark(VersionedContract):

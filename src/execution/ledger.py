@@ -18,6 +18,7 @@ from threading import RLock
 
 from src.domain.common import Instrument, _utc
 from src.domain.portfolio import (
+    AccountFee,
     AccountSpec,
     CorporateAction,
     Fill,
@@ -325,7 +326,7 @@ class PortfolioLedger:
                 if self.spec(fill.account_id).mode == "backtest" or booked_at < fill.executed_at:
                     raise LedgerError("operational receipt must follow actual execution")
                 latest = self.db.execute(
-                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist') ORDER BY sequence DESC LIMIT 1",
+                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist','account_fee') ORDER BY sequence DESC LIMIT 1",
                     (fill.account_id,),
                 ).fetchone()
                 if latest and datetime.fromisoformat(latest[0]) > fill.executed_at:
@@ -457,6 +458,57 @@ class PortfolioLedger:
                     "INSERT OR REPLACE INTO marks VALUES (?,?,?)",
                     (account, mark.instrument.instrument_id, mark.model_dump_json()),
                 )
+
+    def apply_account_fee(self, fee: AccountFee) -> bool:
+        """Book a separately posted actual base-currency expense exactly once."""
+        with self.atomic():
+            existing = self.db.execute(
+                "SELECT payload FROM journal WHERE account=? AND id=?",
+                (fee.account_id, "account-fee:" + fee.fee_id),
+            ).fetchone()
+            if existing:
+                prior = AccountFee.model_validate_json(existing[0])
+                if (
+                    prior.model_dump(exclude={"observed_at"})
+                    != fee.model_dump(exclude={"observed_at"})
+                    or fee.observed_at < prior.observed_at
+                ):
+                    raise LedgerError("account fee identity/content changed")
+                return False
+            spec = self.spec(fee.account_id)
+            if spec.base_currency != fee.currency:
+                raise LedgerError("account fee requires actual base-currency amount")
+            if fee.intent_id is not None:
+                self.order(fee.account_id, fee.intent_id)
+            self._clock(fee.account_id, fee.observed_at)
+            row = self._account(fee.account_id)
+            if fee.amount > self.available_cash(fee.account_id):
+                raise LedgerError("posted fee exceeds unreserved cash; reconcile pending risk")
+            if self.db.execute(
+                "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
+                (fee.account_id, fee.observed_at.isoformat()),
+            ).fetchone():
+                raise LedgerError(
+                    "posted fee conflicts with published NAV; use a later observed cutoff"
+                )
+            self.db.execute(
+                "UPDATE accounts SET cash=?,realized=?,fees=? WHERE id=?",
+                (
+                    str(D(row["cash"]) - fee.amount),
+                    str(D(row["realized"]) - fee.amount),
+                    str(D(row["fees"]) + fee.amount),
+                    fee.account_id,
+                ),
+            )
+            self._journal(
+                fee.account_id,
+                "account-fee:" + fee.fee_id,
+                "account_fee",
+                fee.observed_at,
+                fee.model_dump_json(),
+                fee.amount.copy_negate(),
+            )
+            return True
 
     def snapshot(
         self, account: str, at: datetime, max_age_seconds: int, persist=True
@@ -679,6 +731,12 @@ class PortfolioLedger:
                     realized += amount - f.fee - removed
                 positions[key] = qty, basis
                 fees += f.fee
+            elif row["kind"] == "account_fee":
+                fee = AccountFee.model_validate_json(row["payload"])
+                if D(row["cash_delta"]) != fee.amount.copy_negate():
+                    raise LedgerError("account fee cash entry differs from its source")
+                realized -= fee.amount
+                fees += fee.amount
             elif row["kind"] in ("split", "dividend", "delist"):
                 a = CorporateAction.model_validate_json(row["payload"])
                 key = a.instrument.instrument_id

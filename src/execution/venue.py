@@ -185,6 +185,8 @@ class VenueExecution:
         owner: Literal["direct", "lean"],
         risk_policy: RiskPolicy | None = None,
         fill_policy: FillPolicy | None = None,
+        allow_live: bool = False,
+        max_balance_age_seconds: int = 30,
     ):
         self.ledger, self.account_id, self.adapters, self.routes, self.owner = (
             ledger,
@@ -197,7 +199,12 @@ class VenueExecution:
             risk_policy or RiskPolicy(),
             fill_policy or FillPolicy(),
         )
+        if max_balance_age_seconds < 0:
+            raise LedgerError("nonnegative balance evidence age required")
+        self.max_balance_age_seconds = max_balance_age_seconds
         spec = ledger.spec(account_id)
+        if spec.mode == "live" and not allow_live:
+            raise LedgerError("live venue execution requires explicit independent authorization")
         if spec.mode == "backtest" or not adapters or not set(routes.values()) <= set(adapters):
             raise LedgerError("operational account and explicit eligible venue routes required")
         if any(
@@ -216,6 +223,11 @@ class VenueExecution:
                 "routes": routes,
                 "risk": self.risk_policy.model_dump(mode="json"),
                 "costs": self.fill_policy.model_dump(mode="json"),
+                **(
+                    {"max_balance_age_seconds": max_balance_age_seconds}
+                    if max_balance_age_seconds != 30
+                    else {}
+                ),
             },
             sort_keys=True,
         )
@@ -360,7 +372,12 @@ class VenueExecution:
             raise LedgerError("venue rule source mismatch")
         rules.require_order(intent, as_of)
         balances = self.adapters[venue].balances(as_of)
-        if balances.venue != venue or balances.observed_at != as_of:
+        if (
+            balances.venue != venue
+            or not 0
+            <= (as_of - balances.observed_at).total_seconds()
+            <= self.max_balance_age_seconds
+        ):
             raise LedgerError("venue funding evidence clock/identity mismatch")
         with self.ledger.atomic():
             existing = self.ledger.db.execute(
@@ -660,9 +677,10 @@ class VenueExecution:
     def reconcile_balances(self, *, as_of: datetime) -> dict:
         as_of = _utc(as_of)
         observations = [adapter.balances(as_of) for adapter in self.adapters.values()]
-        if any(o.observed_at != as_of for o in observations) or {
-            o.venue for o in observations
-        } != set(self.adapters):
+        if any(
+            not 0 <= (as_of - o.observed_at).total_seconds() <= self.max_balance_age_seconds
+            for o in observations
+        ) or {o.venue for o in observations} != set(self.adapters):
             raise LedgerError("balance snapshot clock/venue coverage differs")
         cash = sum((o.cash_base for o in observations), D(0))
         quantities = {}

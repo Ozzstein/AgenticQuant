@@ -15,6 +15,7 @@ from decimal import ROUND_DOWN, Decimal, localcontext
 
 from src.domain.common import _utc
 from src.domain.portfolio import (
+    AccountFee,
     CorporateAction,
     Fill,
     Holding,
@@ -99,6 +100,7 @@ class SleeveBook:
         for sql in (
             "CREATE TABLE IF NOT EXISTS sleeve_events(account TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,id))",
             "CREATE TABLE IF NOT EXISTS sleeve_intents(account TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,id))",
+            "CREATE TABLE IF NOT EXISTS sleeve_fees(account TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,id))",
             "CREATE TABLE IF NOT EXISTS sleeve_observations(account TEXT NOT NULL, sleeve TEXT NOT NULL, at TEXT NOT NULL, source_hash TEXT NOT NULL, nav TEXT NOT NULL, flow TEXT NOT NULL, PRIMARY KEY(account,sleeve,at,source_hash))",
         ):
             ledger.db.execute(sql)
@@ -330,6 +332,11 @@ class SleeveBook:
                     basis[action.instrument.instrument_id] = ZERO
                     held[action.instrument.instrument_id] = ZERO
                 total_realized += realized
+            elif row["kind"] == "account_fee":
+                fee = AccountFee.model_validate_json(row["payload"])
+                realized = fee.amount.copy_negate()
+                total_fees += fee.amount
+                total_realized += realized
             contexts[row["id"]] = (dict(row), cash, realized, total_fees, total_realized)
         return contexts
 
@@ -377,6 +384,31 @@ class SleeveBook:
                 ("turnover", D(economic["notional"])),
             ):
                 payload[field] = {k: str(v) for k, v in partition(value, assigned).items()}
+        elif kind == "account_fee":
+            fee = AccountFee.model_validate_json(journal["payload"])
+            plan = self.ledger.db.execute(
+                "SELECT payload FROM sleeve_fees WHERE account=? AND id=?",
+                (self.account_id, fee.fee_id),
+            ).fetchone()
+            if plan is None:
+                raise LedgerError("actual account fee requires explicit sleeve attribution")
+            plan = json.loads(plan[0])
+            amounts = {key: D(value) for key, value in plan["amounts"].items()}
+            if (
+                plan["fee"] != fee.model_dump(mode="json")
+                or set(amounts) - state["cash"].keys()
+                or any(value < 0 for value in amounts.values())
+                or exact_sum(amounts.values()) != fee.amount
+            ):
+                raise LedgerError("account fee attribution differs from canonical source")
+            payload.update(
+                journal_id=journal["id"],
+                source_hash=digest(dict(journal)),
+                attribution_hash=digest(plan),
+            )
+            payload["cash"] = {key: str(value.copy_negate()) for key, value in amounts.items()}
+            payload["fees"] = {key: str(value) for key, value in amounts.items()}
+            payload["realized"] = dict(payload["cash"])
         else:
             action = CorporateAction.model_validate_json(journal["payload"])
             key = action.instrument.instrument_id
@@ -426,7 +458,7 @@ class SleeveBook:
             ):
                 kind = journal["kind"]
                 if (
-                    kind not in ("fill", "split", "dividend", "delist")
+                    kind not in ("fill", "split", "dividend", "delist", "account_fee")
                     or "source:" + journal["id"] in known
                 ):
                     continue
@@ -468,6 +500,74 @@ class SleeveBook:
                     "projected sleeve ownership does not reconcile to canonical holdings"
                 )
             return state
+
+    def apply_account_fee(
+        self, fee: AccountFee, amounts: dict[str, D], *, attribution_source_hash: str
+    ):
+        """Explicitly attribute a posted fee; capital transfers cannot be implied.
+
+        The caller derives amounts from its actual source/ownership policy. This
+        binding is immutable, exact and separately audited from vendor content.
+        """
+        if fee.account_id != self.account_id or len(attribution_source_hash) != 64:
+            raise LedgerError("fee account and attribution source hash required")
+        amounts = {key: D(str(value)) for key, value in sorted(amounts.items())}
+        if (
+            any(not value.is_finite() or value < 0 for value in amounts.values())
+            or exact_sum(amounts.values()) != fee.amount
+        ):
+            raise LedgerError("fee attribution must exactly conserve its actual amount")
+        with self.ledger.atomic():
+            previous = self.ledger.db.execute(
+                "SELECT payload FROM sleeve_fees WHERE account=? AND id=?",
+                (self.account_id, fee.fee_id),
+            ).fetchone()
+            if previous:
+                saved = json.loads(previous[0])
+                old_fee = AccountFee.model_validate(saved["fee"])
+                if (
+                    saved["amounts"] != {k: str(v) for k, v in amounts.items()}
+                    or saved["attribution_source_hash"] != attribution_source_hash
+                    or old_fee.model_dump(exclude={"observed_at"})
+                    != fee.model_dump(exclude={"observed_at"})
+                    or old_fee.observed_at > fee.observed_at
+                ):
+                    raise LedgerError("immutable account fee attribution changed")
+                self.ledger.apply_account_fee(fee)
+                self.sync()
+                return False
+            state = self.sync()
+            if set(amounts) - state["cash"].keys():
+                raise LedgerError("unknown fee sleeve")
+            reserved = dict.fromkeys(state["cash"], ZERO)
+            for order in self.ledger.pending(self.account_id):
+                allocation = self._intent(order["intent"].intent_id)
+                remaining = {
+                    k: D(v) - state["allocated"][order["intent"].intent_id][k]
+                    for k, v in allocation["allocations"].items()
+                }
+                for name, value in partition(order["reserved"], remaining).items():
+                    reserved[name] = exact_sum([reserved[name], value])
+            if any(amount > state["cash"][key] - reserved[key] for key, amount in amounts.items()):
+                raise LedgerError("fee attribution exceeds unreserved sleeve cash")
+            self.ledger.db.execute(
+                "INSERT INTO sleeve_fees VALUES (?,?,?)",
+                (
+                    self.account_id,
+                    fee.fee_id,
+                    json.dumps(
+                        {
+                            "fee": fee.model_dump(mode="json"),
+                            "amounts": {k: str(v) for k, v in amounts.items()},
+                            "attribution_source_hash": attribution_source_hash,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            self.ledger.apply_account_fee(fee)
+            self.sync()
+            return True
 
     def transfer_cash(self, event_id, from_sleeve, to_sleeve, amount, at, source_hash):
         at, amount = _utc(at), D(str(amount))
