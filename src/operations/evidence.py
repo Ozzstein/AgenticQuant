@@ -9,6 +9,7 @@ from __future__ import annotations
 from src.data.evidence.store import EvidenceStore
 from src.research.evidence import (
     _verify_provenance,
+    execution_evidence_events,
     expected_artifacts,
     json_pointer,
     verify_provenance,
@@ -30,13 +31,15 @@ def _source(store,source):
 def verify_paper_provenance(registry,store:EvidenceStore,inputs,references,*,receipts,rule_sources=()):
     if inputs.context.mode!='paper' or inputs.account.mode!='paper' or inputs.context.account_id!=inputs.account.account_id:
         raise RegistryError('observed receipt settlement requires the matching explicit paper account')
+    if inputs.snapshot.context.as_of>inputs.context.as_of:
+        raise RegistryError('paper feature snapshot exceeds the actual cycle cutoff')
     if tuple(receipts)!=tuple(inputs.receipts):
         raise RegistryError('paper execution receipts differ from frozen economic inputs')
     receipt_by_event={r.event_id:r for r in receipts}
     if len(receipt_by_event)!=len(receipts):
         raise RegistryError('duplicate paper execution receipt event')
     if receipts:
-        bars={b.event_id:b for b in inputs.bars}
+        bars={b.event_id:b for b in execution_evidence_events(inputs)}
         if set(receipt_by_event)!=set(bars):
             raise RegistryError('paper execution receipts must exactly cover observed events')
         liquidity={v['event_id']:v for v in expected_artifacts(inputs)['opening_liquidity']}
@@ -65,8 +68,31 @@ def verify_paper_provenance(registry,store:EvidenceStore,inputs,references,*,rec
                 matched.add(identity)
         if matched!=set(bars):
             raise RegistryError('missing exact opening print source coverage')
+        if getattr(inputs,'opening_events',()):
+            # Price and liquidity must originate in the SAME observed print
+            # envelope. An unrelated array with the same event ID is insufficient.
+            opening=BoundArtifact.model_validate_json(registry.blob(references['opening_events_id']))
+            matched=set()
+            for source in opening.sources:
+                envelope,values=_source(store,source)
+                for value in values:
+                    if not isinstance(value,dict) or value.get('event_id') not in receipt_by_event:
+                        raise RegistryError('opening price source contains an unrelated event')
+                    identity=value['event_id']
+                    receipt=receipt_by_event[identity]
+                    if (value!=bars[identity].model_dump(mode='json')
+                            or source.evidence_id!=receipt.evidence_id
+                            or source.available_at!=receipt.available_at
+                            or envelope.content_hash()!=receipt.evidence_hash
+                            or identity in matched):
+                        raise RegistryError('opening event price and liquidity must share the exact receipt envelope')
+                    matched.add(identity)
+            if matched!=set(bars):
+                raise RegistryError('missing exact opening event price source coverage')
         checked=_verify_provenance(registry,store,inputs,references,paper_execution_receipts=receipt_by_event)
     else:
+        if getattr(inputs,'opening_events',()):
+            raise RegistryError('opening events require exact observed source receipts')
         checked=verify_provenance(registry,store,inputs,references)
     values=[]
     for source in rule_sources:

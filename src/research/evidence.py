@@ -27,7 +27,7 @@ class SourceBinding(VersionedContract):
 
 class BoundArtifact(VersionedContract):
     kind: Literal["universe_history", "availability_audit", "calendar", "corporate_actions",
-                  "execution_bars", "opening_liquidity", "instrument_metadata"]
+                  "execution_bars", "opening_events", "opening_liquidity", "instrument_metadata"]
     inputs_hash: Sha256
     value_json: NonEmptyString
     sources: tuple[SourceBinding, ...] = Field(min_length=1)
@@ -53,20 +53,40 @@ def json_pointer(value: Any, pointer: str) -> Any:
     return value
 
 
+def execution_evidence_events(inputs):
+    """Select one explicit execution evidence convention without fabricating bars."""
+    openings=tuple(getattr(inputs,'opening_events',()))
+    bars=tuple(inputs.bars)
+    if openings:
+        from src.domain.portfolio import OpeningEvent
+        if bars:
+            raise RegistryError('opening-event proofs and completed execution bars must be separate')
+        if inputs.context.mode!='paper' or inputs.account.mode!='paper':
+            raise RegistryError('opening-event evidence requires an explicit paper operating context')
+        events=tuple(OpeningEvent.model_validate(e.model_dump()) for e in openings)
+    else:
+        events=bars
+    if len({e.event_id for e in events})!=len(events):
+        raise RegistryError('duplicate execution evidence event identity')
+    return events
+
+
 def expected_artifacts(inputs: ResearchInputs) -> dict:
     """Exact economic assumptions that external source evidence must substantiate."""
+    events=execution_evidence_events(inputs)
     calendars = {canonical({k: b.model_dump(mode="json")[k] for k in
                            ("calendar", "calendar_version", "session", "session_open", "session_close")})
-                 for b in inputs.bars}
+                 for b in events}
+    kind='opening_events' if getattr(inputs,'opening_events',()) else 'execution_bars'
     return {
         "universe_history": [u.model_dump(mode="json") for u in inputs.universes],
         "availability_audit": [r.model_dump(mode="json") for r in inputs.snapshot.evidence],
         "calendar": [json.loads(v) for v in sorted(calendars)],
         "corporate_actions": [a.model_dump(mode="json") for a in inputs.actions],
-        "execution_bars": [b.model_dump(mode="json") for b in inputs.bars],
+        kind: [b.model_dump(mode="json") for b in events],
         "opening_liquidity": [{k: b.model_dump(mode="json")[k] for k in
                                ("event_id", "instrument", "opened_at", "opening_volume", "fx_rate")}
-                              for b in inputs.bars],
+                              for b in events],
         "instrument_metadata": [m.model_dump(mode="json") for m in inputs.metadata],
     }
 
@@ -93,7 +113,7 @@ def _verify_provenance(registry,store,inputs,references,*,paper_execution_receip
     """Shared content checks; public historical verification never enables late receipts."""
     names = {"universe_history": "universe_history_id", "availability_audit": "availability_audit_id",
              "calendar": "calendar_artifact_id", "corporate_actions": "corporate_actions_id",
-             "execution_bars": "execution_bars_id", "opening_liquidity": "opening_liquidity_id",
+             "execution_bars": "execution_bars_id", "opening_events": "opening_events_id", "opening_liquidity": "opening_liquidity_id",
              "instrument_metadata": "instrument_metadata_id"}
     checked = {}
     for kind, expected in expected_artifacts(inputs).items():

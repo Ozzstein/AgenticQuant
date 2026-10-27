@@ -95,3 +95,36 @@ refresh tests covering the final reader and replay after freshness expiry.
 Provider wires in these tests are synthetic. Current ADV freshness, genuine
 opening-event composition and mixed-calendar operating acceptance remain separate
 checks; these receipt tests do not establish them or authenticated entitlements.
+
+## Opening-only operating events
+
+New paper operating plans use `inputs.opening_events: tuple[OpeningEvent, ...]`
+with `inputs.bars=()`. The event contains the actual raw print price, opening
+quantity, FX and session identity, without future OHLC or completed volume.
+`expected_artifacts` replaces `execution_bars` with `opening_events` and its
+`opening_events_id` reference; calendar and opening-liquidity proofs derive from
+those actual events. The completed feature `MarketSnapshot` remains separate
+and cannot exceed the operating cutoff. Existing completed-bar plans retain
+their prior evidence convention; ambiguous mixtures are rejected.
+
+Every event needs an exact observed receipt. Full event price and opening
+liquidity must both bind subtrees of the **same** receipt envelope, including
+its content hash and availability. A second source containing the same event ID
+cannot substitute a price. Calendar, metadata, membership and historical
+research cutoffs remain unchanged. Source-bundle loading accepts the two exact
+eight-kind versions, with no mixing.
+
+`PaperVenue.settle_open(event, metadata_by_intent, observed_at=..., available_at=...,
+as_of=..., evidence_id=..., evidence_hash=...)` delegates to the shared
+`PaperExecution.open_event` primitive. Durable pre-open acceptance, original
+admission metadata, consumed liquidity and published NAV chronology still govern
+execution. Completed bars can explicitly reference an already consumed opening
+event without filling twice. Authenticated completed market closes are marked
+separately; `PaperVenue.expire_orders(as_of=...)` handles canonical expiry at the
+close boundary. No completed-bar fields are manufactured from an opening print.
+
+Verification: 82 offline source/opening/venue/durable-accounting/sleeve/replay
+artifact tests passed in 22.14 seconds. These include settlement evidence before
+session close, exact receipt/price/quantity/FX tampering, unrelated price-envelope
+rejection, restart and shared opening-capacity conservation. The full mixed
+operating cycle and external source acceptance are separate requirements.

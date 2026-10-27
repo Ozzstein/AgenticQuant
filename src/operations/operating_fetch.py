@@ -72,7 +72,9 @@ def load_operating_sources(operations, store, refresh_run_id):
         (kind, tuple(SourceBinding.model_validate(v) for v in sources))
         for kind, sources in value["economic_sources"]
     )
-    if tuple(kind for kind, _ in bindings) != KINDS or any(not sources for _, sources in bindings):
+    versions={tuple('opening_events' if k=='execution_bars' else k for k in KINDS),
+              tuple('execution_bars' if k=='opening_events' else k for k in KINDS)}
+    if tuple(kind for kind, _ in bindings) not in versions or any(not sources for _, sources in bindings):
         raise OperationError("economic bundle source kinds or coverage differ")
     for _, sources in bindings:
         for source in sources:
