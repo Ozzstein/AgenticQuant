@@ -233,6 +233,9 @@ def create_typed_alpaca_execution(
     max_balance_age_seconds=30,
     client=None,
     clock=None,
+    operation_timeout_seconds=30,
+    max_requests_per_operation=128,
+    maximum_response_bytes=8 * 1024 * 1024,
 ):
     """Bind the actual Alpaca REST adapter to the canonical durable book.
 
@@ -259,6 +262,9 @@ def create_typed_alpaca_execution(
             allow_live=allow_live,
             client=client,
             clock=clock,
+            operation_timeout_seconds=operation_timeout_seconds,
+            max_requests_per_operation=max_requests_per_operation,
+            maximum_response_bytes=maximum_response_bytes,
         )
         return VenueExecution(
             ledger,

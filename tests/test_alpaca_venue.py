@@ -1,6 +1,8 @@
 """Synthetic HTTP protocol fixtures; no authenticated Alpaca acceptance claimed."""
 
+import asyncio
 import json
+import time
 from datetime import timedelta
 from decimal import Decimal as D
 
@@ -13,6 +15,30 @@ from src.execution.broker import create_typed_alpaca_execution
 from src.execution.ledger import LedgerError
 from src.execution.venue import VenueRules
 from tests.test_durable_accounting import A, T, intent, metadata
+
+_ADAPTERS = []
+
+
+@pytest.fixture(autouse=True)
+def close_transports():
+    yield
+    while _ADAPTERS:
+        _ADAPTERS.pop().close()
+
+
+class Chunks(httpx.AsyncByteStream):
+    def __init__(self, chunks, *, delay=0):
+        self.chunks, self.delay, self.reads = chunks, delay, 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(self.delay)
+            self.reads += 1
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
 
 
 class Wire:
@@ -29,6 +55,12 @@ class Wire:
         self.missing = False
         self.rejection = None
         self.repeat_page = False
+
+    async def transport(self, request):
+        response = self.handle(request)
+        return httpx.Response(
+            response.status_code, headers=response.headers, stream=Chunks([response.content])
+        )
 
     def handle(self, request):
         assert request.url.host == "paper-api.alpaca.markets"
@@ -113,7 +145,7 @@ class Wire:
         )
 
 
-def setup(tmp_path, wire=None):
+def setup(tmp_path, wire=None, **limits):
     wire = wire or Wire()
     rules = VenueRules(
         venue="alpaca",
@@ -139,10 +171,12 @@ def setup(tmp_path, wire=None):
         api_secret="fixture-secret-not-a-credential",
         rules={A.instrument_id: rules},
         fill_policy=FillPolicy(equity_cost_bps=0),
-        client=httpx.Client(transport=httpx.MockTransport(wire.handle)),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(wire.transport)),
         clock=lambda: wire.now,
+        **limits,
     )
     order = intent().model_copy(update={"account_id": engine.account_id})
+    _ADAPTERS.append(engine.adapters["alpaca"])
     return wire, engine, engine.adapters["alpaca"], order
 
 
@@ -402,4 +436,79 @@ def test_old_cutoff_cannot_authorize_actual_late_submission(tmp_path):
     assert engine.dispatch(order.intent_id, as_of=order.eligible_at)["state"] == "ambiguous"
     assert not any(method == "POST" for method, *_ in wire.calls)
     assert engine.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+    engine.ledger.close()
+
+
+def test_true_total_deadline_cancels_dribbling_response(tmp_path):
+    wire, engine, adapter, _ = setup(tmp_path, operation_timeout_seconds=0.04)
+    stream = Chunks([b" "] * 100, delay=0.01)
+    adapter._client._transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=stream)
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        adapter.capture()
+    assert time.monotonic() - started < 0.5
+    assert stream.reads < 10 and stream.closed
+    assert not engine.ledger.db.execute(
+        "SELECT 1 FROM events WHERE id LIKE 'alpaca-capture:%'"
+    ).fetchone()
+    engine.ledger.close()
+
+
+def test_stream_cap_closes_before_remaining_body_and_retains_bounded_prefix(tmp_path):
+    wire, engine, adapter, _ = setup(tmp_path, maximum_response_bytes=10)
+    stream = Chunks([b"x" * 8] * 100)
+    adapter._client._transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=stream)
+    )
+    with pytest.raises(LedgerError, match="streaming byte cap"):
+        adapter.capture()
+    assert stream.reads == 2 and stream.closed
+    raw = json.loads(
+        engine.ledger.db.execute(
+            "SELECT payload FROM events WHERE id LIKE 'alpaca-http:%'"
+        ).fetchone()[0]
+    )
+    assert raw["response"] == "x" * 10 and raw["complete"] is False
+    engine.ledger.close()
+
+
+@pytest.mark.parametrize("body", [b"{invalid json}", b"\xff\x00bad"])
+def test_invalid_wire_bytes_are_archived_before_json_parse_failure(tmp_path, body):
+    wire, engine, adapter, _ = setup(tmp_path)
+    adapter._client._transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, stream=Chunks([body]))
+    )
+    with pytest.raises((ValueError, UnicodeError)):
+        adapter.capture()
+    raw = json.loads(
+        engine.ledger.db.execute(
+            "SELECT payload FROM events WHERE id LIKE 'alpaca-http:%'"
+        ).fetchone()[0]
+    )
+    import base64
+
+    retained = (
+        raw["response"].encode() if "response" in raw else base64.b64decode(raw["response_base64"])
+    )
+    assert retained == body and raw["complete"] is True
+    engine.ledger.close()
+
+
+def test_operation_request_budget_covers_all_activity_pages(tmp_path):
+    wire, engine, adapter, order = setup(tmp_path)
+    admit(wire, engine, adapter, order)
+    wire.now = T + timedelta(seconds=200)
+    for i in range(101):
+        wire.add_fill(f"fill-{i}", ".01", "100", i + 2)
+    wire.order.update(status="partially_filled", filled_qty="1.01")
+    adapter.max_requests_per_operation = 2
+    prior = len(wire.calls)
+    with pytest.raises(LedgerError, match="request allowance exhausted"):
+        adapter.lookup(
+            order, engine.state(order.intent_id)["client_id"], "remote-order-1", wire.now
+        )
+    assert len(wire.calls) == prior + 2
+    assert not engine.ledger.fills(order.account_id)
     engine.ledger.close()

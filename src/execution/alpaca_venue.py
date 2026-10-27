@@ -8,10 +8,17 @@ average-price synthetic fills, portfolio cache fallback or assumed acceptance.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import json
+import math
+import time
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal as D
+from functools import wraps
+from threading import RLock
 from urllib.parse import quote
 
 import httpx
@@ -40,6 +47,15 @@ def _decimal(value):
     return result
 
 
+def _bounded(method):
+    @wraps(method)
+    def operation(self, *args, **kwargs):
+        with self._operation():
+            return method(self, *args, **kwargs)
+
+    return operation
+
+
 class AlpacaVenue:
     venue = "alpaca"
     owner = "direct"
@@ -55,8 +71,11 @@ class AlpacaVenue:
         api_secret: str | SecretStr,
         rules: dict[str, VenueRules],
         allow_live: bool = False,
-        client: httpx.Client | None = None,
+        client: httpx.AsyncClient | None = None,
         clock=None,
+        operation_timeout_seconds: float = 30,
+        max_requests_per_operation: int = 128,
+        maximum_response_bytes: int = 8 * 1024 * 1024,
     ):
         self.ledger, self.account_id = ledger, account_id
         spec = ledger.spec(account_id)
@@ -77,6 +96,23 @@ class AlpacaVenue:
         ):
             raise LedgerError("explicit remote account and eligible equity venue rules required")
         self.mode, self.broker_account_id, self._rules = spec.mode, broker_account_id, dict(rules)
+        if (
+            not math.isfinite(operation_timeout_seconds)
+            or operation_timeout_seconds <= 0
+            or type(max_requests_per_operation) is not int
+            or max_requests_per_operation < 1
+            or type(maximum_response_bytes) is not int
+            or maximum_response_bytes < 1
+        ):
+            raise LedgerError("positive finite transport operation limits required")
+        if client is not None and not isinstance(client, httpx.AsyncClient):
+            raise LedgerError("injected Alpaca transport must be httpx.AsyncClient")
+        self.operation_timeout_seconds = operation_timeout_seconds
+        self.max_requests_per_operation = max_requests_per_operation
+        self.maximum_response_bytes = maximum_response_bytes
+        self._operation_lock = RLock()
+        self._budget = None
+        self._runner = asyncio.Runner()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
         self._secret = api_secret if isinstance(api_secret, SecretStr) else SecretStr(api_secret)
@@ -110,12 +146,67 @@ class AlpacaVenue:
                         }
                     ),
                 )
-        self._client = client or httpx.Client(timeout=15, follow_redirects=False)
-        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            timeout=15, follow_redirects=False, trust_env=False
+        )
 
     def close(self):
-        if self._owns_client:
-            self._client.close()
+        with self._operation_lock:
+            if not self._client.is_closed:
+                self._runner.run(self._client.aclose())
+            self._runner.close()
+
+    @contextmanager
+    def _operation(self):
+        with self._operation_lock:
+            outer = self._budget is None
+            if outer:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise LedgerError(
+                        "run synchronous venue operations outside the caller's event loop"
+                    )
+                self._budget = [time.monotonic() + self.operation_timeout_seconds, 0]
+            try:
+                yield
+            finally:
+                if outer:
+                    self._budget = None
+
+    async def _read_response(self, method, path, *, params, payload, remaining):
+        # A true overall cancellation deadline covers connection, headers and
+        # every streamed byte, even if the peer keeps a per-read timeout alive.
+        async with asyncio.timeout(remaining):
+            async with self._client.stream(
+                method,
+                self._url + path,
+                params=params,
+                json=payload,
+                headers={
+                    "APCA-API-KEY-ID": self._key.get_secret_value(),
+                    "APCA-API-SECRET-KEY": self._secret.get_secret_value(),
+                    "Accept-Encoding": "identity",
+                },
+                timeout=httpx.Timeout(min(15, remaining)),
+                follow_redirects=False,
+            ) as response:
+                body = bytearray()
+                truncated = False
+                async for chunk in response.aiter_raw():
+                    available = self.maximum_response_bytes - len(body)
+                    body.extend(chunk[:available])
+                    if len(chunk) > available:
+                        truncated = True
+                        break
+                return (
+                    response.status_code,
+                    bytes(body),
+                    response.headers.get("content-encoding", "identity"),
+                    truncated,
+                )
 
     def _now(self):
         observed = _utc(self._clock())
@@ -180,55 +271,64 @@ class AlpacaVenue:
         # httpx performs no implicit order retry. A timeout after POST acceptance
         # escapes to VenueExecution's durable ambiguous state.
         self._now()
-        response = self._client.request(
-            method,
-            self._url + path,
-            params=params,
-            json=payload,
-            headers={
-                "APCA-API-KEY-ID": self._key.get_secret_value(),
-                "APCA-API-SECRET-KEY": self._secret.get_secret_value(),
-            },
+        if self._budget is None:
+            raise LedgerError("remote HTTP request requires a bounded operation")
+        remaining = self._budget[0] - time.monotonic()
+        if remaining <= 0 or self._budget[1] >= self.max_requests_per_operation:
+            raise LedgerError("Alpaca operation deadline/request allowance exhausted")
+        self._budget[1] += 1
+        status, content, encoding, truncated = self._runner.run(
+            self._read_response(
+                method,
+                path,
+                params=params,
+                payload=payload,
+                remaining=remaining,
+            )
         )
         observed = self._now()
-        if len(response.content) > 8 * 1024 * 1024:
-            raise LedgerError("Alpaca response exceeds bounded evidence size")
         evidence = {
             "method": method,
             "path": path,
             "params": params,
             "request": payload,
-            "status": response.status_code,
+            "status": status,
             "observed_at": observed.isoformat(),
-            "response": response.content.decode("utf-8"),
+            "content_encoding": encoding,
+            "complete": not truncated,
         }
+        try:
+            evidence["response"] = content.decode("utf-8")
+        except UnicodeDecodeError:
+            evidence["response_base64"] = base64.b64encode(content).decode("ascii")
         evidence_id = "alpaca-http:" + _hash(evidence)
         with self.ledger.atomic():
             self.ledger.record_event(self.account_id, evidence_id, _json(evidence))
-        if response.status_code == 404 and missing:
+        if truncated:
+            raise LedgerError("Alpaca response exceeds streaming byte cap; bounded prefix archived")
+        if encoding not in ("", "identity"):
+            raise LedgerError("unexpected compressed wire response retained; execution unverified")
+        if time.monotonic() > self._budget[0]:
+            raise LedgerError("Alpaca overall operation deadline exhausted")
+        if status == 404 and missing:
             return None, observed, evidence_id
-        if not 200 <= response.status_code < 300:
+        if not 200 <= status < 300:
             # A duplicate client ID or uncertain gateway failure never proves
             # the original submission absent. Keep its reservation and look up.
             code = None
             try:
-                code = response.json().get("code")
+                code = json.loads(content).get("code")
             except (ValueError, AttributeError):
                 pass
-            if (
-                submitting
-                and response.status_code in (400, 401, 403, 422)
-                and str(code) != "42210000"
-            ):
+            if submitting and status in (400, 401, 403, 422) and str(code) != "42210000":
                 raise DefinitiveRejection(
-                    f"Alpaca rejected submission: HTTP {response.status_code}, evidence {evidence_id}"
+                    f"Alpaca rejected submission: HTTP {status}, evidence {evidence_id}"
                 )
-            raise LedgerError(
-                f"Alpaca HTTP {response.status_code}; retained evidence {evidence_id}"
-            )
-        value = json.loads(response.content, parse_float=D) if response.content else None
+            raise LedgerError(f"Alpaca HTTP {status}; retained evidence {evidence_id}")
+        value = json.loads(content, parse_float=D) if content else None
         return value, observed, evidence_id
 
+    @_bounded
     def capture(self) -> VenueBalances:
         """Read actual remote state before choosing the next decision cutoff."""
         account, _, account_evidence = self._request("GET", "/v2/account")
@@ -313,6 +413,7 @@ class AlpacaVenue:
                 or raw["method"] != "GET"
                 or raw["path"] != path
                 or not 200 <= raw["status"] < 300
+                or raw.get("complete") is False
                 or datetime.fromisoformat(raw["observed_at"])
                 > datetime.fromisoformat(capture["observed_at"])
                 or _json(json.loads(raw["response"], parse_float=D)) != _json(value)
@@ -490,6 +591,7 @@ class AlpacaVenue:
             evidence_id=evidence_id,
         )
 
+    @_bounded
     def submit(self, intent: OrderIntent, client_order_id, rules, as_of):
         if intent.account_id != self.account_id or intent.fx_rate != 1:
             raise LedgerError("Alpaca exact account/USD FX required")
@@ -513,6 +615,7 @@ class AlpacaVenue:
         )
         return self._report(intent, client_order_id, order, observed, [reference])
 
+    @_bounded
     def lookup(self, intent, client_order_id, venue_order_id, as_of):
         path = (
             "/v2/orders/" + quote(venue_order_id, safe="")
@@ -531,6 +634,7 @@ class AlpacaVenue:
             raise LedgerError("Alpaca lookup returned a different venue order identity")
         return self._report(intent, client_order_id, order, observed, [reference])
 
+    @_bounded
     def cancel(self, intent, client_order_id, venue_order_id, as_of):
         if self._now() < _utc(as_of):
             raise LedgerError("cannot cancel against a future decision clock")
@@ -554,6 +658,7 @@ class AlpacaVenue:
             raise LedgerError("cancellation outcome unresolved; retain reservation")
         return report
 
+    @_bounded
     def posted_fees(self) -> tuple[AccountFee, ...]:
         activities, observed, _ = self._activities(kind="FEE")
         result = []
@@ -586,6 +691,7 @@ class AlpacaVenue:
             )
         return tuple(result)
 
+    @_bounded
     def reconcile_fees(self, *, sleeve_book=None, attributions=None):
         """Book posted actual expenses; unknown attribution never invents ownership."""
         fees = self.posted_fees()
