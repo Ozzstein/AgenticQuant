@@ -174,11 +174,11 @@ class TestAlpacaConfig:
 class TestBrokerFactory:
     """Tests for the create_broker() factory function."""
 
-    def test_factory_returns_paper_trader_by_default(self) -> None:
+    def test_factory_returns_paper_trader_by_default(self, tmp_path) -> None:
         """create_broker returns PaperTrader when alpaca.enabled=False."""
         from src.execution.broker import create_broker
 
-        config = AppConfig()  # alpaca.enabled = False by default
+        config = AppConfig(output_dir=str(tmp_path))  # isolated durable account
         broker = create_broker(config)
         assert isinstance(broker, PaperTrader), (
             "create_broker should return PaperTrader when alpaca.enabled=False"
@@ -234,22 +234,22 @@ class TestBrokerFactory:
             with pytest.raises(ImportError):
                 create_broker(config)
 
-    def test_factory_paper_trader_respects_lean_cash(self) -> None:
+    def test_factory_paper_trader_respects_lean_cash(self, tmp_path) -> None:
         """create_broker passes lean.initial_cash to PaperTrader."""
         from src.execution.broker import create_broker
 
-        config = AppConfig(lean={"initial_cash": 50_000.0})
+        config = AppConfig(output_dir=str(tmp_path), lean={"initial_cash": 50_000.0})
         broker = create_broker(config)
 
         assert isinstance(broker, PaperTrader)
         # PaperTrader stores initial cash in portfolio.cash
         assert broker.portfolio.cash == pytest.approx(50_000.0)
 
-    def test_factory_paper_trader_uses_default_cash_when_zero(self) -> None:
+    def test_factory_paper_trader_uses_default_cash_when_zero(self, tmp_path) -> None:
         """create_broker uses 100_000.0 when lean.initial_cash=0."""
         from src.execution.broker import create_broker
 
-        config = AppConfig(lean={"initial_cash": 0.0})
+        config = AppConfig(output_dir=str(tmp_path), lean={"initial_cash": 0.0})
         broker = create_broker(config)
 
         assert isinstance(broker, PaperTrader)
@@ -391,6 +391,7 @@ class TestCcxtFactory:
         # With ccxt disabled, factory falls through to alpaca path
         import sys
         from unittest.mock import MagicMock, patch
+
         from src.execution.broker import create_broker
         from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
         mock_alpaca_module = MagicMock()
@@ -401,7 +402,7 @@ class TestCcxtFactory:
             alpaca=AlpacaConfig(enabled=True, paper=True),
         )
         with patch.dict(sys.modules, {"src.execution.alpaca_trader": mock_alpaca_module}):
-            broker = create_broker(config)
+            create_broker(config)
         mock_alpaca_class.assert_called_once_with(config.alpaca)
 
     def test_factory_paper_trader_when_both_disabled(self) -> None:
@@ -414,8 +415,10 @@ class TestCcxtFactory:
 
     def test_cli_trade_ccxt_flag(self) -> None:
         # Patch at the module where CcxtTrader is defined — CLI imports from there
-        from typer.testing import CliRunner
         from unittest.mock import MagicMock, patch
+
+        from typer.testing import CliRunner
+
         from src.utils.cli import app
         runner = CliRunner()
         mock_trader = MagicMock()

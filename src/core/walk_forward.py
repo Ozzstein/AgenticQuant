@@ -1,453 +1,386 @@
-"""Enhanced walk-forward runner with feature importance drift and rolling IC."""
+"""Causal expanding walk-forward: six-month OOS windows and one carried ledger."""
 
 from __future__ import annotations
 
-import math
-from collections.abc import Callable
+import hashlib
+import io
+import json
+from decimal import Decimal as D
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
-from src.core.backtester import WalkForwardBacktester, split_folds
-from src.core.model_zoo import ModelWrapper
-from src.utils.config import AppConfig, get_config
-from src.utils.exceptions import BacktestError
-from src.utils.logger import get_logger
-from src.utils.schemas import (
-    EnsembleWeights,
-    WalkForwardFold,
-    WalkForwardResult,
+from src.core.backtester import (
+    FoldEvidence,
+    PortfolioReplay,
+    performance_metrics,
+    split_folds,
 )
+from src.domain.portfolio import FillPolicy, RankedSignal
+from src.utils.exceptions import BacktestError
 
-logger = get_logger(__name__)
 
-_TRADING_DAYS = 252
+def frame_hash(frame) -> str:
+    """Include instrument/date alignment, column names and values."""
+    return hashlib.sha256(
+        pd.util.hash_pandas_object(frame, index=True).values.tobytes()
+        + str(getattr(frame, "columns", getattr(frame, "name", None))).encode()
+    ).hexdigest()
+
+
+def cross_sectional_ic(predictions: pd.Series, labels: pd.Series) -> dict[str, float | None]:
+    if not predictions.index.equals(labels.index) or not isinstance(labels.index, pd.MultiIndex):
+        raise BacktestError("IC requires exactly aligned (date,instrument) predictions/labels")
+    combined = pd.DataFrame({"pred": predictions, "label": labels})
+    result = {}
+    for at, group in combined.groupby(level=0):
+        eligible = group.replace([np.inf, -np.inf], np.nan).dropna()
+        value = (
+            eligible["pred"].corr(eligible["label"], method="spearman")
+            if len(eligible) >= 3
+            and eligible["pred"].nunique() > 1
+            and eligible["label"].nunique() > 1
+            else None
+        )
+        result[pd.Timestamp(at).isoformat()] = (
+            float(value) if value is not None and np.isfinite(value) else None
+        )
+    return result
 
 
 class WalkForwardRunner:
-    """Run enhanced walk-forward backtests with feature drift and rolling IC tracking.
-
-    Builds on WalkForwardBacktester but adds:
-    - Per-fold feature importance tracking
-    - Spearman rank correlation drift between consecutive folds
-    - Per-fold Information Coefficient (IC) between predictions and realized returns
-    - Enhanced 5-panel HTML report
-    """
-
-    def __init__(self, config: AppConfig | None = None) -> None:
-        """Initialise WalkForwardRunner.
-
-        Args:
-            config: Application config; falls back to ``get_config()`` singleton.
-        """
-        self.config = config or get_config()
-        self._backtester = WalkForwardBacktester(self.config)
+    def __init__(self, config=None):
+        self.config = config
 
     def run(
         self,
         features: pd.DataFrame,
         labels: pd.Series,
-        model_name: str = "LightGBM",
-        topk: int = 30,
-        cost_bps: float = 10.0,
-        walk_months: int = 3,
-        embargo_days: int = 5,
-        mode: str = "expanding",
-        model_factory: Callable[[], object] | None = None,
-    ) -> WalkForwardResult:
-        """Run enhanced walk-forward backtest with feature importance drift and rolling IC.
-
-        Args:
-            features: Feature matrix indexed by date (or MultiIndex(date, ticker)).
-            labels: Forward returns aligned with ``features``.
-            model_name: One of the ModelWrapper registry keys (e.g. ``LightGBM``).
-            topk: Number of stocks to hold per OOS period.
-            cost_bps: One-way transaction cost in basis points.
-            walk_months: Length of each OOS window in months.
-            embargo_days: Gap between train end and test start.
-            mode: Walk-forward mode (currently only ``expanding`` is supported).
-            model_factory: Optional callable that returns a fresh model instance per fold.
-                When provided, overrides ``model_name``. The callable must return an object
-                with ``train(X, y)``, ``predict(X)``, and ``get_feature_importance()`` methods.
-                Note: the factory is invoked once before the fold loop to determine the result
-                model name, so callers can expect N+1 total invocations for N folds.
-                If ``model_factory`` is provided but the returned object has no ``model_name``
-                attribute, ``model_name`` is used as the fallback display name.
-
-        Returns:
-            WalkForwardResult with stitched returns, per-fold metrics, feature drift
-            and rolling IC.
-
-        Raises:
-            BacktestError: If no folds are produced from the dataset.
-        """
+        model_name="LightGBM",
+        topk=30,
+        cost_bps=10.0,
+        walk_months=6,
+        embargo_days=5,
+        mode="expanding",
+        model_factory=None,
+        *,
+        label_end_times: pd.Series | None = None,
+        feature_available_at: pd.Series | None = None,
+        bars=None,
+        metadata=None,
+        universes=None,
+        context=None,
+        account=None,
+        ledger_path=None,
+        artifact_dir=None,
+        universe_version=None,
+        validation_months=1,
+        initial_train_months=12,
+        risk_policy=None,
+        fill_policy=None,
+        samples_per_year=252,
+        valuation_calendar="declared-equity-sessions",
+        valuation_times=None,
+        provenance=None,
+        actions=None,
+    ):
+        if mode != "expanding":
+            raise BacktestError("only expanding walk-forward is implemented")
         if features.empty or labels.empty:
             raise BacktestError("features and labels must not be empty")
-
-        dates = WalkForwardBacktester._extract_dates(features)
+        if any(
+            v is None
+            for v in (
+                label_end_times,
+                feature_available_at,
+                bars,
+                metadata,
+                universes,
+                context,
+                account,
+                ledger_path,
+                artifact_dir,
+                universe_version,
+            )
+        ):
+            raise BacktestError(
+                "walk-forward requires label end/feature availability, actual execution bars/metadata, context/account, ledger_path, artifact_dir and universe_version"
+            )
+        if (
+            not isinstance(features.index, pd.MultiIndex)
+            or features.index.nlevels != 2
+            or features.index.has_duplicates
+        ):
+            raise BacktestError("unique (decision_at,instrument_id) feature index required")
+        if not all(
+            features.index.equals(s.index) for s in (labels, label_end_times, feature_available_at)
+        ):
+            raise BacktestError(
+                "features, labels and availability must retain exact instrument/date alignment"
+            )
+        if (
+            not features.index.is_monotonic_increasing
+            or not np.isfinite(features.to_numpy(dtype=float)).all()
+        ):
+            raise BacktestError("sorted finite features required")
+        dates = pd.DatetimeIndex(features.index.get_level_values(0))
+        if dates.tz is None:
+            raise BacktestError("decision timestamps require explicit timezone")
+        ends, available = pd.DatetimeIndex(label_end_times), pd.DatetimeIndex(feature_available_at)
+        if ends.tz is None or available.tz is None or ends.hasnans or available.hasnans:
+            raise BacktestError("explicit timezone-aware label/feature availability required")
+        if (available > dates).any() or (ends <= dates).any():
+            raise BacktestError("future feature availability or invalid forward-label horizon")
+        if not context.data_snapshot_ids:
+            raise BacktestError("walk-forward data snapshot provenance required")
+        realized_labels = labels.where(ends <= context.as_of)
         folds = split_folds(
-            dates, str(dates.min().date()), walk_months, embargo_days
+            dates,
+            dates.min().isoformat(),
+            walk_months,
+            embargo_days,
+            validation_months,
+            initial_train_months,
         )
-
         if not folds:
-            raise BacktestError("No folds produced — dataset may be too small")
+            raise BacktestError("no folds: insufficient history for training/validation/test")
+        if model_factory is None:
+            from src.core.ensemble import create_model
 
-        fold_results: list[WalkForwardFold] = []
-        rolling_ic: list[float] = []
-        feature_importances: list[pd.Series] = []
-        # Each entry: (test_start_str, list[float]) for stitching
-        fold_period_returns: list[tuple[str, list[float]]] = []
-        ensemble_weights_per_fold: list[EnsembleWeights] = []
+            def model_factory():
+                return create_model(model_name, self.config)
 
-        # Determine display name for result
-        if model_factory is not None:
-            _probe = model_factory()
-            result_model_name = getattr(_probe, "model_name", model_name)
-            del _probe
-        else:
-            result_model_name = model_name
-
-        for i, fold in enumerate(folds):
-            train_mask = (dates >= fold["train_start"]) & (dates <= fold["train_end"])
-            test_mask = (dates >= fold["test_start"]) & (dates <= fold["test_end"])
-
-            X_train = features.loc[train_mask]
-            y_train = labels.loc[train_mask]
-            X_test = features.loc[test_mask]
-            y_test = labels.loc[test_mask]
-
-            # Skip folds with insufficient data
-            if X_train.empty or X_test.empty:
-                fold_results.append(
-                    WalkForwardFold(
-                        fold_id=i,
-                        train_start=fold["train_start"],
-                        train_end=fold["train_end"],
-                        test_start=fold["test_start"],
-                        test_end=fold["test_end"],
+        artifacts = Path(artifact_dir)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        instruments = {b.instrument.instrument_id: b.instrument for b in bars}
+        signals, evidence, models = [], [], []
+        predicted = []
+        incomplete = False
+        try:
+            for number, fold in enumerate(folds):
+                train_raw = (dates >= fold["train_start"]) & (dates < fold["train_end"])
+                train_mask = train_raw & (ends < pd.Timestamp(fold["train_end"]))
+                val_raw = (dates >= fold["validation_start"]) & (dates < fold["validation_end"])
+                val_mask = val_raw & (ends < pd.Timestamp(fold["validation_end"]))
+                test_mask = (dates >= fold["test_start"]) & (dates < fold["test_end"])
+                if not train_mask.any() or not val_mask.any() or not test_mask.any():
+                    raise BacktestError(f"fold {number} has an empty purged segment")
+                if (
+                    not np.isfinite(labels.loc[train_mask]).all()
+                    or not np.isfinite(labels.loc[val_mask]).all()
+                ):
+                    raise BacktestError(f"fold {number} has unavailable training/validation labels")
+                x_train, y_train = features.loc[train_mask], labels.loc[train_mask]
+                x_val, y_val = features.loc[val_mask], labels.loc[val_mask]
+                model = model_factory()
+                if any(model is old for old in models):
+                    raise BacktestError("model_factory reused fitted state across folds")
+                models.append(model)
+                if hasattr(model, "train_with_validation"):
+                    model.train_with_validation(x_train, y_train, x_val, y_val)
+                elif hasattr(model, "train"):
+                    model.train(x_train, y_train)
+                else:
+                    model.fit(x_train, y_train)
+                validation_preds = np.asarray(model.predict(x_val), dtype=float).reshape(-1)
+                if len(validation_preds) != len(x_val) or not np.isfinite(validation_preds).all():
+                    raise BacktestError(f"fold {number} invalid validation predictions")
+                # Serialize the actual fitted model; no invented artifact version.
+                model_path = artifacts / f"fold-{number}.joblib"
+                buffer = io.BytesIO()
+                joblib.dump(model, buffer)
+                model_bytes = buffer.getvalue()
+                model_version = hashlib.sha256(model_bytes).hexdigest()
+                if model_path.exists() and model_path.read_bytes() != model_bytes:
+                    raise BacktestError(
+                        "fitted artifact changed; use a new immutable run/artifact directory"
+                    )
+                if not model_path.exists():
+                    with model_path.open("xb") as destination:
+                        destination.write(model_bytes)
+                fold_predictions = []
+                # Date-local inference prevents transforms that normalize over a future
+                # test batch from changing earlier predictions.
+                for at, frame in features.loc[test_mask].groupby(level=0, sort=True):
+                    output = np.asarray(model.predict(frame), dtype=float).reshape(-1)
+                    if len(output) != len(frame) or not np.isfinite(output).all():
+                        raise BacktestError(f"fold {number} invalid OOS predictions at {at}")
+                    fold_predictions.append(pd.Series(output, index=frame.index))
+                    for index, score in zip(frame.index, output, strict=True):
+                        key = index[1]
+                        if key not in instruments:
+                            raise BacktestError(
+                                f"prediction instrument lacks execution prices: {key}"
+                            )
+                        signals.append(
+                            RankedSignal(
+                                signal_id=f"fold-{number}:{at.isoformat()}:{key}",
+                                instrument=instruments[key],
+                                decision_at=at.to_pydatetime(),
+                                available_at=pd.Timestamp(
+                                    feature_available_at.loc[index]
+                                ).to_pydatetime(),
+                                score=float(score),
+                                model_version=model_version,
+                                universe_version=universe_version,
+                                data_snapshot_id=context.data_snapshot_ids[0],
+                                strategy_id="model-topk",
+                            )
+                        )
+                p = pd.concat(fold_predictions).sort_index()
+                predicted.append(p)
+                ic = cross_sectional_ic(p, realized_labels.loc[p.index])
+                values = [v for v in ic.values() if v is not None]
+                importance = {}
+                if hasattr(model, "get_feature_importance"):
+                    importance = {
+                        str(k): float(v)
+                        for k, v in model.get_feature_importance().items()
+                        if np.isfinite(v)
+                    }
+                evidence.append(
+                    FoldEvidence(
+                        fold_id=number,
+                        **{
+                            k: fold[k]
+                            for k in (
+                                "train_start",
+                                "train_end",
+                                "validation_start",
+                                "validation_end",
+                                "test_start",
+                                "test_end",
+                            )
+                        },
+                        train_rows=int(train_mask.sum()),
+                        validation_rows=int(val_mask.sum()),
+                        test_rows=int(test_mask.sum()),
+                        purged_rows=int(
+                            train_raw.sum() - train_mask.sum() + val_raw.sum() - val_mask.sum()
+                        ),
+                        embargo_days=embargo_days,
+                        model_version=model_version,
+                        train_hash=frame_hash(x_train) + ":" + frame_hash(y_train),
+                        validation_hash=frame_hash(x_val) + ":" + frame_hash(y_val),
+                        predictions_hash=frame_hash(p),
+                        label_end_max=ends[train_mask].max().isoformat(),
+                        validation_label_end_max=ends[val_mask].max().isoformat(),
+                        ic=float(np.mean(values)) if values else None,
+                        feature_importance=importance,
                     )
                 )
-                rolling_ic.append(0.0)
-                feature_importances.append(pd.Series(dtype=float))
-                fold_period_returns.append((fold["test_start"], []))
-                logger.debug("Fold {}: skipped — empty train or test split", i)
-                continue
-
-            # Train model
-            if model_factory is not None:
-                model = model_factory()
-            else:
-                model = ModelWrapper(model_name, self.config)
-            model.train(X_train.values, y_train.values)
-
-            # Capture ensemble weights if model supports it
-            if hasattr(model, "get_weights"):
-                w = model.get_weights()
-                if w:  # non-empty means model is trained and ensemble
-                    ensemble_weights_per_fold.append(
-                        EnsembleWeights(
-                            model_weights=w,
-                            weighting_method=getattr(model, "_weighting", "unknown"),
-                            fold_id=i,
-                        )
-                    )
-
-            is_preds = model.predict(X_train.values)
-            oos_preds = model.predict(X_test.values)
-
-            # Feature importance
-            feature_imp = model.get_feature_importance()
-            feature_importances.append(feature_imp)
-
-            # IS Sharpe
-            is_sharpe = WalkForwardBacktester._top_k_sharpe(y_train, is_preds, topk)
-
-            # OOS period returns
-            oos_returns = WalkForwardBacktester._top_k_period_returns(
-                y_test, oos_preds, topk, cost_bps
+                incomplete |= not fold["complete_window"]
+            predictions = pd.concat(predicted).sort_index()
+            if predictions.index.has_duplicates:
+                raise BacktestError("overlapping OOS prediction observations")
+            # Replay the entire continuous OOS span once: no fold reset/liquidation.
+            first = min(s.decision_at for s in signals)
+            execution_bars = [b for b in bars if b.closed_at >= first]
+            oos_start = min(b.opened_at for b in execution_bars)
+            oos_account = account.model_copy(
+                update={"opened_at": oos_start - pd.Timedelta(microseconds=1)}
             )
-
-            # OOS Sharpe — cross-sectional (same pattern as IS Sharpe)
-            oos_sharpe = WalkForwardBacktester._top_k_sharpe(y_test, oos_preds, topk)
-
-            # Per-fold IC
-            try:
-                if len(oos_preds) >= 2 and len(y_test.values) >= 2:
-                    ic_val = float(spearmanr(oos_preds, y_test.values).statistic)
-                    if not math.isfinite(ic_val):
-                        ic_val = 0.0
-                else:
-                    ic_val = 0.0
-            except Exception:
-                ic_val = 0.0
-            rolling_ic.append(ic_val)
-
-            # Store top-10 feature importances in model_params
-            if not feature_imp.empty:
-                top_imp = feature_imp.nlargest(10)
-                model_params: dict[str, float | int | str | bool] = {
-                    f"fi_{name}": float(val) for name, val in top_imp.items()
+            run_provenance = {
+                **(provenance or {}),
+                "folds": [e.model_dump(mode="json") for e in evidence],
+                "features_hash": frame_hash(features),
+                "labels_hash": frame_hash(labels),
+                "feature_availability_hash": frame_hash(feature_available_at),
+                "label_end_hash": frame_hash(label_end_times),
+                "universe_version": universe_version,
+                "mode": "expanding",
+                "walk_months": walk_months,
+                "model_artifacts": [
+                    str((artifacts / f"fold-{i}.joblib").resolve()) for i in range(len(evidence))
+                ],
+            }
+            result = PortfolioReplay(ledger_path).run(
+                context=context,
+                account=oos_account,
+                bars=execution_bars,
+                metadata=metadata,
+                universes=universes,
+                signals=signals,
+                topk=topk,
+                actions=[a for a in (actions or []) if a.effective_at >= oos_start],
+                fill_policy=fill_policy or FillPolicy(equity_cost_bps=D(str(cost_bps))),
+                risk_policy=risk_policy,
+                samples_per_year=samples_per_year,
+                valuation_calendar=valuation_calendar,
+                valuation_times=[t for t in valuation_times if t >= first]
+                if valuation_times
+                else None,
+                provenance=run_provenance,
+            )
+            for fold in evidence:
+                observations = [
+                    s
+                    for s in result.snapshots
+                    if pd.Timestamp(fold.test_start) <= s.as_of < pd.Timestamp(fold.test_end)
+                ]
+                preceding = [s for s in result.snapshots if s.as_of < pd.Timestamp(fold.test_start)]
+                if observations and preceding:
+                    fold.oos_sharpe = performance_metrics(
+                        [float(preceding[-1].nav), *[float(s.nav) for s in observations]],
+                        samples_per_year,
+                    ).sharpe_ratio
+            diagnostics = (
+                ["final OOS window is incomplete; promotion prohibited"] if incomplete else []
+            )
+            result = result.model_copy(
+                update={
+                    "walk_forward_results": evidence,
+                    "cross_sectional_ic": cross_sectional_ic(
+                        predictions, realized_labels.loc[predictions.index]
+                    ),
+                    "status": "incomplete" if incomplete else "complete",
+                    "diagnostics": diagnostics,
                 }
-            else:
-                model_params = {}
-
-            wf_fold = WalkForwardFold(
-                fold_id=i,
-                train_start=fold["train_start"],
-                train_end=fold["train_end"],
-                test_start=fold["test_start"],
-                test_end=fold["test_end"],
-                in_sample_sharpe=is_sharpe,
-                oos_sharpe=oos_sharpe,
-                model_params=model_params,
             )
-            fold_results.append(wf_fold)
-            fold_period_returns.append((fold["test_start"], oos_returns))
-
-            logger.debug(
-                "Fold {}: IS Sharpe={:.2f}, OOS Sharpe={:.2f}, IC={:.3f}",
-                i,
-                is_sharpe,
-                oos_sharpe,
-                ic_val,
+            (artifacts / "signals.json").write_text(
+                json.dumps([s.model_dump(mode="json") for s in signals], indent=2)
             )
+            (artifacts / "result.json").write_text(result.model_dump_json(indent=2))
+            # Store the enhanced result in the same ledger run record.
+            from src.execution.ledger import PortfolioLedger
 
-        # Compute feature importance drift (Spearman rank corr of consecutive folds)
-        # Always produces exactly n_folds - 1 entries; pairs with empty importances yield 0.0.
-        n_folds = len(folds)
-        feature_importance_drift: list[float] = []
-        for j in range(len(feature_importances) - 1):
-            imp_a = feature_importances[j]
-            imp_b = feature_importances[j + 1]
-            if imp_a.empty or imp_b.empty:
-                feature_importance_drift.append(0.0)
-                continue
-            # Align on common index
-            common = imp_a.index.intersection(imp_b.index)
-            if len(common) < 2:
-                feature_importance_drift.append(0.0)
-                continue
-            a_vals = imp_a[common].values
-            b_vals = imp_b[common].values
-            if a_vals.std() == 0 or b_vals.std() == 0:
-                feature_importance_drift.append(0.0)
-                continue
+            ledger = PortfolioLedger(ledger_path)
             try:
-                corr = float(spearmanr(a_vals, b_vals).statistic)
-                feature_importance_drift.append(corr if math.isfinite(corr) else 0.0)
-            except Exception:
-                feature_importance_drift.append(0.0)
+                row = ledger.db.execute(
+                    "SELECT payload FROM runs WHERE account=? AND id=?",
+                    (account.account_id, context.run_id),
+                ).fetchone()
+                payload = json.loads(row[0])
+                payload.update(status=result.status, result=result.model_dump(mode="json"))
+                ledger.save_run(account.account_id, context.run_id, payload)
+            finally:
+                ledger.close()
+            return result
+        except Exception as exc:
+            (artifacts / "failure.json").write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "run_id": context.run_id,
+                        "error": str(exc),
+                        "completed_fold_evidence": [e.model_dump(mode="json") for e in evidence],
+                    },
+                    indent=2,
+                )
+            )
+            if isinstance(exc, BacktestError):
+                raise
+            raise BacktestError(f"walk-forward failed: {exc}") from exc
 
-        # Stitch returns and timestamps
-        # Sort by test_start then flatten
-        fold_period_returns_sorted = sorted(fold_period_returns, key=lambda x: x[0])
-        stitched_returns: list[float] = []
-        stitched_timestamps: list[str] = []
-        for test_start_str, ret_list in fold_period_returns_sorted:
-            for r in ret_list:
-                stitched_returns.append(r)
-                stitched_timestamps.append(test_start_str)
-
-        # Aggregate metrics
-        aggregate_metrics = self._backtester._compute_metrics(pd.Series(stitched_returns))
-        aggregate_metrics.total_trades = topk * len(folds)
-
-        logger.info(
-            "WalkForwardRunner complete: {} folds, Sharpe={:.2f}, IC_mean={:.3f}",
-            n_folds,
-            aggregate_metrics.sharpe_ratio,
-            float(np.mean(rolling_ic)) if rolling_ic else 0.0,
-        )
-
-        return WalkForwardResult(
-            folds=fold_results,
-            stitched_returns=stitched_returns,
-            stitched_timestamps=stitched_timestamps,
-            aggregate_metrics=aggregate_metrics,
-            feature_importance_drift=feature_importance_drift,
-            rolling_ic=rolling_ic,
-            model_name=result_model_name,
-            ensemble_weights_per_fold=ensemble_weights_per_fold,
-        )
-
-    def generate_html_report(self, result: WalkForwardResult, output_path: str) -> str:
-        """Generate 5-panel Plotly HTML report.
-
-        Panels:
-        1. Cumulative returns with vertical retrain lines at each fold train_end
-        2. Per-window Sharpe bars (OOS Sharpe per fold)
-        3. Feature importance heatmap (fold × feature top-10)
-        4. Drawdown
-        5. Rolling IC per fold
-
-        Args:
-            result: WalkForwardResult produced by :meth:`run`.
-            output_path: Destination file path for the HTML report.
-
-        Returns:
-            Absolute path to the written HTML file.
-
-        Raises:
-            BacktestError: If plotly is not installed.
-        """
-        try:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-        except ImportError as exc:
-            raise BacktestError("plotly is required for HTML reports") from exc
+    def generate_html_report(self, result, output_path: str) -> str:
+        """Export actual NAV and fills; no synthetic timestamp interpolation."""
+        import plotly.graph_objects as go
 
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-
-        # --- Build cumulative returns series ---
-        returns_series = pd.Series(result.stitched_returns, dtype=float)
-        timestamps = result.stitched_timestamps or list(range(len(result.stitched_returns)))
-
-        cum_returns = (1 + returns_series).cumprod().tolist() if len(returns_series) > 0 else []
-
-        # Drawdown
-        if cum_returns:
-            cum_s = pd.Series(cum_returns)
-            peak = cum_s.cummax()
-            drawdown = ((cum_s - peak) / peak).tolist()
-        else:
-            drawdown = []
-
-        # Fold train_end dates for vertical retrain lines
-        retrain_dates = [f.train_end for f in result.folds]
-        fold_ids = [str(f.fold_id) for f in result.folds]
-        oos_sharpes = [f.oos_sharpe for f in result.folds]
-
-        # Feature heatmap data
-        fi_data: list[dict[str, float]] = []
-        for fold in result.folds:
-            fi_row = {
-                k.replace("fi_", ""): v
-                for k, v in fold.model_params.items()
-                if k.startswith("fi_") and isinstance(v, float)
-            }
-            fi_data.append(fi_row)
-
-        all_feat_names = sorted(
-            {feat for row in fi_data for feat in row}
-        )
-
-        has_feature_data = bool(all_feat_names)
-
-        # Always produce exactly 5 panels
-        subplot_titles_list = [
-            "Cumulative Returns",
-            "OOS Sharpe per Fold",
-            "Feature Importance Heatmap",
-            "Drawdown",
-            "Rolling IC per Fold",
-        ]
-
-        fig = make_subplots(
-            rows=5,
-            cols=1,
-            subplot_titles=subplot_titles_list,
-            vertical_spacing=0.07,
-        )
-
-        # Panel 1: cumulative returns
-        fig.add_trace(
-            go.Scatter(
-                x=list(timestamps),
-                y=cum_returns,
-                name="Cumulative Return",
-                line={"color": "royalblue"},
-            ),
-            row=1,
-            col=1,
-        )
-
-        # Vertical retrain lines as shapes
-        shapes = []
-        for rd in retrain_dates:
-            shapes.append(
-                {
-                    "type": "line",
-                    "x0": rd,
-                    "x1": rd,
-                    "y0": 0,
-                    "y1": 1,
-                    "xref": "x1",
-                    "yref": "paper",
-                    "line": {"color": "grey", "dash": "dot", "width": 1},
-                }
-            )
-
-        # Panel 2: OOS Sharpe bars
-        fig.add_trace(
-            go.Bar(x=fold_ids, y=oos_sharpes, name="OOS Sharpe", marker_color="coral"),
-            row=2,
-            col=1,
-        )
-
-        # Panel 3: feature importance heatmap (or empty placeholder)
-        if has_feature_data:
-            z_matrix = [
-                [row.get(feat, 0.0) for feat in all_feat_names] for row in fi_data
-            ]
-            fig.add_trace(
-                go.Heatmap(
-                    z=z_matrix,
-                    x=all_feat_names,
-                    y=fold_ids,
-                    colorscale="Blues",
-                    name="Feature Importance",
-                ),
-                row=3,
-                col=1,
-            )
-        else:
-            fig.add_trace(
-                go.Heatmap(z=[], x=[], y=[], name="Feature Importance"),
-                row=3,
-                col=1,
-            )
-
-        # Panel 4: drawdown
-        fig.add_trace(
-            go.Scatter(
-                x=list(timestamps),
-                y=drawdown,
-                name="Drawdown",
-                fill="tozeroy",
-                line={"color": "crimson"},
-            ),
-            row=4,
-            col=1,
-        )
-
-        # Panel 5: rolling IC
-        fig.add_trace(
-            go.Bar(
-                x=fold_ids,
-                y=result.rolling_ic,
-                name="Rolling IC",
-                marker_color="steelblue",
-            ),
-            row=5,
-            col=1,
-        )
-
-        m = result.aggregate_metrics
-        fig.update_layout(
-            title=(
-                f"Walk-Forward Report | Model={result.model_name} | "
-                f"Sharpe={m.sharpe_ratio:.2f} | "
-                f"Ann Return={m.annual_return:.1%} | MaxDD={m.max_drawdown:.1%}"
-            ),
-            height=1200,
-            template="plotly_white",
-            showlegend=True,
-            shapes=shapes,
-        )
-
-        fig.write_html(str(out), include_plotlyjs="cdn")
-        logger.info("WalkForward HTML report written to {}", out.resolve())
+        fig = go.Figure(go.Scatter(x=result.timestamps, y=result.equity_curve, name="OOS NAV"))
+        fig.update_layout(title=f"{result.run_id} — {result.status}", yaxis_title="Account NAV")
+        fig.write_html(str(out), include_plotlyjs=True)
         return str(out.resolve())

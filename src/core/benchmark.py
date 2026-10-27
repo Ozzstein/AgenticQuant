@@ -1,257 +1,293 @@
-"""Benchmark runners for strategy comparison."""
+"""Matched benchmark and cost reruns using the authoritative portfolio ledger."""
 
 from __future__ import annotations
 
-import math
+from pathlib import Path
 
 import numpy as np
-import pandas as pd
+from pydantic import BaseModel, Field
 
-from src.utils.config import AppConfig, get_config
-from src.utils.logger import get_logger
-from src.utils.schemas import BacktestResult, BenchmarkComparison
+from src.core.backtester import PortfolioReplay, ReplayResult, canonical_hash
+from src.domain.portfolio import FillPolicy, PortfolioTarget, TargetWeight
+from src.utils.exceptions import BacktestError
 
-logger = get_logger(__name__)
 
-_TRADING_DAYS = 252
+class MatchedComparison(BaseModel):
+    schema_version: str = "2.0"
+    strategy_run_id: str
+    strategy_sharpe: float | None
+    benchmark_metrics: dict[str, dict] = Field(default_factory=dict)
+    unavailable: dict[str, str] = Field(default_factory=dict)
+    random_sharpes: list[float | None] = Field(default_factory=list)
+    random_nav: list[list[float]] = Field(default_factory=list)
+    monte_carlo_percentile: float | None = None
+    simulations: int
+    seed: int
+    match: dict
 
 
 class BenchmarkRunner:
-    """Compute benchmark returns for strategy comparison.
+    def __init__(self, config=None):
+        self.config = config
 
-    Supports buy-and-hold SPY, BTC-USD, 60/40 (SPY/AGG), equal-weight, and
-    Monte Carlo random-portfolio percentile ranking.
-    """
-
-    def __init__(self, config: AppConfig | None = None) -> None:
-        self.config = config or get_config()
-
-    # ------------------------------------------------------------------
-    # Public benchmarks
-    # ------------------------------------------------------------------
-
-    def run_spy(self, start: str, end: str) -> pd.Series:
-        """Buy-and-hold SPY daily returns.
-
-        Args:
-            start: Start date string (YYYY-MM-DD).
-            end: End date string (YYYY-MM-DD).
-
-        Returns:
-            Series of daily percentage returns indexed by date.
-        """
-        return self._download_returns("SPY", start, end)
-
-    def run_btc(self, start: str, end: str) -> pd.Series:
-        """Buy-and-hold BTC-USD daily returns.
-
-        Args:
-            start: Start date string (YYYY-MM-DD).
-            end: End date string (YYYY-MM-DD).
-
-        Returns:
-            Series of daily percentage returns indexed by date.
-        """
-        return self._download_returns("BTC-USD", start, end)
-
-    def run_sixty_forty(self, start: str, end: str) -> pd.Series:
-        """60% SPY / 40% AGG portfolio with monthly rebalancing.
-
-        Args:
-            start: Start date string (YYYY-MM-DD).
-            end: End date string (YYYY-MM-DD).
-
-        Returns:
-            Series of daily blended returns indexed by date.
-        """
-        spy = self._download_returns("SPY", start, end)
-        agg = self._download_returns("AGG", start, end)
-        combined = pd.concat([spy, agg], axis=1, keys=["SPY", "AGG"]).dropna()
-        if combined.empty:
-            return pd.Series(dtype=float)
-
-        # Monthly rebalance: weights reset to 0.6 / 0.4 at each month start
-        combined["month"] = pd.PeriodIndex(combined.index, freq="M")
-        blended = pd.Series(index=combined.index, dtype=float)
-        w_spy, w_agg = 0.6, 0.4
-
-        for month, group in combined.groupby("month"):
-            for i, (date, row) in enumerate(group.iterrows()):
-                blended[date] = w_spy * row["SPY"] + w_agg * row["AGG"]
-                # Drift weights intramonth
-                w_spy *= 1 + row["SPY"]
-                w_agg *= 1 + row["AGG"]
-                total = w_spy + w_agg
-                w_spy /= total
-                w_agg /= total
-            # Rebalance at month end
-            w_spy, w_agg = 0.6, 0.4
-
-        return blended.dropna()
-
-    def run_equal_weight(self, returns_df: pd.DataFrame) -> pd.Series:
-        """Equal-weight portfolio from a returns DataFrame.
-
-        Args:
-            returns_df: DataFrame where each column is a return stream.
-
-        Returns:
-            Series of equal-weight portfolio daily returns.
-        """
-        if returns_df.empty:
-            return pd.Series(dtype=float)
-        return returns_df.mean(axis=1)
-
-    def run_monte_carlo(
+    def compare_replay(
         self,
-        strategy_returns: pd.Series,
-        returns_df: pd.DataFrame,
-        n_simulations: int = 1000,
-    ) -> float:
-        """Monte Carlo random portfolio simulation.
+        result: ReplayResult,
+        *,
+        inputs: dict,
+        output_dir: str | Path,
+        n_simulations=1000,
+        seed=42,
+    ) -> MatchedComparison:
+        """Rebalance on the strategy's decision times, with identical costs/risk.
 
-        Samples ``n_simulations`` random equal-weight sub-portfolios from
-        ``returns_df`` and computes each portfolio's annualised Sharpe.  Returns
-        the percentile rank (0–100) of the strategy Sharpe vs that distribution.
-
-        Args:
-            strategy_returns: Daily returns of the strategy under evaluation.
-            returns_df: Universe of available daily return streams (columns).
-            n_simulations: Number of random portfolios to simulate.
-
-        Returns:
-            Percentile rank of strategy Sharpe (float in [0, 100]).
+        Random portfolios have the same date-local universe and top-K. If K
+        spans the universe, a random selection benchmark is mathematically
+        degenerate and is reported unavailable, never as a neutral percentile.
+        SPY/BTC and 60/40 are constrained benchmark sleeves, with unused capital
+        in cash. They need their own real price/metadata inputs in the bundle.
         """
-        strategy_sharpe = self._compute_sharpe(strategy_returns)
-
-        if returns_df.empty or returns_df.shape[1] < 2:
-            logger.warning("Insufficient universe for Monte Carlo — returning 50th percentile")
-            return 50.0
-
-        rng = np.random.default_rng(seed=42)
-        n_assets = returns_df.shape[1]
-        k = min(30, n_assets)
-        sharpes: list[float] = []
-
-        returns_arr = returns_df.values
-        for _ in range(n_simulations):
-            idx = rng.choice(n_assets, size=k, replace=False)
-            port_returns = returns_arr[:, idx].mean(axis=1)
-            sharpes.append(self._compute_sharpe(pd.Series(port_returns)))
-
-        sharpes_arr = np.array(sharpes)
-        percentile = float(np.mean(sharpes_arr < strategy_sharpe) * 100)
-        logger.info(
-            "Monte Carlo: strategy Sharpe={:.2f} at {:.1f}th percentile of {} simulations",
-            strategy_sharpe,
-            percentile,
-            n_simulations,
+        if n_simulations < 1:
+            raise BacktestError("positive simulation count required")
+        if not inputs.get("signals"):
+            raise BacktestError(
+                "matched random selection requires the original point-in-time ranked universe"
+            )
+        expected = {
+            "bars_hash": canonical_hash(
+                [
+                    b.model_dump(mode="json")
+                    for b in sorted(
+                        inputs["bars"], key=lambda b: (b.opened_at, b.instrument.instrument_id)
+                    )
+                ]
+            ),
+            "metadata_hash": canonical_hash(
+                [m.model_dump(mode="json") for m in inputs["metadata"]]
+            ),
+            "signals_hash": canonical_hash(
+                [
+                    s.model_dump(mode="json")
+                    for s in sorted(inputs["signals"], key=lambda s: s.signal_id)
+                ]
+            ),
+            "universe_hash": canonical_hash(
+                [u.model_dump(mode="json") for u in inputs["universes"]]
+            ),
+        }
+        if any(result.manifest.get(key) != value for key, value in expected.items()):
+            raise BacktestError("benchmark inputs differ from the strategy's frozen data/signals")
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        groups = {}
+        for s in inputs["signals"]:
+            groups.setdefault(s.decision_at, []).append(s)
+        topk = inputs.get("topk", 30)
+        rng = np.random.default_rng(seed)
+        comparison = MatchedComparison(
+            strategy_run_id=result.run_id,
+            strategy_sharpe=result.metrics.sharpe_ratio,
+            simulations=n_simulations,
+            seed=seed,
+            match={
+                "bars_hash": result.manifest["bars_hash"],
+                "metadata_hash": result.manifest["metadata_hash"],
+                "signals_hash": result.manifest["signals_hash"],
+                "timestamps": result.timestamps,
+                "topk": topk,
+                "fill_policy": result.manifest["fill_policy"],
+                "risk_policy": result.manifest["risk_policy"],
+                "cash_return": "zero",
+                "costs": "one-way fill charges, identical rules",
+                "seed": seed,
+            },
         )
-        return percentile
 
-    def compare(
-        self,
-        result: BacktestResult,
-        start: str,
-        end: str,
-        universe_returns: pd.DataFrame | None = None,
-    ) -> BenchmarkComparison:
-        """Compare strategy against all benchmarks.
+        def execute(name, *, signals=None, targets=None):
+            account = inputs["account"].model_copy(
+                update={"account_id": "backtest:benchmark:" + name}
+            )
+            context = inputs["context"].model_copy(
+                update={"account_id": account.account_id, "run_id": "benchmark:" + name}
+            )
+            args = {
+                **inputs,
+                "account": account,
+                "context": context,
+                "signals": signals,
+                "targets": targets,
+            }
+            candidate = PortfolioReplay(":memory:").run(**args)
+            if candidate.timestamps != result.timestamps:
+                raise BacktestError("benchmark dates do not match strategy ledger dates")
+            return candidate
 
-        Args:
-            result: Strategy BacktestResult.
-            start: Benchmark start date.
-            end: Benchmark end date.
-            universe_returns: Optional universe DataFrame for equal-weight and
-                Monte Carlo benchmarks.
-
-        Returns:
-            BenchmarkComparison Pydantic model.
-        """
-        strategy_returns = pd.Series(result.daily_returns, dtype=float)
-        strategy_sharpe = self._compute_sharpe(strategy_returns)
-
-        spy_returns = self.run_spy(start, end)
-        btc_returns = self.run_btc(start, end)
-        sixty_forty_returns = self.run_sixty_forty(start, end)
-
-        spy_sharpe = self._compute_sharpe(spy_returns)
-        btc_sharpe = self._compute_sharpe(btc_returns)
-        sixty_forty_sharpe = self._compute_sharpe(sixty_forty_returns)
-
-        if universe_returns is not None and not universe_returns.empty:
-            ew_returns = self.run_equal_weight(universe_returns)
-            ew_sharpe = self._compute_sharpe(ew_returns)
-            mc_pct = self.run_monte_carlo(strategy_returns, universe_returns)
+        if any(topk >= len(g) for g in groups.values()):
+            comparison.unavailable["random_selection"] = (
+                "topk spans the eligible universe on at least one date; no nondegenerate matched selection distribution"
+            )
         else:
-            ew_sharpe = 0.0
-            mc_pct = 50.0
+            for i in range(n_simulations):
+                signals = []
+                for group in groups.values():
+                    scores = rng.permutation(len(group))
+                    signals.extend(
+                        s.model_copy(
+                            update={
+                                "signal_id": f"random-{i}:" + s.signal_id,
+                                "score": float(score),
+                                "model_version": f"random-seed-{seed}",
+                                "strategy_id": "random",
+                            }
+                        )
+                        for s, score in zip(group, scores, strict=True)
+                    )
+                candidate = execute(f"random-{i}", signals=signals)
+                comparison.random_sharpes.append(candidate.metrics.sharpe_ratio)
+                comparison.random_nav.append(candidate.equity_curve)
+            finite = [s for s in comparison.random_sharpes if s is not None]
+            if len(finite) != n_simulations or result.metrics.sharpe_ratio is None:
+                comparison.unavailable["random_percentile"] = (
+                    "undefined strategy or random-portfolio Sharpe"
+                )
+            elif np.std(finite) < 1e-12:
+                comparison.unavailable["random_percentile"] = (
+                    "all matched portfolio Sharpes are identical"
+                )
+            else:
+                value = result.metrics.sharpe_ratio
+                comparison.monte_carlo_percentile = float(
+                    100 * np.mean([1 if s < value else 0.5 if s == value else 0 for s in finite])
+                )
 
-        comparison = BenchmarkComparison(
-            strategy_sharpe=strategy_sharpe,
-            spy_sharpe=spy_sharpe,
-            btc_sharpe=btc_sharpe,
-            sixty_forty_sharpe=sixty_forty_sharpe,
-            equal_weight_sharpe=ew_sharpe,
-            monte_carlo_percentile=mc_pct,
-            excess_sharpe_vs_spy=strategy_sharpe - spy_sharpe,
-        )
-        logger.info(
-            "Benchmark comparison: strategy={:.2f}, SPY={:.2f}, BTC={:.2f}, 60/40={:.2f}",
-            strategy_sharpe,
-            spy_sharpe,
-            btc_sharpe,
-            sixty_forty_sharpe,
-        )
+        from decimal import Decimal as D
+
+        from src.domain.portfolio import RiskPolicy
+
+        risk = inputs.get("risk_policy") or RiskPolicy()
+        instruments = {b.instrument.symbol: b.instrument for b in inputs["bars"]}
+        definitions = {
+            "SPY": [("SPY", D(1))],
+            "BTC": [("BTC/USD", D(1))],
+            "60/40": [("SPY", D("0.6")), ("AGG", D("0.4"))],
+        }
+        for name, components in definitions.items():
+            if any(symbol not in instruments for symbol, _ in components):
+                comparison.unavailable[name] = (
+                    "actual benchmark price bars and risk metadata not supplied"
+                )
+                continue
+            scale = min(
+                [1 - risk.min_cash]
+                + [
+                    (
+                        risk.crypto_weight
+                        if instruments[s].asset_class == "crypto"
+                        else risk.equity_weight
+                    )
+                    / weight
+                    for s, weight in components
+                ]
+            )
+            weights = tuple(
+                TargetWeight(instrument=instruments[s], weight=w * scale) for s, w in components
+            )
+            targets = [
+                PortfolioTarget(
+                    universe_version=groups[at][0].universe_version,
+                    target_id=f"{name}:{at.isoformat()}",
+                    decision_at=at,
+                    strategy_id=name,
+                    artifact_version="fixed-constrained-benchmark-v1",
+                    data_snapshot_id=inputs["context"].data_snapshot_ids[0],
+                    weights=weights,
+                )
+                for at in groups
+            ]
+            candidate = execute(name, targets=targets)
+            comparison.benchmark_metrics[name] = {
+                **candidate.metrics.model_dump(),
+                "weights": {s: str(w * scale) for s, w in components},
+                "nav": candidate.equity_curve,
+                "dates": candidate.timestamps,
+            }
+        equal_targets = []
+        for at, group in groups.items():
+            if topk != len(group):
+                # Equal weight whole-universe baseline deliberately has a different
+                # breadth; disclose it instead of claiming matched portfolio size.
+                comparison.match["equal_weight_breadth"] = (
+                    "entire date-local universe; random benchmark alone matches topk"
+                )
+            weights = tuple(
+                TargetWeight(
+                    instrument=s.instrument,
+                    weight=min(
+                        (1 - risk.min_cash) / len(group),
+                        risk.crypto_weight
+                        if s.instrument.asset_class == "crypto"
+                        else risk.equity_weight,
+                    ),
+                )
+                for s in group
+            )
+            equal_targets.append(
+                PortfolioTarget(
+                    universe_version=group[0].universe_version,
+                    target_id="equal:" + at.isoformat(),
+                    decision_at=at,
+                    strategy_id="equal-weight",
+                    artifact_version="equal-weight-v1",
+                    data_snapshot_id=group[0].data_snapshot_id,
+                    weights=weights,
+                )
+            )
+        equal = execute("equal-weight", targets=equal_targets)
+        comparison.benchmark_metrics["equal_weight"] = {
+            **equal.metrics.model_dump(),
+            "nav": equal.equity_curve,
+            "dates": equal.timestamps,
+        }
+        (output / "benchmarks.json").write_text(comparison.model_dump_json(indent=2))
         return comparison
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def cost_sensitivity(
+        self,
+        *,
+        inputs: dict,
+        output_dir: str | Path,
+        equity_bps=(0, 10, 20),
+        crypto_bps=(0, 20, 40),
+    ) -> list[ReplayResult]:
+        if len(equity_bps) != len(crypto_bps):
+            raise BacktestError("paired equity/crypto cost scenarios required")
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        results = []
+        base = inputs.get("fill_policy") or FillPolicy()
+        for eq, crypto in zip(equity_bps, crypto_bps, strict=True):
+            # Reconstruct/validate rather than using unvalidated model_copy values.
+            policy = FillPolicy(
+                **{**base.model_dump(), "equity_cost_bps": eq, "crypto_cost_bps": crypto}
+            )
+            name = f"cost-{eq}-{crypto}"
+            account = inputs["account"].model_copy(update={"account_id": "backtest:" + name})
+            context = inputs["context"].model_copy(
+                update={"account_id": account.account_id, "run_id": name}
+            )
+            result = PortfolioReplay(output / f"{name}.sqlite3").run(
+                **{**inputs, "account": account, "context": context, "fill_policy": policy}
+            )
+            (output / f"{name}.json").write_text(result.model_dump_json(indent=2))
+            results.append(result)
+        return results
 
-    def _compute_sharpe(self, returns: pd.Series) -> float:
-        """Annualised Sharpe ratio (zero risk-free rate).
+    def compare(self, *args, **kwargs):
+        raise BacktestError(
+            "unmatched legacy return comparisons are unverified; use compare_replay with actual input events"
+        )
 
-        Args:
-            returns: Daily return series.
-
-        Returns:
-            Annualised Sharpe ratio.
-        """
-        returns = returns.dropna()
-        if returns.empty or returns.std() < 1e-10:
-            return 0.0
-        annual_return = float((1 + returns).prod() ** (_TRADING_DAYS / len(returns)) - 1)
-        vol = float(returns.std() * math.sqrt(_TRADING_DAYS))
-        return float(annual_return / vol) if vol > 0 else 0.0
-
-    @staticmethod
-    def _download_returns(ticker: str, start: str, end: str) -> pd.Series:
-        """Download adjusted close prices via yfinance and compute daily returns.
-
-        Args:
-            ticker: Yahoo Finance ticker symbol.
-            start: Start date (YYYY-MM-DD).
-            end: End date (YYYY-MM-DD).
-
-        Returns:
-            Series of daily returns.
-        """
-        import yfinance as yf
-
-        try:
-            raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-            if raw.empty:
-                logger.warning("No data returned for ticker {}", ticker)
-                return pd.Series(dtype=float)
-
-            # yfinance may return MultiIndex columns when downloading a single ticker
-            if isinstance(raw.columns, pd.MultiIndex):
-                close = raw["Close"][ticker]
-            else:
-                close = raw["Close"]
-
-            return close.pct_change().dropna()
-        except Exception as exc:
-            logger.warning("Failed to download {}: {}", ticker, exc)
-            return pd.Series(dtype=float)
+    def run_monte_carlo(self, *args, **kwargs):
+        raise BacktestError(
+            "return-only random sampling cannot match execution costs; use compare_replay"
+        )

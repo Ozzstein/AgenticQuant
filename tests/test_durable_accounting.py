@@ -1,4 +1,5 @@
 """Hand-calculated synthetic fixtures; no provider acceptance claimed."""
+
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from src.domain.portfolio import (
     CorporateAction,
     ExecutionBar,
     Fill,
+    FillPolicy,
     InstrumentRisk,
     OrderIntent,
     PriceMark,
@@ -26,39 +28,78 @@ from src.utils.schemas import Order, OrderSide
 
 T = datetime(2024, 1, 2, 14, tzinfo=timezone.utc)
 A = Instrument(instrument_id="us:A", symbol="A", asset_class="equity", quote_currency="USD")
-B = Instrument(instrument_id="spot:BTC", symbol="BTC/USD", asset_class="crypto", quote_currency="USD")
+B = Instrument(
+    instrument_id="spot:BTC", symbol="BTC/USD", asset_class="crypto", quote_currency="USD"
+)
 
 
 def account(path=":memory:", cash="100000"):
     ledger = PortfolioLedger(path)
-    ledger.create_account(AccountSpec(account_id="backtest:test", mode="backtest", base_currency="USD", initial_cash=cash, opened_at=T))
+    ledger.create_account(
+        AccountSpec(
+            account_id="backtest:test",
+            mode="backtest",
+            base_currency="USD",
+            initial_cash=cash,
+            opened_at=T,
+        )
+    )
     return ledger
 
 
 def intent(name="buy", side="buy", qty="10", price="100", at=T, instrument=A, fee="0"):
-    return OrderIntent(intent_id=name, account_id="backtest:test", run_id="run", instrument=instrument,
-                       side=side, quantity=qty, decision_at=at, eligible_at=at + timedelta(seconds=1),
-                       reference_price=price, estimated_fee=fee, strategy_id="test")
+    return OrderIntent(
+        intent_id=name,
+        account_id="backtest:test",
+        run_id="run",
+        instrument=instrument,
+        side=side,
+        quantity=qty,
+        decision_at=at,
+        eligible_at=at + timedelta(seconds=1),
+        reference_price=price,
+        estimated_fee=fee,
+        strategy_id="test",
+    )
 
 
 def fill(order, name="f1", qty=None, price="100", fee="0", at=None):
-    return Fill(fill_id=name, intent_id=order.intent_id, account_id=order.account_id,
-                quantity=qty or order.quantity, price=price, fee=fee,
-                executed_at=at or order.eligible_at, event_id="quote-" + name)
+    return Fill(
+        fill_id=name,
+        intent_id=order.intent_id,
+        account_id=order.account_id,
+        quantity=qty or order.quantity,
+        price=price,
+        fee=fee,
+        executed_at=at or order.eligible_at,
+        event_id="quote-" + name,
+    )
 
 
 def metadata(at=T, instrument=A, sector="tech"):
-    return InstrumentRisk(instrument=instrument, sector=sector, adv_base="100000000", as_of=at, lot_size="1")
+    return InstrumentRisk(
+        instrument=instrument, sector=sector, adv_base="100000000", as_of=at, lot_size="1"
+    )
 
 
 def bar(at=T + timedelta(days=1), opening_volume="10000", instrument=A, close="100"):
-    return ExecutionBar(event_id=at.isoformat() + instrument.instrument_id, instrument=instrument,
-                        opened_at=at, closed_at=at + timedelta(hours=6),
-                        open="100", high=max(D(100), D(close)), low=min(D(100), D(close)), close=close,
-                        volume="100000", opening_volume=opening_volume,
-                        calendar="24/7" if instrument.asset_class == "crypto" else "XNYS",
-                        calendar_version="fixture-1", session=at.date(), session_open=at,
-                        session_close=at + timedelta(hours=6))
+    return ExecutionBar(
+        event_id=at.isoformat() + instrument.instrument_id,
+        instrument=instrument,
+        opened_at=at,
+        closed_at=at + timedelta(hours=6),
+        open="100",
+        high=max(D(100), D(close)),
+        low=min(D(100), D(close)),
+        close=close,
+        volume="100000",
+        opening_volume=opening_volume,
+        calendar="24/7" if instrument.asset_class == "crypto" else "XNYS",
+        calendar_version="fixture-1",
+        session=at.date(),
+        session_open=at,
+        session_close=at + timedelta(hours=6),
+    )
 
 
 def test_fee_cash_basis_and_realized_reconcile():
@@ -117,15 +158,19 @@ def test_restart_new_process_and_duplicate_fill(tmp_path):
     f = fill(buy)
     ledger.apply_fill(f)
     ledger.close()
-    code = '''import sys
+    code = """import sys
 from src.execution.ledger import PortfolioLedger
 from src.domain.portfolio import Fill
 l=PortfolioLedger(sys.argv[1])
 assert not l.apply_fill(Fill.model_validate_json(sys.argv[2]))
 assert l.quantity('backtest:test','us:A')==10
 assert l.reconcile('backtest:test')['cash']=='99000'
-'''
-    subprocess.run([sys.executable, "-c", code, str(path), f.model_dump_json()], check=True, env={**os.environ, "PYTHONPATH": os.getcwd()})
+"""
+    subprocess.run(
+        [sys.executable, "-c", code, str(path), f.model_dump_json()],
+        check=True,
+        env={**os.environ, "PYTHONPATH": os.getcwd()},
+    )
 
 
 def test_sell_to_zero_and_nav_cash_reserve():
@@ -141,7 +186,9 @@ def test_sell_to_zero_and_nav_cash_reserve():
     assert result.passed, result.details
     # Reproduced defect: 900 spend with only 1000 cash and 100000 NAV.
     low_cash = snapshot.model_copy(update={"cash": D(1000)})
-    result = evaluate_order(intent("other", qty="9", at=t2), low_cash, [], {A.instrument_id: metadata(t2)}, RiskPolicy())
+    result = evaluate_order(
+        intent("other", qty="9", at=t2), low_cash, [], {A.instrument_id: metadata(t2)}, RiskPolicy()
+    )
     assert "cash_buffer" in result.failed_checks
 
 
@@ -150,11 +197,25 @@ def test_pending_exposure_sector_crypto_and_buy_halt():
     at = T
     snap = ledger.snapshot("backtest:test", at, 0)
     pending = {"intent": intent(qty="60"), "remaining": D(60), "reserved": D(6000)}
-    result = evaluate_order(intent("more", qty="50"), snap, [pending], {A.instrument_id: metadata()}, RiskPolicy())
+    result = evaluate_order(
+        intent("more", qty="50"), snap, [pending], {A.instrument_id: metadata()}, RiskPolicy()
+    )
     assert "position_size" in result.failed_checks
-    result = evaluate_order(intent(instrument=B, qty="45"), snap, [], {B.instrument_id: metadata(instrument=B)}, RiskPolicy(crypto_total="0.04"))
+    result = evaluate_order(
+        intent(instrument=B, qty="45"),
+        snap,
+        [],
+        {B.instrument_id: metadata(instrument=B)},
+        RiskPolicy(crypto_total="0.04"),
+    )
     assert "crypto_total" in result.failed_checks
-    result = evaluate_order(intent(), snap.model_copy(update={"high_water_mark": D(120000)}), [], {A.instrument_id: metadata()}, RiskPolicy())
+    result = evaluate_order(
+        intent(),
+        snap.model_copy(update={"high_water_mark": D(120000)}),
+        [],
+        {A.instrument_id: metadata()},
+        RiskPolicy(),
+    )
     assert "drawdown_cb" in result.failed_checks
 
 
@@ -182,15 +243,42 @@ def test_split_dividend_delisting_conserve_accounting():
     ledger.apply_fill(fill(buy))
     ledger.mark(buy.account_id, [PriceMark(instrument=A, price="100", as_of=buy.eligible_at)])
     t2 = T + timedelta(days=1)
-    split = CorporateAction(action_id="split", instrument=A, kind="split", value="2", effective_at=t2, source_id="fixture")
+    split = CorporateAction(
+        action_id="split",
+        instrument=A,
+        kind="split",
+        value="2",
+        effective_at=t2,
+        source_id="fixture",
+    )
     ledger.corporate_action(buy.account_id, split)
     ledger.corporate_action(buy.account_id, split)
     snap = ledger.snapshot(buy.account_id, t2, 0)
     assert snap.positions[0].quantity == 20
     assert snap.positions[0].cost_basis == 1000
     assert snap.nav == 10000
-    ledger.corporate_action(buy.account_id, CorporateAction(action_id="div", instrument=A, kind="dividend", value="1", effective_at=t2 + timedelta(seconds=1), source_id="fixture"))
-    ledger.corporate_action(buy.account_id, CorporateAction(action_id="delist", instrument=A, kind="delist", value="40", effective_at=t2 + timedelta(seconds=2), source_id="fixture"))
+    ledger.corporate_action(
+        buy.account_id,
+        CorporateAction(
+            action_id="div",
+            instrument=A,
+            kind="dividend",
+            value="1",
+            effective_at=t2 + timedelta(seconds=1),
+            source_id="fixture",
+        ),
+    )
+    ledger.corporate_action(
+        buy.account_id,
+        CorporateAction(
+            action_id="delist",
+            instrument=A,
+            kind="delist",
+            value="40",
+            effective_at=t2 + timedelta(seconds=2),
+            source_id="fixture",
+        ),
+    )
     assert ledger.reconcile(buy.account_id)["cash"] == "9820"
     assert ledger.reconcile(buy.account_id)["realized_pnl"] == "-180"
 
@@ -198,7 +286,7 @@ def test_split_dividend_delisting_conserve_accounting():
 def test_crypto_weekend_and_stale_marks():
     ledger = account()
     engine = PaperExecution(ledger, "backtest:test")
-    engine.submit(intent(instrument=B), {B.instrument_id: metadata(instrument=B)})
+    engine.submit(intent(instrument=B, fee="2"), {B.instrument_id: metadata(instrument=B)})
     saturday = datetime(2024, 1, 6, 0, tzinfo=timezone.utc)
     event = bar(at=saturday, instrument=B)
     assert engine.open_bar(event, {B.instrument_id: metadata(instrument=B)})
@@ -221,12 +309,126 @@ def test_no_short_double_sell_or_cross_account_fill():
 
 def test_legacy_paper_restart_uses_canonical_ledger(tmp_path):
     path = tmp_path / "paper.db"
-    trader = PaperTrader(10000, slippage_bps=0, commission_per_share=0, min_commission=0, ledger_path=path)
+    trader = PaperTrader(
+        10000, slippage_bps=0, commission_per_share=0, min_commission=0, ledger_path=path
+    )
     order = Order(ticker="A", side=OrderSide.BUY, quantity=10)
     trader.execute_order(order, {"A": 100})
     trader.ledger.close()
-    restarted = PaperTrader(10000, slippage_bps=0, commission_per_share=0, min_commission=0, ledger_path=path)
+    restarted = PaperTrader(
+        10000, slippage_bps=0, commission_per_share=0, min_commission=0, ledger_path=path
+    )
     assert restarted.portfolio.cash == 9000
     assert restarted.execute_order(order, {"A": 100})
     assert restarted.portfolio.positions["A"].quantity == 10
     assert restarted.ledger.reconcile("paper:default")["reconciled"]
+
+
+def test_fx_and_currency_basis_reconcile():
+    foreign = Instrument(
+        instrument_id="eu:X", symbol="X", asset_class="equity", quote_currency="EUR"
+    )
+    ledger = account(cash="1000")
+    order = intent(instrument=foreign, qty="2", price="100", fee="1").model_copy(
+        update={"fx_rate": D("1.2")}
+    )
+    ledger.submit(order)
+    ledger.apply_fill(fill(order, fee="1").model_copy(update={"fx_rate": D("1.2")}))
+    ledger.mark(
+        order.account_id,
+        [PriceMark(instrument=foreign, price="100", fx_rate="1.3", as_of=order.eligible_at)],
+    )
+    snap = ledger.snapshot(order.account_id, order.eligible_at, 0)
+    assert snap.cash == 759
+    assert snap.positions[0].cost_basis == 241
+    assert snap.nav == 1019
+    assert ledger.reconcile(order.account_id)["reconciled"]
+
+
+def test_pending_sector_exposure_and_strict_adv_boundary():
+    ledger = account()
+    snap = ledger.snapshot("backtest:test", T, 0)
+    other = Instrument(instrument_id="us:C", symbol="C", asset_class="equity", quote_currency="USD")
+    pending = [{"intent": intent("one", qty="60"), "remaining": D(60), "reserved": D(6000)}]
+    buy = intent("two", qty="60", instrument=other)
+    meta = {A.instrument_id: metadata(), other.instrument_id: metadata(instrument=other)}
+    result = evaluate_order(buy, snap, pending, meta, RiskPolicy(sector_weight=".10"))
+    assert "sector" in result.failed_checks
+    exact = metadata().model_copy(update={"adv_base": D(1000000)})
+    result = evaluate_order(intent(qty="100"), snap, [], {A.instrument_id: exact}, RiskPolicy())
+    assert "market_impact" in result.failed_checks
+
+
+def test_limit_stop_fok_and_cancellation_use_open_events():
+    ledger = account()
+    engine = PaperExecution(ledger, "backtest:test", FillPolicy(equity_cost_bps=0))
+    market = intent(qty="10")
+    limit = market.model_copy(update={"order_type": "limit", "limit_price": D(90)})
+    engine.submit(limit, {A.instrument_id: metadata()})
+    event = bar()
+    # Intrabar lows cannot invent a fill when the observed open is not marketable.
+    event = event.model_copy(update={"low": D(80)})
+    assert engine.open_bar(event, {A.instrument_id: metadata()}) == []
+    assert ledger.quantity("backtest:test", A.instrument_id) == 0
+    ledger.cancel("backtest:test", limit.intent_id, event.opened_at, "replace")
+    order = intent("fok", qty="10", at=event.opened_at).model_copy(update={"tif": "FOK"})
+    engine.submit(order, {A.instrument_id: metadata()})
+    assert (
+        engine.open_bar(
+            bar(at=T + timedelta(days=2), opening_volume="300"), {A.instrument_id: metadata()}
+        )
+        == []
+    )
+    assert ledger.order("backtest:test", "fok")["status"] == "cancelled"
+    assert ledger.available_cash("backtest:test") == 100000
+
+
+def test_underestimated_fees_and_conflicting_intents_fail_before_execution():
+    ledger = account()
+    engine = PaperExecution(ledger, "backtest:test")
+    with pytest.raises(LedgerError, match="fee"):
+        engine.submit(intent(), {A.instrument_id: metadata()})
+    engine.submit(intent(fee="1"), {A.instrument_id: metadata()})
+    with pytest.raises(LedgerError, match="different content"):
+        engine.submit(intent(qty="11", fee="1.1"), {A.instrument_id: metadata()})
+
+
+def test_process_crash_inside_fill_transaction_recovers_without_lost_liquidity(tmp_path):
+    path = tmp_path / "crash.db"
+    ledger = account(path)
+    engine = PaperExecution(ledger, "backtest:test")
+    engine.submit(intent(fee="1"), {A.instrument_id: metadata()})
+    ledger.close()
+    event = bar()
+    code = """import os, sys
+from src.execution.ledger import PortfolioLedger
+from src.execution.simulator import PaperExecution
+from src.domain.portfolio import ExecutionBar, InstrumentRisk
+l=PortfolioLedger(sys.argv[1])
+original=l.apply_fill
+def crash(fill):
+    original(fill)
+    os._exit(23)
+l.apply_fill=crash
+meta=InstrumentRisk.model_validate_json(sys.argv[3])
+PaperExecution(l,'backtest:test').open_bar(ExecutionBar.model_validate_json(sys.argv[2]),{meta.instrument.instrument_id:meta})
+"""
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(path),
+            event.model_dump_json(),
+            metadata().model_dump_json(),
+        ],
+        env={**os.environ, "PYTHONPATH": os.getcwd()},
+    )
+    assert process.returncode == 23
+    ledger = PortfolioLedger(path)
+    assert ledger.quantity("backtest:test", A.instrument_id) == 0
+    assert ledger.order("backtest:test", "buy")["status"] == "pending"
+    engine = PaperExecution(ledger, "backtest:test")
+    assert len(engine.open_bar(event, {A.instrument_id: metadata()})) == 1
+    assert ledger.quantity("backtest:test", A.instrument_id) == 10
+    assert ledger.reconcile("backtest:test")["reconciled"]

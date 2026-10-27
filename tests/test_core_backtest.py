@@ -1,291 +1,340 @@
-"""Tests for WalkForwardBacktester and BacktestValidator."""
+"""Synthetic, independently calculated chronological accounting cases."""
 
-from __future__ import annotations
-
-from pathlib import Path
-from unittest.mock import MagicMock
+import json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal as D
 
 import numpy as np
 import pandas as pd
 import pytest
+from typer.testing import CliRunner
 
-from src.core.backtester import BacktestValidator, WalkForwardBacktester, split_folds
-from src.utils.schemas import (
-    BacktestMetrics,
-    BacktestResult,
-    ValidationVerdict,
-    WalkForwardFold,
+from scripts.run_backtest import app
+from src.core.backtester import PortfolioReplay, WalkForwardBacktester
+from src.domain.common import Instrument, RunContext
+from src.domain.portfolio import (
+    AccountSpec,
+    ExecutionBar,
+    FillPolicy,
+    InstrumentRisk,
+    RankedSignal,
+    RiskPolicy,
+    UniverseEligibility,
 )
+from src.execution.ledger import LedgerError, PortfolioLedger
+from src.utils.exceptions import BacktestError
+
+START = datetime(2024, 1, 2, 14, tzinfo=timezone.utc)
+A = Instrument(instrument_id="A", symbol="A", asset_class="equity", quote_currency="USD")
+B = Instrument(instrument_id="B", symbol="B", asset_class="equity", quote_currency="USD")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_model(seed: int = 0) -> MagicMock:
-    """Return a mock model that predicts random scores."""
-    rng = np.random.default_rng(seed)
-
-    model = MagicMock()
-    model.train.return_value = None
-
-    def predict(X):
-        return rng.standard_normal(len(X))
-
-    model.predict.side_effect = predict
-    return model
-
-
-def _make_features_labels(
-    n_days: int = 300,
-    n_tickers: int = 10,
-    seed: int = 42,
-) -> tuple[pd.DataFrame, pd.Series]:
-    """Generate synthetic features and forward-return labels."""
-    rng = np.random.default_rng(seed)
-    dates = pd.bdate_range("2020-01-01", periods=n_days)
-    # Flat index (one row per day, aggregated across tickers for simplicity)
-    feats = pd.DataFrame(rng.standard_normal((n_days, 5)), index=dates,
-                         columns=[f"f{i}" for i in range(5)])
-    labels = pd.Series(rng.normal(0.001, 0.02, n_days), index=dates, name="fwd_ret")
-    return feats, labels
-
-
-def make_synthetic_result(n_days: int = 252, sharpe: float = 1.5, seed: int = 0) -> BacktestResult:
-    """Build a synthetic BacktestResult for validator tests."""
-    rng = np.random.default_rng(seed)
-    daily_mean = sharpe * 0.16 / 252  # approximate: Sharpe * vol / days
-    daily_std = 0.16 / np.sqrt(252)
-    daily_returns = rng.normal(daily_mean, daily_std, n_days).tolist()
-
-    equity = (pd.Series([1.0] + daily_returns).cumprod() * 100).tolist()[1:]
-    timestamps = [str(pd.Timestamp("2021-01-01") + pd.Timedelta(days=i)) for i in range(n_days)]
-
-    fold = WalkForwardFold(
-        fold_id=0,
-        train_start="2021-01-01",
-        train_end="2021-06-30",
-        test_start="2021-07-06",
-        test_end="2021-09-30",
-        in_sample_sharpe=sharpe * 0.9,
-        oos_sharpe=sharpe * 0.8,
+def replay_inputs():
+    bars = []
+    for day, (opening, close) in enumerate([(100, 100), (100, 110), (110, 88)]):
+        at = START + timedelta(days=day)
+        for instrument in (A, B):
+            op, cl = (opening, close) if instrument == A else (100, 100)
+            bars.append(
+                ExecutionBar(
+                    event_id=f"{instrument.symbol}-{day}",
+                    instrument=instrument,
+                    opened_at=at,
+                    closed_at=at + timedelta(hours=6),
+                    open=op,
+                    high=max(op, cl),
+                    low=min(op, cl),
+                    close=cl,
+                    volume=1000000,
+                    opening_volume=100000,
+                    calendar="XNYS",
+                    calendar_version="test",
+                    session=at.date(),
+                    session_open=at,
+                    session_close=at + timedelta(hours=6),
+                )
+            )
+    signals = [
+        RankedSignal(
+            signal_id=f"{i.symbol}-{day}",
+            instrument=i,
+            decision_at=START + timedelta(days=day, hours=6),
+            available_at=START + timedelta(days=day, hours=6),
+            score=1 if i == A else 0,
+            model_version="test-frozen",
+            universe_version="test-universe",
+            data_snapshot_id="fixture",
+            strategy_id="test",
+        )
+        for day in (0, 1)
+        for i in (A, B)
+    ]
+    account = AccountSpec(
+        account_id="backtest:case",
+        mode="backtest",
+        base_currency="USD",
+        initial_cash=10000,
+        opened_at=START - timedelta(seconds=1),
+    )
+    context = RunContext(
+        run_id="case",
+        account_id=account.account_id,
+        mode="backtest",
+        as_of=bars[-1].closed_at,
+        code_version="fixture",
+        config_hash="1" * 64,
+        data_snapshot_ids=("fixture",),
+    )
+    return dict(
+        context=context,
+        account=account,
+        bars=bars,
+        universes=[
+            UniverseEligibility(
+                universe_version="test-universe",
+                data_snapshot_id="fixture",
+                effective_at=account.opened_at,
+                available_at=account.opened_at,
+                instrument_ids=("A", "B"),
+            )
+        ],
+        metadata=[
+            InstrumentRisk(
+                instrument=i,
+                sector=i.symbol,
+                adv_base=100000000,
+                as_of=account.opened_at,
+                lot_size=1,
+            )
+            for i in (A, B)
+        ],
+        signals=signals,
+        topk=1,
+        fill_policy=FillPolicy(equity_cost_bps=0, crypto_cost_bps=0),
+        risk_policy=RiskPolicy(
+            equity_weight=1,
+            crypto_weight=1,
+            sector_weight=1,
+            crypto_total=1,
+            min_cash=0,
+            max_daily_turnover=1,
+            max_drawdown=1,
+        ),
+        samples_per_year=252,
     )
 
-    metrics = BacktestMetrics(
-        total_return=float(np.prod(1 + np.array(daily_returns)) - 1),
-        annual_return=sharpe * 0.15,
-        sharpe_ratio=sharpe,
-        max_drawdown=-0.05,
-        calmar_ratio=sharpe * 0.15 / 0.05,
-        win_rate=0.55,
-        total_trades=30,
-        avg_trade_return=daily_mean,
-        volatility=0.15,
-        sortino_ratio=sharpe * 1.2,
+
+def write_bundle(path, inputs):
+    data = {}
+    for k, v in inputs.items():
+        if hasattr(v, "model_dump"):
+            data[k] = v.model_dump(mode="json")
+        elif isinstance(v, list):
+            data[k] = [x.model_dump(mode="json") if hasattr(x, "model_dump") else x for x in v]
+        else:
+            data[k] = v
+    path.write_text(json.dumps(data))
+
+
+def test_reproduced_selection_failure_is_date_local():
+    index = pd.MultiIndex.from_product([pd.date_range("2024-01-01", periods=2), ["A", "B"]])
+    labels = pd.Series([0.1, 0.01, 0, -0.2], index=index)
+    assert WalkForwardBacktester._top_k_period_returns(labels, np.array([9, 1, 0, 8]), 1, 0) == [
+        0.1,
+        -0.2,
+    ]
+
+
+def test_real_losing_nav_drawdown_and_timestamped_fills(tmp_path):
+    inputs = replay_inputs()
+    result = PortfolioReplay(tmp_path / "replay.db").run(**inputs)
+    assert result.equity_curve == [10000, 10000, 11000, 8800]
+    assert result.daily_returns == pytest.approx([0, 0.1, -0.2])
+    assert result.metrics.total_return == pytest.approx(-0.12)
+    assert result.metrics.max_drawdown == pytest.approx(-0.2)
+    assert result.metrics.total_trades == 1
+    assert pd.Timestamp(result.trades[0]["executed_at"]) > pd.Timestamp(
+        result.trades[0]["decision_at"]
     )
+    assert result.reconciliation["reconciled"]
+    assert len(result.timestamps) == len(set(result.timestamps))
 
-    return BacktestResult(
-        metrics=metrics,
-        daily_returns=daily_returns,
-        trades=[{"fold": 0, "test_start": "2021-07-06", "test_end": "2021-09-30", "topk": 30,
-                 "oos_sharpe": sharpe * 0.8}],
-        walk_forward_results=[fold],
-        equity_curve=equity,
-        timestamps=timestamps,
+
+def test_future_perturbation_cannot_change_past_decisions_or_nav(tmp_path):
+    inputs = replay_inputs()
+    before = PortfolioReplay(tmp_path / "before.db").run(**inputs)
+    future = inputs["signals"][-2].decision_at
+    inputs["signals"] = [
+        s.model_copy(update={"score": 100 if s.instrument == B else -100})
+        if s.decision_at == future
+        else s
+        for s in inputs["signals"]
+    ]
+    inputs["bars"] = [
+        b.model_copy(update={"close": D(22), "low": D(22)})
+        if b.opened_at > future and b.instrument == A
+        else b
+        for b in inputs["bars"]
+    ]
+    after = PortfolioReplay(tmp_path / "after.db").run(**inputs)
+    assert before.decisions[0] == after.decisions[0]
+    assert before.equity_curve[:3] == after.equity_curve[:3]
+    assert before.trades[0] == after.trades[0]
+
+
+def test_replay_idempotent_after_restart_and_manifest_immutable(tmp_path):
+    path = tmp_path / "replay.db"
+    inputs = replay_inputs()
+    one = PortfolioReplay(path).run(**inputs)
+    two = PortfolioReplay(path).run(**inputs)
+    assert one == two
+    changed = {**inputs, "topk": 2}
+    with pytest.raises(BacktestError, match="inputs changed"):
+        PortfolioReplay(path).run(**changed)
+    ledger = PortfolioLedger(path)
+    with pytest.raises(LedgerError, match="immutable manifest"):
+        ledger.save_run(one.account_id, one.run_id, {"manifest_hash": "changed"})
+    stored = json.loads(ledger.db.execute("SELECT payload FROM runs").fetchone()[0])
+    assert stored["status"] == "complete"
+    ledger.close()
+
+
+def test_costs_reconcile_to_cash_and_nav(tmp_path):
+    inputs = replay_inputs()
+    inputs["fill_policy"] = FillPolicy(equity_cost_bps=10)
+    result = PortfolioReplay(tmp_path / "cost.db").run(**inputs)
+    # 99 shares at 100; entry charge 9.90; 90.10 cash remains.
+    assert result.trades[0]["quantity"] == "99"
+    assert D(result.trades[0]["fee"]) == D("9.9")
+    assert result.snapshots[2].cash == D("90.1")
+    assert result.snapshots[2].nav == D("10980.1")
+    assert result.reconciliation["reconciled"]
+
+
+def test_label_only_replay_and_missing_inputs_fail():
+    with pytest.raises(BacktestError, match="model_factory"):
+        WalkForwardBacktester().run(pd.DataFrame({"x": [1]}), pd.Series([1]), model=object())
+    args = replay_inputs()
+    args["bars"] = []
+    with pytest.raises(BacktestError, match="actual bars"):
+        PortfolioReplay(":memory:").run(**args)
+
+
+def test_cli_actual_run_and_failed_data_cannot_report_success(tmp_path):
+    runner = CliRunner()
+    bundle, output, ledger = (
+        tmp_path / "input.json",
+        tmp_path / "result.json",
+        tmp_path / "ledger.db",
     )
+    write_bundle(bundle, replay_inputs())
+    result = runner.invoke(
+        app, ["run", "--input", str(bundle), "--ledger", str(ledger), "--output", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(output.read_text())["metrics"]["total_return"] == pytest.approx(-0.12)
+    bad = replay_inputs()
+    bad["bars"] = []
+    write_bundle(bundle, bad)
+    failed = runner.invoke(
+        app,
+        [
+            "run",
+            "--input",
+            str(bundle),
+            "--ledger",
+            str(tmp_path / "bad.db"),
+            "--output",
+            str(tmp_path / "bad.json"),
+        ],
+    )
+    assert failed.exit_code == 1
+    assert not (tmp_path / "bad.json").exists()
+    assert json.loads((tmp_path / "bad.json.failure.json").read_text())["status"] == "failed"
+    validation = runner.invoke(
+        app,
+        [
+            "validate",
+            "--result",
+            str(output),
+            "--ledger",
+            str(ledger),
+            "--output",
+            str(tmp_path / "validation.json"),
+        ],
+    )
+    assert validation.exit_code == 2
+    assert json.loads((tmp_path / "validation.json").read_text())["overall"] == "NOT RELIABLE"
 
 
-# ---------------------------------------------------------------------------
-# WalkForwardBacktester tests
-# ---------------------------------------------------------------------------
+def test_missing_open_liquidity_and_future_signal_rejected():
+    args = replay_inputs()
+    with pytest.raises(ValueError):
+        RankedSignal(
+            **{
+                **args["signals"][0].model_dump(),
+                "available_at": args["signals"][0].decision_at + timedelta(days=1),
+            }
+        )
+    with pytest.raises(ValueError):
+        ExecutionBar(
+            **{k: v for k, v in args["bars"][0].model_dump().items() if k != "opening_volume"}
+        )
 
 
-class TestWalkForwardBacktester:
-    def test_walk_forward_backtester_runs(self, mock_config):
-        """Backtester returns a BacktestResult without errors."""
-        feats, labels = _make_features_labels(n_days=400)
-        model = _make_model()
-        bt = WalkForwardBacktester(config=mock_config)
-        result = bt.run(feats, labels, model, topk=5, walk_forward_months=3, embargo_days=5)
-        assert isinstance(result, BacktestResult)
-        assert len(result.daily_returns) > 0
-
-    def test_walk_forward_produces_folds(self, mock_config):
-        """Walk-forward produces multiple folds."""
-        feats, labels = _make_features_labels(n_days=400)
-        model = _make_model()
-        bt = WalkForwardBacktester(config=mock_config)
-        result = bt.run(feats, labels, model, topk=5, walk_forward_months=3, embargo_days=5)
-        assert len(result.walk_forward_results) >= 1, "Expected at least 1 fold"
-
-    def test_walk_forward_folds_count(self, mock_config):
-        """More months in dataset → more folds."""
-        feats, labels = _make_features_labels(n_days=600)
-        model = _make_model()
-        bt = WalkForwardBacktester(config=mock_config)
-        result = bt.run(feats, labels, model, topk=5, walk_forward_months=3, embargo_days=5)
-        assert len(result.walk_forward_results) >= 2
-
-    def test_metrics_sharpe_positive(self, mock_config):
-        """Monotonically positive returns yield positive Sharpe."""
-        bt = WalkForwardBacktester(config=mock_config)
-        positive_returns = pd.Series([0.001] * 300)
-        metrics = bt._compute_metrics(positive_returns)
-        assert metrics.sharpe_ratio > 0
-
-    def test_metrics_max_drawdown_non_positive(self, mock_config):
-        """Max drawdown is always ≤ 0."""
-        bt = WalkForwardBacktester(config=mock_config)
-        rng = np.random.default_rng(1)
-        returns = pd.Series(rng.normal(0, 0.01, 252))
-        metrics = bt._compute_metrics(returns)
-        assert metrics.max_drawdown <= 0
-
-    def test_metrics_win_rate_range(self, mock_config):
-        """Win rate is in [0, 1]."""
-        bt = WalkForwardBacktester(config=mock_config)
-        rng = np.random.default_rng(2)
-        returns = pd.Series(rng.normal(0, 0.01, 252))
-        metrics = bt._compute_metrics(returns)
-        assert 0.0 <= metrics.win_rate <= 1.0
-
-    def test_equity_curve_starts_at_100(self, mock_config):
-        """Equity curve starts at ~100."""
-        feats, labels = _make_features_labels(n_days=400)
-        model = _make_model()
-        bt = WalkForwardBacktester(config=mock_config)
-        result = bt.run(feats, labels, model, topk=5, walk_forward_months=3, embargo_days=5)
-        assert len(result.equity_curve) > 0
-        # First value should be close to 100 (within 10 bps * 30 topk rounding)
-        assert 90 < result.equity_curve[0] < 110
-
-    def test_empty_features_raises(self, mock_config):
-        """Empty inputs raise BacktestError."""
-        from src.utils.exceptions import BacktestError
-
-        bt = WalkForwardBacktester(config=mock_config)
-        with pytest.raises(BacktestError):
-            bt.run(pd.DataFrame(), pd.Series(dtype=float), _make_model(), topk=5)
-
-    def test_split_folds_returns_dicts(self, mock_config):
-        """split_folds returns list of dicts with required keys."""
-        dates = pd.bdate_range("2020-01-01", periods=300)
-        folds = split_folds(dates, "2020-01-01", 3, 5)
-        assert isinstance(folds, list)
-        for fold in folds:
-            for key in ("train_start", "train_end", "test_start", "test_end"):
-                assert key in fold
-
-    def test_split_folds_embargo_enforced(self, mock_config):
-        """Train end is before test start in each fold."""
-        dates = pd.bdate_range("2020-01-01", periods=400)
-        folds = split_folds(dates, "2020-01-01", 3, 5)
-        for fold in folds:
-            assert fold["train_end"] < fold["test_start"]
+def test_future_universe_membership_cannot_qualify_a_signal(tmp_path):
+    args = replay_inputs()
+    args["universes"] = [
+        args["universes"][0].model_copy(update={"available_at": args["context"].as_of})
+    ]
+    with pytest.raises(BacktestError, match="universe membership"):
+        PortfolioReplay(tmp_path / "ledger.db").run(**args)
 
 
-# ---------------------------------------------------------------------------
-# HTML report
-# ---------------------------------------------------------------------------
+def test_typed_paper_and_replay_have_identical_economic_state(tmp_path):
+    from src.domain.portfolio import OrderIntent
+    from src.execution.paper_trader import PaperTrader
 
-
-class TestHtmlReport:
-    def test_generate_html_report(self, mock_config, tmp_path):
-        """HTML report is generated and file exists."""
-        result = make_synthetic_result(n_days=252)
-        bt = WalkForwardBacktester(config=mock_config)
-        out = tmp_path / "report.html"
-        path = bt.generate_html_report(result, str(out))
-        assert Path(path).exists()
-        content = Path(path).read_text()
-        assert "plotly" in content.lower()
-
-    def test_generate_html_report_creates_dir(self, mock_config, tmp_path):
-        """HTML report creates missing parent directories."""
-        result = make_synthetic_result(n_days=252)
-        bt = WalkForwardBacktester(config=mock_config)
-        out = tmp_path / "nested" / "dir" / "report.html"
-        path = bt.generate_html_report(result, str(out))
-        assert Path(path).exists()
-
-
-# ---------------------------------------------------------------------------
-# BacktestValidator tests
-# ---------------------------------------------------------------------------
-
-
-class TestBacktestValidator:
-    def test_all_8_checks_present(self):
-        """validate() always returns exactly 8 checks."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert len(vr.checks) == 8
-
-    def test_validator_approved_good_strategy(self):
-        """Good strategy (Sharpe=1.5, 252 days) → APPROVED or CAUTION."""
-        np.random.seed(42)
-        result = make_synthetic_result(n_days=252, sharpe=1.5, seed=42)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert vr.verdict in (ValidationVerdict.APPROVED, ValidationVerdict.CAUTION)
-
-    def test_validator_rejected_overfitting(self):
-        """Sharpe > 3.0 triggers overfitting flag → REJECTED."""
-        result = make_synthetic_result(n_days=252, sharpe=5.0)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert vr.verdict == ValidationVerdict.REJECTED
-
-    def test_validator_low_significance(self):
-        """Only 50 days → fails statistical significance → REJECTED."""
-        result = make_synthetic_result(n_days=50, sharpe=1.5)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert vr.verdict == ValidationVerdict.REJECTED
-
-    def test_check_names_are_unique(self):
-        """Each check has a unique name."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        names = [c.name for c in vr.checks]
-        assert len(names) == len(set(names))
-
-    def test_verdict_summary_present(self):
-        """ValidationResult.summary is a non-empty string."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert isinstance(vr.summary, str)
-        assert len(vr.summary) > 0
-
-    def test_critical_check_failure_rejected(self):
-        """Any failing critical check → REJECTED verdict."""
-        # 10 days only → statistical significance fails
-        result = make_synthetic_result(n_days=10, sharpe=1.5)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert vr.verdict == ValidationVerdict.REJECTED
-
-    def test_passed_count_property(self):
-        """passed_count + failed_count == 8."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        vr = validator.validate(result)
-        assert vr.passed_count + vr.failed_count == 8
-
-    def test_look_ahead_check_passes_with_embargo(self):
-        """Look-ahead check passes when train_end < test_start."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        check = validator._check_look_ahead_bias(result)
-        assert check.passed  # synthetic result has correct dates
-
-    def test_concentration_check_with_topk_30(self):
-        """Equal-weight with 30 stocks → max weight ≤ 30%."""
-        result = make_synthetic_result(n_days=252)
-        validator = BacktestValidator()
-        check = validator._check_concentration_risk(result)
-        assert check.passed  # 1/30 ≈ 3.3% < 30%
+    inputs = replay_inputs()
+    result = PortfolioReplay(tmp_path / "replay.db").run(**inputs)
+    paper = PaperTrader(
+        10000,
+        ledger_path=tmp_path / "paper.db",
+        account_id="paper:equivalent",
+        opened_at=inputs["account"].opened_at,
+        fill_policy=inputs["fill_policy"],
+        risk_policy=inputs["risk_policy"],
+    )
+    meta = {m.instrument.instrument_id: m for m in inputs["metadata"]}
+    timeline = {}
+    for b in inputs["bars"]:
+        timeline.setdefault(b.opened_at, {"open": [], "close": [], "decisions": []})["open"].append(
+            b
+        )
+        timeline.setdefault(b.closed_at, {"open": [], "close": [], "decisions": []})[
+            "close"
+        ].append(b)
+    for d in result.decisions:
+        timeline[pd.Timestamp(d["target"]["decision_at"]).to_pydatetime()]["decisions"].append(d)
+    for at, event in sorted(timeline.items()):
+        for b in event["open"]:
+            paper.execution.open_bar(b, meta)
+        for b in event["close"]:
+            paper.execution.close_bar(b)
+        for d in event["decisions"]:
+            for o in d["orders"]:
+                order = OrderIntent.model_validate(
+                    {**o["intent"], "account_id": "paper:equivalent"}
+                )
+                paper.execution.submit(order, meta)
+        if event["close"]:
+            snap = paper.ledger.snapshot("paper:equivalent", at, 86400)
+            replay = next(s for s in result.snapshots if s.as_of == at)
+            assert (snap.cash, snap.nav, snap.fees, snap.realized_pnl) == (
+                replay.cash,
+                replay.nav,
+                replay.fees,
+                replay.realized_pnl,
+            )
+            assert snap.positions == replay.positions
+    assert paper.ledger.reconcile("paper:equivalent")["reconciled"]

@@ -1,4 +1,5 @@
 """Deterministic projected exposure checks for the shared execution owner."""
+
 from __future__ import annotations
 
 import math
@@ -34,11 +35,16 @@ def evaluate_order(
     notional; the order limit is strictly less than the configured participation.
     """
     failures = {}
+
     def fail(name, detail):
         failures[name] = detail
 
     nav = portfolio.nav
-    if nav <= 0 or portfolio.account_id != intent.account_id or portfolio.as_of < intent.decision_at:
+    if (
+        nav <= 0
+        or portfolio.account_id != intent.account_id
+        or portfolio.as_of < intent.decision_at
+    ):
         return RiskCheckResult(False, ["state"], {"state": "invalid NAV/account/decision clock"})
     marks = {p.instrument.instrument_id: p for p in portfolio.positions}
     exposures = {k: p.market_value for k, p in marks.items()}
@@ -67,7 +73,9 @@ def evaluate_order(
         if intent.quantity > held_qty - reserved_sells:
             fail("sufficient_shares", "sale exceeds unreserved holdings")
         # Use held mark for projected exposure; execution proceeds may differ on gaps.
-        projected_value = current_value - (marks[key].market_value * intent.quantity / held_qty if held_qty else value)
+        projected_value = current_value - (
+            marks[key].market_value * intent.quantity / held_qty if held_qty else value
+        )
     exposures[key] = max(D(0), projected_value)
     meta = instruments.get(key)
     if meta is None:
@@ -92,13 +100,18 @@ def evaluate_order(
         fail("cash_buffer", "fees exhaust NAV")
         projected_nav = nav
     if intent.side == "buy":
-        if portfolio.cash - reserved_buys - value - intent.estimated_fee < policy.min_cash * projected_nav:
+        if (
+            portfolio.cash - reserved_buys - value - intent.estimated_fee
+            < policy.min_cash * projected_nav
+        ):
             fail("cash_buffer", "cash after fees/reservations is below NAV reserve")
         if nav <= portfolio.high_water_mark * (1 - policy.max_drawdown):
             fail("drawdown_cb", "drawdown buy halt")
         for k, exposure in exposures.items():
             instrument = identities[k]
-            cap = policy.crypto_weight if instrument.asset_class == "crypto" else policy.equity_weight
+            cap = (
+                policy.crypto_weight if instrument.asset_class == "crypto" else policy.equity_weight
+            )
             if exposure > projected_nav * cap:
                 fail("position_size", f"projected position exceeds cap: {k}")
         sectors = {}
@@ -109,7 +122,15 @@ def evaluate_order(
             if k not in instruments:
                 fail("sector", f"missing sector for {k}")
                 continue
-            sector = instruments[k].sector
+            other_meta = instruments[k]
+            if (
+                other_meta.instrument != identities[k]
+                or not 0
+                <= (portfolio.as_of - other_meta.as_of).total_seconds()
+                <= policy.max_liquidity_age_seconds
+            ):
+                fail("sector", f"stale/future or mismatched metadata for {k}")
+            sector = other_meta.sector
             sectors[sector] = sectors.get(sector, D(0)) + exposure
             if identities[k].asset_class == "crypto":
                 crypto += exposure
@@ -139,16 +160,26 @@ def check_order(
     failures = {}
     price = market_prices.get(order.ticker, 0)
     if not all(math.isfinite(v) and v > 0 for v in (price, order.quantity, portfolio.nav)):
-        return RiskCheckResult(False, ["invalid_input"], {"invalid_input": "positive finite price, quantity, NAV required"})
+        return RiskCheckResult(
+            False,
+            ["invalid_input"],
+            {"invalid_input": "positive finite price, quantity, NAV required"},
+        )
     value = price * order.quantity
     existing = portfolio.positions.get(order.ticker)
     qty = existing.quantity if existing else 0
     buy = order.side == OrderSide.BUY
     projected = (qty + order.quantity if buy else qty - order.quantity) * price
-    if buy and projected > portfolio.nav * (0.05 if asset_class.upper() == "CRYPTO" else config.max_position_weight / 100):
-        failures["position_size"] = "projected position exceeds limit"
+    if buy and projected > portfolio.nav * (
+        0.05 if asset_class.upper() == "CRYPTO" else config.max_position_weight / 100
+    ):
+        failures["position_size"] = (
+            f"{projected / portfolio.nav * 100:.2f}% > {5.0 if asset_class.upper() == 'CRYPTO' else config.max_position_weight}%"
+        )
     if buy and portfolio.cash - value < portfolio.nav * config.min_cash_pct / 100:
-        failures["cash_buffer"] = "remaining cash below NAV reserve"
+        failures["cash_buffer"] = (
+            f"order cost ${value:.2f} > available ${portfolio.cash - portfolio.nav * config.min_cash_pct / 100:.2f} after NAV reserve"
+        )
     if not buy and order.quantity > qty:
         failures["sufficient_shares"] = "sale exceeds holdings"
     adv = market_prices.get(f"{order.ticker}_adv")
@@ -157,7 +188,11 @@ def check_order(
             failures["liquidity"] = "invalid/insufficient ADV"
         if value >= adv * config.max_market_impact_pct / 100:
             failures["market_impact"] = "participation must be below limit"
-    if buy and peak_nav is not None and (peak_nav <= 0 or portfolio.nav <= peak_nav * (1 - config.max_drawdown_halt / 100)):
+    if (
+        buy
+        and peak_nav is not None
+        and (peak_nav <= 0 or portfolio.nav <= peak_nav * (1 - config.max_drawdown_halt / 100))
+    ):
         failures["drawdown_cb"] = "drawdown buy halt"
     if daily_turnover_so_far + value > portfolio.nav * config.max_daily_turnover / 100:
         failures["daily_turnover"] = "turnover exceeds limit"

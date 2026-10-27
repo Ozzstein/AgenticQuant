@@ -1,179 +1,322 @@
-"""Tests for WalkForwardRunner."""
+"""Synthetic causal model evaluations, purging and failed-training acceptance cases."""
 
-from __future__ import annotations
-
-import math
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from datetime import timedelta
+from decimal import Decimal as D
 
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import Ridge
 
-from src.core.walk_forward import WalkForwardRunner
-from src.utils.schemas import BacktestMetrics, WalkForwardFold, WalkForwardResult
+from src.core.backtester import split_folds
+from src.core.walk_forward import WalkForwardRunner, cross_sectional_ic
+from src.domain.common import Instrument, RunContext
+from src.domain.portfolio import (
+    AccountSpec,
+    ExecutionBar,
+    FillPolicy,
+    InstrumentRisk,
+    RiskPolicy,
+    UniverseEligibility,
+)
+from src.utils.exceptions import BacktestError
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_features_labels(n_dates: int = 756, n_features: int = 5) -> tuple[pd.DataFrame, pd.Series]:
-    """Generate synthetic 3-year feature/label dataset.
-
-    Args:
-        n_dates: Number of business days (756 ≈ 3 years).
-        n_features: Number of feature columns.
-
-    Returns:
-        Tuple of (features DataFrame, labels Series).
-    """
-    np.random.seed(42)
-    dates = pd.bdate_range("2020-01-01", periods=n_dates)
-    features = pd.DataFrame(
-        np.random.randn(n_dates, n_features),
-        index=dates,
-        columns=[f"f{i}" for i in range(n_features)],
+def wf_case(tmp_path, *, two_folds=False):
+    # Shorter initial training is explicit in test; OOS remains six months.
+    dates = pd.date_range(
+        "2023-01-02 20:00",
+        "2024-03-07 20:00" if two_folds else "2023-09-07 20:00",
+        tz="UTC",
+        freq="D",
     )
-    labels = pd.Series(np.random.randn(n_dates), index=dates)
-    return features, labels
-
-
-def _mock_model() -> MagicMock:
-    """Return a MagicMock that emulates ModelWrapper's interface."""
-    mock = MagicMock()
-    mock.train.return_value = mock
-    mock.predict.side_effect = lambda X: np.random.randn(len(X))
-    mock.get_feature_importance.return_value = pd.Series(
-        np.abs(np.random.randn(5)), index=[f"f{i}" for i in range(5)]
-    )
-    # ModelWrapper does not have get_weights; remove auto-created attribute so
-    # hasattr() returns False and the ensemble-weight capture path is not triggered.
-    del mock.get_weights
-    return mock
-
-
-def _run_with_mock(mock_config, features: pd.DataFrame, labels: pd.Series, **kwargs) -> WalkForwardResult:
-    """Run WalkForwardRunner with a fully mocked ModelWrapper."""
-    with patch("src.core.walk_forward.ModelWrapper") as MockModel:
-        mock_instance = _mock_model()
-        MockModel.return_value = mock_instance
-        runner = WalkForwardRunner(config=mock_config)
-        return runner.run(features, labels, model_name="LightGBM", **kwargs)
-
-
-def _make_minimal_result(n_folds: int = 3) -> WalkForwardResult:
-    """Build a minimal WalkForwardResult with fake data for report tests."""
-    folds = [
-        WalkForwardFold(
-            fold_id=i,
-            train_start="2020-01-01",
-            train_end=f"2020-0{i + 3}-01",
-            test_start=f"2020-0{i + 4}-01",
-            test_end=f"2020-0{i + 5}-01",
-            in_sample_sharpe=1.0,
-            oos_sharpe=0.5 + i * 0.1,
-            model_params={f"fi_f{j}": float(j + 1) for j in range(5)},
-        )
-        for i in range(n_folds)
+    instruments = [
+        Instrument(instrument_id=s, symbol=s, asset_class="crypto", quote_currency="USD")
+        for s in ("A", "B", "C")
     ]
-    stitched_returns = [0.001, -0.002, 0.003, 0.001, -0.001, 0.002]
-    stitched_timestamps = ["2020-04-01"] * 2 + ["2020-05-01"] * 2 + ["2020-06-01"] * 2
-    metrics = BacktestMetrics(
-        total_return=0.05,
-        annual_return=0.10,
-        sharpe_ratio=0.8,
-        max_drawdown=-0.03,
-        calmar_ratio=3.33,
-        win_rate=0.55,
-        total_trades=30,
-        avg_trade_return=0.001,
-        volatility=0.12,
-        sortino_ratio=1.0,
+    rows, ys, ends, bars, metadata = [], [], [], [], []
+    index = []
+    for day, at in enumerate(dates):
+        for j, instrument in enumerate(instruments):
+            opening = D(str(round(100 + 0.02 * day + j * 3 + np.sin(day / 13 + j), 6)))
+            close = opening * D(str(round(1 + 0.002 * np.sin(day / 7 + j), 8)))
+            midnight = at.normalize()
+            bars.append(
+                ExecutionBar(
+                    event_id=f"{j}-{day}",
+                    instrument=instrument,
+                    opened_at=at.to_pydatetime() - timedelta(hours=6),
+                    closed_at=at.to_pydatetime(),
+                    open=opening,
+                    high=max(opening, close),
+                    low=min(opening, close),
+                    close=close,
+                    volume=1000000,
+                    opening_volume=100000,
+                    calendar="24/7",
+                    calendar_version="fixture",
+                    session=at.date(),
+                    session_open=midnight,
+                    session_close=midnight + pd.Timedelta(days=1),
+                )
+            )
+            metadata.append(
+                InstrumentRisk(
+                    instrument=instrument,
+                    sector=str(j),
+                    adv_base=100000000,
+                    as_of=midnight,
+                    lot_size=".01",
+                )
+            )
+            if day < len(dates) - 1:
+                index.append((at, instrument.instrument_id))
+                rows.append([np.sin(day / 7 + j), float(close / opening - 1)])
+                ys.append(0.002 * np.sin((day + 1) / 7 + j))
+                ends.append(at + pd.Timedelta(days=1))
+    idx = pd.MultiIndex.from_tuples(index, names=["decision_at", "instrument_id"])
+    features, labels = (
+        pd.DataFrame(rows, index=idx, columns=["lag", "return"]),
+        pd.Series(ys, index=idx),
     )
-    return WalkForwardResult(
-        folds=folds,
-        stitched_returns=stitched_returns,
-        stitched_timestamps=stitched_timestamps,
-        aggregate_metrics=metrics,
-        feature_importance_drift=[0.9, 0.85],
-        rolling_ic=[0.05, 0.03, 0.04],
-        model_name="LightGBM",
+    label_end, available = pd.Series(ends, index=idx), pd.Series(idx.get_level_values(0), index=idx)
+    account = AccountSpec(
+        account_id="backtest:wf",
+        mode="backtest",
+        base_currency="USD",
+        initial_cash=10000,
+        opened_at=dates[0] - pd.Timedelta(days=1),
     )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_fold_splitting_produces_at_least_2_folds(mock_config):
-    """3 years of data with walk_months=6 should produce ≥2 folds."""
-    features, labels = _make_features_labels(n_dates=756)
-    result = _run_with_mock(mock_config, features, labels, walk_months=6, embargo_days=5)
-    assert len(result.folds) >= 2, f"Expected ≥2 folds, got {len(result.folds)}"
-
-
-def test_embargo_gap_respected(mock_config):
-    """test_start - train_end >= embargo_days for each fold."""
-    features, labels = _make_features_labels(n_dates=756)
-    embargo_days = 5
-    result = _run_with_mock(
-        mock_config, features, labels, walk_months=6, embargo_days=embargo_days
+    context = RunContext(
+        run_id="wf",
+        account_id=account.account_id,
+        mode="backtest",
+        as_of=dates[-1],
+        config_hash="2" * 64,
+        code_version="test",
+        data_snapshot_ids=("fixture",),
     )
-    for fold in result.folds:
-        train_end = pd.Timestamp(fold.train_end)
-        test_start = pd.Timestamp(fold.test_start)
-        gap = (test_start - train_end).days
-        assert gap >= embargo_days, (
-            f"Fold {fold.fold_id}: gap={gap} days < embargo_days={embargo_days} "
-            f"(train_end={fold.train_end}, test_start={fold.test_start})"
+    kwargs = dict(
+        label_end_times=label_end,
+        feature_available_at=available,
+        bars=bars,
+        metadata=metadata,
+        context=context,
+        account=account,
+        universes=[
+            UniverseEligibility(
+                universe_version="fixture",
+                data_snapshot_id="fixture",
+                effective_at=account.opened_at,
+                available_at=account.opened_at,
+                instrument_ids=("A", "B", "C"),
+            )
+        ],
+        ledger_path=tmp_path / "wf.db",
+        artifact_dir=tmp_path / "models",
+        universe_version="fixture",
+        initial_train_months=1,
+        validation_months=1,
+        embargo_days=5,
+        fill_policy=FillPolicy(equity_cost_bps=10, crypto_cost_bps=20),
+        risk_policy=RiskPolicy(),
+        samples_per_year=365,
+        valuation_calendar="24/7",
+        topk=1,
+    )
+    return features, labels, kwargs
+
+
+def test_six_month_expanding_splits_honor_train_start():
+    dates = pd.date_range("2020-01-01", "2024-01-01", tz="UTC")
+    folds = split_folds(dates, "2021-01-01")
+    assert pd.Timestamp(folds[0]["train_start"]) == pd.Timestamp("2021-01-01", tz="UTC")
+    assert pd.Timestamp(folds[0]["test_end"]) == pd.Timestamp(
+        folds[0]["test_start"]
+    ) + pd.DateOffset(months=6)
+    assert folds[1]["train_start"] == folds[0]["train_start"]
+    assert folds[1]["train_end"] > folds[0]["train_end"]
+    assert folds[0]["test_end"] == folds[1]["test_start"]
+
+
+def test_real_oos_nav_purging_and_holdings_carried(tmp_path):
+    x, y, args = wf_case(tmp_path, two_folds=True)
+    instances = []
+
+    def factory():
+        instance = Ridge(alpha=1)
+        instances.append(instance)
+        return instance
+
+    result = WalkForwardRunner().run(x, y, model_factory=factory, **args)
+    assert len(instances) == len(result.walk_forward_results) == 2
+    assert result.reconciliation["reconciled"]
+    assert result.metrics.total_trades > 0
+    assert len(result.timestamps) == len(set(result.timestamps))
+    assert len(result.daily_returns) == len(result.equity_curve) - 1
+    assert np.std(result.daily_returns) > 0
+    assert len(list((tmp_path / "models").glob("fold-*.joblib"))) == 2
+    for fold in result.walk_forward_results:
+        assert fold.purged_rows > 0
+        assert (
+            pd.Timestamp(fold.label_end_max)
+            < pd.Timestamp(fold.train_end)
+            < pd.Timestamp(fold.validation_start)
         )
+    boundary = pd.Timestamp(result.walk_forward_results[1].test_start)
+    before = [s for s in result.snapshots if s.as_of < boundary][-1]
+    after = [s for s in result.snapshots if s.as_of >= boundary][0]
+    assert before.positions and after.positions
+    assert before.cash != args["account"].initial_cash
+    assert abs(float(after.nav / before.nav) - 1) < 0.02  # no capital reset at fold boundary
 
 
-def test_stitched_returns_not_empty(mock_config):
-    """stitched_returns should be non-empty after a successful run."""
-    features, labels = _make_features_labels(n_dates=756)
-    result = _run_with_mock(mock_config, features, labels, walk_months=6, embargo_days=5)
-    assert len(result.stitched_returns) > 0, "stitched_returns should not be empty"
+def test_future_feature_perturbation_does_not_rewrite_first_fold(tmp_path):
+    x, y, args = wf_case(tmp_path / "one", two_folds=True)
+    one = WalkForwardRunner().run(x, y, model_factory=Ridge, **args)
+    boundary = pd.Timestamp(one.walk_forward_results[1].test_start)
+    changed = x.copy()
+    changed.loc[changed.index.get_level_values(0) >= boundary] *= 100
+    args.update(ledger_path=tmp_path / "two" / "wf.db", artifact_dir=tmp_path / "two" / "models")
+    two = WalkForwardRunner().run(changed, y, model_factory=Ridge, **args)
+    assert [d for d in one.decisions if pd.Timestamp(d["target"]["decision_at"]) < boundary] == [
+        d for d in two.decisions if pd.Timestamp(d["target"]["decision_at"]) < boundary
+    ]
+    assert [(s.as_of, s.nav) for s in one.snapshots if s.as_of < boundary] == [
+        (s.as_of, s.nav) for s in two.snapshots if s.as_of < boundary
+    ]
 
 
-def test_feature_importance_drift_length(mock_config):
-    """feature_importance_drift should have len == n_folds - 1."""
-    features, labels = _make_features_labels(n_dates=756)
-    result = _run_with_mock(mock_config, features, labels, walk_months=6, embargo_days=5)
-    n_folds = len(result.folds)
-    expected_len = max(0, n_folds - 1)
-    assert len(result.feature_importance_drift) == expected_len, (
-        f"Expected feature_importance_drift length {expected_len}, "
-        f"got {len(result.feature_importance_drift)}"
+def test_future_availability_overlap_and_incomplete_folds(tmp_path):
+    x, y, args = wf_case(tmp_path)
+    args["feature_available_at"] = args["feature_available_at"] + pd.Timedelta(days=1)
+    with pytest.raises(BacktestError, match="future feature"):
+        WalkForwardRunner().run(x, y, model_factory=Ridge, **args)
+    args["feature_available_at"] -= pd.Timedelta(days=1)
+    # Labels spanning all of training and validation leave no eligible model fit.
+    args["label_end_times"] = args["label_end_times"] + pd.Timedelta(days=400)
+    with pytest.raises(BacktestError, match="empty purged"):
+        WalkForwardRunner().run(x, y, model_factory=Ridge, **args)
+    assert not (tmp_path / "models" / "result.json").exists()
+
+
+def test_training_failure_never_returns_performance(tmp_path):
+    x, y, args = wf_case(tmp_path)
+
+    class Failed:
+        def fit(self, *args):
+            raise RuntimeError("training failed")
+
+    with pytest.raises(BacktestError, match="training failed"):
+        WalkForwardRunner().run(x, y, model_factory=Failed, **args)
+    assert (tmp_path / "models" / "failure.json").exists()
+    assert not (tmp_path / "models" / "result.json").exists()
+
+
+def test_ic_is_cross_sectional_and_undefined_is_preserved():
+    idx = pd.MultiIndex.from_product(
+        [pd.date_range("2024-01-01", periods=2, tz="UTC"), ["A", "B", "C"]]
     )
-
-
-def test_rolling_ic_values_are_finite(mock_config):
-    """rolling_ic values must all be finite numbers."""
-    features, labels = _make_features_labels(n_dates=756)
-    result = _run_with_mock(mock_config, features, labels, walk_months=6, embargo_days=5)
-    for i, ic_val in enumerate(result.rolling_ic):
-        assert math.isfinite(ic_val), f"rolling_ic[{i}] = {ic_val} is not finite"
-
-
-def test_generate_html_report_creates_file(mock_config, tmp_path):
-    """generate_html_report should create a file at output_path."""
-    result = _make_minimal_result(n_folds=3)
-    runner = WalkForwardRunner(config=mock_config)
-    report_path = str(tmp_path / "report.html")
-    returned_path = runner.generate_html_report(result, report_path)
-    assert Path(returned_path).exists(), f"Report file not found at {returned_path}"
-    content = Path(returned_path).read_text()
-    assert len(content) > 100, "Report HTML is suspiciously short"
-
-
-def test_run_returns_walk_forward_result_type(mock_config):
-    """run() should return a WalkForwardResult instance."""
-    features, labels = _make_features_labels(n_dates=756)
-    result = _run_with_mock(mock_config, features, labels, walk_months=6, embargo_days=5)
-    assert isinstance(result, WalkForwardResult), (
-        f"Expected WalkForwardResult, got {type(result)}"
+    values = cross_sectional_ic(
+        pd.Series([1, 2, 3, 3, 2, 1], index=idx), pd.Series([2, 3, 4, 2, 3, 4], index=idx)
     )
+    assert list(values.values()) == pytest.approx([1, -1])
+    undefined = cross_sectional_ic(pd.Series([1] * 6, index=idx), pd.Series([1] * 6, index=idx))
+    assert list(undefined.values()) == [None, None]
+
+
+@pytest.mark.parametrize("name", ["Linear", "LightGBM", "CatBoost", "XGBoost", "Ensemble"])
+def test_real_model_family_executes_oos_ledger(name, tmp_path):
+    from src.core.ensemble import EnsembleModel
+    from src.core.model_zoo import ModelWrapper
+    from src.utils.config import AppConfig
+
+    x, y, args = wf_case(tmp_path)
+    cfg = AppConfig(output_dir=str(tmp_path / "output"), log_dir=str(tmp_path / "logs"))
+
+    def factory():
+        if name == "Ensemble":
+            return EnsembleModel(model_names=["Linear"], weighting="equal", config=cfg)
+        model = ModelWrapper(name, cfg)
+        if name == "LightGBM":
+            model._params.update(n_estimators=4, n_jobs=1, min_child_samples=5)
+        elif name == "CatBoost":
+            model._params.update(iterations=4, thread_count=1, allow_writing_files=False)
+        elif name == "XGBoost":
+            model._params.update(n_estimators=4, n_jobs=1)
+        return model
+
+    result = WalkForwardRunner(cfg).run(x, y, model_factory=factory, **args)
+    assert result.metrics.total_trades > 0
+    assert result.walk_forward_results[0].model_version
+    assert result.reconciliation["reconciled"]
+
+
+def test_incomplete_window_and_cli_failed_training_are_non_success(tmp_path):
+    import json
+
+    from typer.testing import CliRunner
+
+    from scripts.run_backtest import app
+    from tests.test_core_backtest import write_bundle
+
+    x, y, args = wf_case(tmp_path / "partial")
+    cutoff = x.index.get_level_values(0).max() - pd.Timedelta(days=30)
+    mask = x.index.get_level_values(0) <= cutoff
+    args["label_end_times"] = args["label_end_times"].loc[mask]
+    args["feature_available_at"] = args["feature_available_at"].loc[mask]
+    result = WalkForwardRunner().run(x.loc[mask], y.loc[mask], model_factory=Ridge, **args)
+    assert result.status == "incomplete"
+    assert "promotion prohibited" in result.diagnostics[-1]
+    # Exercise a real unsupported model/training failure through the public CLI.
+    bundle = tmp_path / "bad-training.json"
+    inputs = {
+        k: args[k]
+        for k in (
+            "context",
+            "account",
+            "bars",
+            "metadata",
+            "universes",
+            "fill_policy",
+            "risk_policy",
+            "topk",
+            "samples_per_year",
+        )
+    }
+    write_bundle(bundle, inputs)
+    payload = json.loads(bundle.read_text())
+    payload["walk_forward"] = {
+        "model_name": "MissingModel",
+        "universe_version": "fixture",
+        "initial_train_months": 1,
+        "validation_months": 1,
+        "rows": [
+            {
+                "decision_at": i[0].isoformat(),
+                "instrument_id": i[1],
+                "features": row.to_dict(),
+                "label": float(y.loc[i]),
+                "label_end_at": (i[0] + pd.Timedelta(days=1)).isoformat(),
+                "feature_available_at": i[0].isoformat(),
+            }
+            for i, row in x.iterrows()
+        ],
+    }
+    bundle.write_text(json.dumps(payload))
+    output = tmp_path / "failed.json"
+    invocation = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "--input",
+            str(bundle),
+            "--ledger",
+            str(tmp_path / "failed.db"),
+            "--output",
+            str(output),
+        ],
+    )
+    assert invocation.exit_code == 1, invocation.output
+    assert not output.exists()
+    assert json.loads((tmp_path / "failed.json.failure.json").read_text())["status"] == "failed"

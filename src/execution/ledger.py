@@ -5,6 +5,7 @@ by account and immutable: retrying identical input is a no-op; changing input
 under an existing identifier is an error. All cash and basis arithmetic is
 Decimal, stored as text. Buy fees are capitalized into weighted-average basis.
 """
+
 from __future__ import annotations
 
 import json
@@ -39,7 +40,9 @@ class PortfolioLedger:
         self.path = str(path)
         if self.path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None, timeout=30, check_same_thread=False)
+        self.db = sqlite3.connect(
+            self.path, isolation_level=None, timeout=30, check_same_thread=False
+        )
         self.db.row_factory = sqlite3.Row
         self._lock = RLock()
         self._depth = 0
@@ -110,16 +113,33 @@ class PortfolioLedger:
 
     def create_account(self, spec: AccountSpec):
         with self.atomic():
-            existing = self.db.execute("SELECT spec FROM accounts WHERE id=?", (spec.account_id,)).fetchone()
+            existing = self.db.execute(
+                "SELECT spec FROM accounts WHERE id=?", (spec.account_id,)
+            ).fetchone()
             if existing:
                 if AccountSpec.model_validate_json(existing[0]) != spec:
                     raise LedgerError("account already exists with different initial conditions")
                 return
-            self.db.execute("INSERT INTO accounts VALUES (?,?,?,?,?,?,?)", (
-                spec.account_id, spec.model_dump_json(), str(spec.initial_cash), "0", "0",
-                str(spec.initial_cash), spec.opened_at.isoformat()))
-            self._journal(spec.account_id, "initial", "deposit", spec.opened_at,
-                          spec.model_dump_json(), spec.initial_cash)
+            self.db.execute(
+                "INSERT INTO accounts VALUES (?,?,?,?,?,?,?)",
+                (
+                    spec.account_id,
+                    spec.model_dump_json(),
+                    str(spec.initial_cash),
+                    "0",
+                    "0",
+                    str(spec.initial_cash),
+                    spec.opened_at.isoformat(),
+                ),
+            )
+            self._journal(
+                spec.account_id,
+                "initial",
+                "deposit",
+                spec.opened_at,
+                spec.model_dump_json(),
+                spec.initial_cash,
+            )
 
     def spec(self, account: str) -> AccountSpec:
         return AccountSpec.model_validate_json(self._account(account)["spec"])
@@ -138,12 +158,16 @@ class PortfolioLedger:
         self.db.execute("UPDATE accounts SET last_at=? WHERE id=?", (at.isoformat(), account))
 
     def _journal(self, account, event_id, kind, at, payload, delta):
-        self.db.execute("INSERT INTO journal(account,id,kind,at,payload,cash_delta) VALUES (?,?,?,?,?,?)",
-                        (account, event_id, kind, at.isoformat(), payload, str(delta)))
+        self.db.execute(
+            "INSERT INTO journal(account,id,kind,at,payload,cash_delta) VALUES (?,?,?,?,?,?)",
+            (account, event_id, kind, at.isoformat(), payload, str(delta)),
+        )
 
     def record_event(self, account: str, event_id: str, payload: str) -> bool:
         """Call inside the same transaction as the event's mutations."""
-        row = self.db.execute("SELECT payload FROM events WHERE account=? AND id=?", (account, event_id)).fetchone()
+        row = self.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?", (account, event_id)
+        ).fetchone()
         if row:
             if row[0] != payload:
                 raise LedgerError(f"conflicting event retry: {event_id}")
@@ -153,8 +177,10 @@ class PortfolioLedger:
 
     def submit(self, intent: OrderIntent):
         with self.atomic():
-            old = self.db.execute("SELECT payload FROM orders WHERE account=? AND id=?",
-                                  (intent.account_id, intent.intent_id)).fetchone()
+            old = self.db.execute(
+                "SELECT payload FROM orders WHERE account=? AND id=?",
+                (intent.account_id, intent.intent_id),
+            ).fetchone()
             if old:
                 if OrderIntent.model_validate_json(old[0]) != intent:
                     raise LedgerError("intent identifier reused with different content")
@@ -165,56 +191,102 @@ class PortfolioLedger:
                 raise LedgerError("base currency instrument must have FX rate 1")
             reserved = ZERO
             if intent.side == "buy":
-                reserved = intent.quantity * intent.reference_price * intent.fx_rate + intent.estimated_fee
+                reserved = (
+                    intent.quantity * intent.reference_price * intent.fx_rate + intent.estimated_fee
+                )
                 if reserved > self.available_cash(intent.account_id):
                     raise LedgerError("insufficient unreserved cash")
             else:
                 held = self.quantity(intent.account_id, intent.instrument.instrument_id)
-                reserved_qty = sum((o["remaining"] for o in self.pending(intent.account_id)
-                                    if o["intent"].instrument.instrument_id == intent.instrument.instrument_id
-                                    and o["intent"].side == "sell"), ZERO)
+                reserved_qty = sum(
+                    (
+                        o["remaining"]
+                        for o in self.pending(intent.account_id)
+                        if o["intent"].instrument.instrument_id == intent.instrument.instrument_id
+                        and o["intent"].side == "sell"
+                    ),
+                    ZERO,
+                )
                 if intent.quantity > held - reserved_qty:
                     raise LedgerError("insufficient unreserved holdings")
-            self.db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?)", (
-                intent.account_id, intent.intent_id, intent.model_dump_json(), "pending", "0", str(reserved), None))
-            self._journal(intent.account_id, "order:" + intent.intent_id, "order", intent.decision_at,
-                          intent.model_dump_json(), ZERO)
+            self.db.execute(
+                "INSERT INTO orders VALUES (?,?,?,?,?,?,?)",
+                (
+                    intent.account_id,
+                    intent.intent_id,
+                    intent.model_dump_json(),
+                    "pending",
+                    "0",
+                    str(reserved),
+                    None,
+                ),
+            )
+            self._journal(
+                intent.account_id,
+                "order:" + intent.intent_id,
+                "order",
+                intent.decision_at,
+                intent.model_dump_json(),
+                ZERO,
+            )
             return self.order(intent.account_id, intent.intent_id)
 
     def order(self, account: str, intent_id: str):
-        row = self.db.execute("SELECT * FROM orders WHERE account=? AND id=?", (account, intent_id)).fetchone()
+        row = self.db.execute(
+            "SELECT * FROM orders WHERE account=? AND id=?", (account, intent_id)
+        ).fetchone()
         if row is None:
             raise LedgerError("unknown order")
         intent = OrderIntent.model_validate_json(row["payload"])
-        return {"intent": intent, "status": row["status"], "filled": D(row["filled"]),
-                "remaining": intent.quantity - D(row["filled"]), "reserved": D(row["reserved"]),
-                "reason": row["reason"]}
+        return {
+            "intent": intent,
+            "status": row["status"],
+            "filled": D(row["filled"]),
+            "remaining": intent.quantity - D(row["filled"]),
+            "reserved": D(row["reserved"]),
+            "reason": row["reason"],
+        }
 
     def pending(self, account: str):
-        rows = self.db.execute("SELECT id FROM orders WHERE account=? AND status IN ('pending','partial') ORDER BY rowid", (account,)).fetchall()
+        rows = self.db.execute(
+            "SELECT id FROM orders WHERE account=? AND status IN ('pending','partial') ORDER BY rowid",
+            (account,),
+        ).fetchall()
         return [self.order(account, r[0]) for r in rows]
 
     def available_cash(self, account: str):
-        return D(self._account(account)["cash"]) - sum((o["reserved"] for o in self.pending(account)), ZERO)
+        return D(self._account(account)["cash"]) - sum(
+            (o["reserved"] for o in self.pending(account)), ZERO
+        )
 
     def quantity(self, account: str, instrument_id: str):
-        row = self.db.execute("SELECT quantity FROM holdings WHERE account=? AND instrument=?", (account, instrument_id)).fetchone()
+        row = self.db.execute(
+            "SELECT quantity FROM holdings WHERE account=? AND instrument=?",
+            (account, instrument_id),
+        ).fetchone()
         return D(row[0]) if row else ZERO
 
-    def cancel(self, account: str, intent_id: str, at: datetime, reason="cancelled", rejected=False):
+    def cancel(
+        self, account: str, intent_id: str, at: datetime, reason="cancelled", rejected=False
+    ):
         with self.atomic():
             order = self.order(account, intent_id)
             if order["status"] not in ("pending", "partial"):
                 return
             self._clock(account, at)
             status = "rejected" if rejected else "cancelled"
-            self.db.execute("UPDATE orders SET status=?, reserved='0', reason=? WHERE account=? AND id=?",
-                            (status, reason, account, intent_id))
+            self.db.execute(
+                "UPDATE orders SET status=?, reserved='0', reason=? WHERE account=? AND id=?",
+                (status, reason, account, intent_id),
+            )
             self._journal(account, "cancel:" + intent_id, status, _utc(at), reason, ZERO)
 
     def apply_fill(self, fill: Fill) -> bool:
         with self.atomic():
-            old = self.db.execute("SELECT payload FROM fills WHERE account=? AND id=?", (fill.account_id, fill.fill_id)).fetchone()
+            old = self.db.execute(
+                "SELECT payload FROM fills WHERE account=? AND id=?",
+                (fill.account_id, fill.fill_id),
+            ).fetchone()
             if old:
                 if Fill.model_validate_json(old[0]) != fill:
                     raise LedgerError("fill identifier reused with different content")
@@ -223,20 +295,32 @@ class PortfolioLedger:
             intent = order["intent"]
             if order["status"] not in ("pending", "partial") or fill.quantity > order["remaining"]:
                 raise LedgerError("fill exceeds open order quantity")
-            if fill.executed_at < intent.eligible_at or (intent.expires_at and fill.executed_at > intent.expires_at):
+            if fill.executed_at < intent.eligible_at or (
+                intent.expires_at and fill.executed_at > intent.expires_at
+            ):
                 raise LedgerError("fill outside eligible execution interval")
             if intent.order_type == "limit":
-                if (intent.side == "buy" and fill.price > intent.limit_price) or (intent.side == "sell" and fill.price < intent.limit_price):
+                if (intent.side == "buy" and fill.price > intent.limit_price) or (
+                    intent.side == "sell" and fill.price < intent.limit_price
+                ):
                     raise LedgerError("fill violates limit price")
-            if intent.instrument.quote_currency == self.spec(fill.account_id).base_currency and fill.fx_rate != 1:
+            if (
+                intent.instrument.quote_currency == self.spec(fill.account_id).base_currency
+                and fill.fx_rate != 1
+            ):
                 raise LedgerError("base currency fill must have FX rate 1")
             self._clock(fill.account_id, fill.executed_at)
             row = self._account(fill.account_id)
-            holding = self.db.execute("SELECT * FROM holdings WHERE account=? AND instrument=?",
-                                      (fill.account_id, intent.instrument.instrument_id)).fetchone()
+            holding = self.db.execute(
+                "SELECT * FROM holdings WHERE account=? AND instrument=?",
+                (fill.account_id, intent.instrument.instrument_id),
+            ).fetchone()
             qty = D(holding["quantity"]) if holding else ZERO
             basis = D(holding["basis"]) if holding else ZERO
-            if holding and Instrument.model_validate_json(holding["definition"]) != intent.instrument:
+            if (
+                holding
+                and Instrument.model_validate_json(holding["definition"]) != intent.instrument
+            ):
                 raise LedgerError("instrument identity changed without a security-master migration")
             notional = fill.quantity * fill.price * fill.fx_rate
             remaining = order["remaining"] - fill.quantity
@@ -244,7 +328,9 @@ class PortfolioLedger:
             realized = ZERO
             if intent.side == "buy":
                 delta = -notional - fill.fee
-                other_reservations = D(row["cash"]) - self.available_cash(fill.account_id) - order["reserved"]
+                other_reservations = (
+                    D(row["cash"]) - self.available_cash(fill.account_id) - order["reserved"]
+                )
                 if D(row["cash"]) + delta < other_reservations + reserve:
                     raise LedgerError("fill would consume reserved cash or borrow")
                 qty += fill.quantity
@@ -259,107 +345,256 @@ class PortfolioLedger:
                 realized = delta - removed_basis
                 basis -= removed_basis
                 qty -= fill.quantity
-            self.db.execute("UPDATE accounts SET cash=?,realized=?,fees=? WHERE id=?", (
-                str(D(row["cash"]) + delta), str(D(row["realized"]) + realized),
-                str(D(row["fees"]) + fill.fee), fill.account_id))
+            self.db.execute(
+                "UPDATE accounts SET cash=?,realized=?,fees=? WHERE id=?",
+                (
+                    str(D(row["cash"]) + delta),
+                    str(D(row["realized"]) + realized),
+                    str(D(row["fees"]) + fill.fee),
+                    fill.account_id,
+                ),
+            )
             if qty:
-                self.db.execute("INSERT OR REPLACE INTO holdings VALUES (?,?,?,?,?)", (
-                    fill.account_id, intent.instrument.instrument_id, intent.instrument.model_dump_json(), str(qty), str(basis)))
+                self.db.execute(
+                    "INSERT OR REPLACE INTO holdings VALUES (?,?,?,?,?)",
+                    (
+                        fill.account_id,
+                        intent.instrument.instrument_id,
+                        intent.instrument.model_dump_json(),
+                        str(qty),
+                        str(basis),
+                    ),
+                )
             else:
-                self.db.execute("DELETE FROM holdings WHERE account=? AND instrument=?", (fill.account_id, intent.instrument.instrument_id))
-                self.db.execute("DELETE FROM protections WHERE account=? AND instrument=?", (fill.account_id, intent.instrument.instrument_id))
-            self.db.execute("UPDATE orders SET filled=?,reserved=?,status=? WHERE account=? AND id=?", (
-                str(order["filled"] + fill.quantity), str(reserve), "filled" if remaining == 0 else "partial", fill.account_id, fill.intent_id))
-            self.db.execute("INSERT INTO fills VALUES (?,?,?,?,?,?,?,?)", (
-                fill.account_id, fill.fill_id, fill.intent_id, fill.model_dump_json(), str(delta), str(realized), str(notional), fill.executed_at.isoformat()))
-            self._journal(fill.account_id, "fill:" + fill.fill_id, "fill", fill.executed_at, fill.model_dump_json(), delta)
+                self.db.execute(
+                    "DELETE FROM holdings WHERE account=? AND instrument=?",
+                    (fill.account_id, intent.instrument.instrument_id),
+                )
+                self.db.execute(
+                    "DELETE FROM protections WHERE account=? AND instrument=?",
+                    (fill.account_id, intent.instrument.instrument_id),
+                )
+            self.db.execute(
+                "UPDATE orders SET filled=?,reserved=?,status=? WHERE account=? AND id=?",
+                (
+                    str(order["filled"] + fill.quantity),
+                    str(reserve),
+                    "filled" if remaining == 0 else "partial",
+                    fill.account_id,
+                    fill.intent_id,
+                ),
+            )
+            self.db.execute(
+                "INSERT INTO fills VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    fill.account_id,
+                    fill.fill_id,
+                    fill.intent_id,
+                    fill.model_dump_json(),
+                    str(delta),
+                    str(realized),
+                    str(notional),
+                    fill.executed_at.isoformat(),
+                ),
+            )
+            self._journal(
+                fill.account_id,
+                "fill:" + fill.fill_id,
+                "fill",
+                fill.executed_at,
+                fill.model_dump_json(),
+                delta,
+            )
             return True
 
     def mark(self, account: str, marks: list[PriceMark]):
         with self.atomic():
             for mark in sorted(marks, key=lambda m: m.as_of):
                 self._clock(account, mark.as_of)
-                if mark.instrument.quote_currency == self.spec(account).base_currency and mark.fx_rate != 1:
+                if (
+                    mark.instrument.quote_currency == self.spec(account).base_currency
+                    and mark.fx_rate != 1
+                ):
                     raise LedgerError("base currency mark must have FX rate 1")
-                self.db.execute("INSERT OR REPLACE INTO marks VALUES (?,?,?)", (account, mark.instrument.instrument_id, mark.model_dump_json()))
+                self.db.execute(
+                    "INSERT OR REPLACE INTO marks VALUES (?,?,?)",
+                    (account, mark.instrument.instrument_id, mark.model_dump_json()),
+                )
 
-    def snapshot(self, account: str, at: datetime, max_age_seconds: int, persist=True) -> PortfolioSnapshot:
+    def snapshot(
+        self, account: str, at: datetime, max_age_seconds: int, persist=True
+    ) -> PortfolioSnapshot:
         at = _utc(at)
         with self.atomic():
             row = self._account(account)
             if at < datetime.fromisoformat(row["last_at"]):
                 raise LedgerError("cannot value current state at an earlier time")
             positions = []
-            for h in self.db.execute("SELECT * FROM holdings WHERE account=? ORDER BY instrument", (account,)):
-                m = self.db.execute("SELECT payload FROM marks WHERE account=? AND instrument=?", (account, h["instrument"])).fetchone()
+            for h in self.db.execute(
+                "SELECT * FROM holdings WHERE account=? ORDER BY instrument", (account,)
+            ):
+                m = self.db.execute(
+                    "SELECT payload FROM marks WHERE account=? AND instrument=?",
+                    (account, h["instrument"]),
+                ).fetchone()
                 if m is None:
                     raise LedgerError(f"missing mark for {h['instrument']}")
                 mark = PriceMark.model_validate_json(m[0])
                 age = (at - mark.as_of).total_seconds()
                 if not 0 <= age <= max_age_seconds:
                     raise LedgerError(f"stale/future mark for {h['instrument']}")
-                positions.append(Holding(instrument=mark.instrument, quantity=D(h["quantity"]), cost_basis=D(h["basis"]),
-                                         price=mark.price, fx_rate=mark.fx_rate, marked_at=mark.as_of,
-                                         market_value=D(h["quantity"]) * mark.price * mark.fx_rate))
+                positions.append(
+                    Holding(
+                        instrument=mark.instrument,
+                        quantity=D(h["quantity"]),
+                        cost_basis=D(h["basis"]),
+                        price=mark.price,
+                        fx_rate=mark.fx_rate,
+                        marked_at=mark.as_of,
+                        market_value=D(h["quantity"]) * mark.price * mark.fx_rate,
+                    )
+                )
             nav = D(row["cash"]) + sum((p.market_value for p in positions), ZERO)
             peak = max(D(row["peak"]), nav)
-            turnover = sum((D(f[0]) for f in self.db.execute("SELECT notional FROM fills WHERE account=? AND substr(at,1,10)=?",
-                                                           (account, at.date().isoformat()))), ZERO)
-            snap = PortfolioSnapshot(account_id=account, as_of=at, cash=D(row["cash"]),
-                                     reserved_cash=D(row["cash"]) - self.available_cash(account), nav=nav,
-                                     high_water_mark=peak, realized_pnl=D(row["realized"]), fees=D(row["fees"]),
-                                     turnover_today=turnover, positions=tuple(positions))
+            turnover = sum(
+                (
+                    D(f[0])
+                    for f in self.db.execute(
+                        "SELECT notional FROM fills WHERE account=? AND substr(at,1,10)=?",
+                        (account, at.date().isoformat()),
+                    )
+                ),
+                ZERO,
+            )
+            snap = PortfolioSnapshot(
+                account_id=account,
+                as_of=at,
+                cash=D(row["cash"]),
+                reserved_cash=D(row["cash"]) - self.available_cash(account),
+                nav=nav,
+                high_water_mark=peak,
+                realized_pnl=D(row["realized"]),
+                fees=D(row["fees"]),
+                turnover_today=turnover,
+                positions=tuple(positions),
+            )
             if persist:
-                existing = self.db.execute("SELECT payload FROM snapshots WHERE account=? AND at=?", (account, at.isoformat())).fetchone()
+                existing = self.db.execute(
+                    "SELECT payload FROM snapshots WHERE account=? AND at=?",
+                    (account, at.isoformat()),
+                ).fetchone()
                 if existing and PortfolioSnapshot.model_validate_json(existing[0]) != snap:
                     raise LedgerError("cannot rewrite an existing NAV observation")
                 self._clock(account, at)
                 self.db.execute("UPDATE accounts SET peak=? WHERE id=?", (str(peak), account))
-                self.db.execute("INSERT OR IGNORE INTO snapshots VALUES (?,?,?)", (account, at.isoformat(), snap.model_dump_json()))
+                self.db.execute(
+                    "INSERT OR IGNORE INTO snapshots VALUES (?,?,?)",
+                    (account, at.isoformat(), snap.model_dump_json()),
+                )
             return snap
 
     def corporate_action(self, account: str, action: CorporateAction):
         with self.atomic():
-            if not self.record_event(account, "action:" + action.action_id, action.model_dump_json()):
+            if not self.record_event(
+                account, "action:" + action.action_id, action.model_dump_json()
+            ):
                 return
             self._clock(account, action.effective_at)
             # Cancel resting orders before a split/delisting, rather than executing old units.
             if action.kind in ("split", "delist"):
                 for order in self.pending(account):
                     if order["intent"].instrument.instrument_id == action.instrument.instrument_id:
-                        self.cancel(account, order["intent"].intent_id, action.effective_at, "corporate action")
-            row = self.db.execute("SELECT * FROM holdings WHERE account=? AND instrument=?", (account, action.instrument.instrument_id)).fetchone()
+                        self.cancel(
+                            account,
+                            order["intent"].intent_id,
+                            action.effective_at,
+                            "corporate action",
+                        )
+            row = self.db.execute(
+                "SELECT * FROM holdings WHERE account=? AND instrument=?",
+                (account, action.instrument.instrument_id),
+            ).fetchone()
             delta = ZERO
             if row:
                 qty, basis = D(row["quantity"]), D(row["basis"])
                 if action.kind == "split":
-                    self.db.execute("UPDATE holdings SET quantity=? WHERE account=? AND instrument=?", (str(qty * action.value), account, action.instrument.instrument_id))
-                    mark_row = self.db.execute("SELECT payload FROM marks WHERE account=? AND instrument=?", (account, action.instrument.instrument_id)).fetchone()
+                    self.db.execute(
+                        "UPDATE holdings SET quantity=? WHERE account=? AND instrument=?",
+                        (str(qty * action.value), account, action.instrument.instrument_id),
+                    )
+                    mark_row = self.db.execute(
+                        "SELECT payload FROM marks WHERE account=? AND instrument=?",
+                        (account, action.instrument.instrument_id),
+                    ).fetchone()
                     if mark_row:
                         mark = PriceMark.model_validate_json(mark_row[0])
-                        self.mark(account, [PriceMark(instrument=mark.instrument, price=mark.price / action.value,
-                                                     fx_rate=mark.fx_rate, as_of=action.effective_at)])
-                    self.db.execute("DELETE FROM protections WHERE account=? AND instrument=?", (account, action.instrument.instrument_id))
+                        self.mark(
+                            account,
+                            [
+                                PriceMark(
+                                    instrument=mark.instrument,
+                                    price=mark.price / action.value,
+                                    fx_rate=mark.fx_rate,
+                                    as_of=action.effective_at,
+                                )
+                            ],
+                        )
+                    self.db.execute(
+                        "DELETE FROM protections WHERE account=? AND instrument=?",
+                        (account, action.instrument.instrument_id),
+                    )
                 else:
                     delta = qty * action.value
                     acct = self._account(account)
                     realized = delta - basis if action.kind == "delist" else delta
-                    self.db.execute("UPDATE accounts SET cash=?,realized=? WHERE id=?", (str(D(acct["cash"]) + delta), str(D(acct["realized"]) + realized), account))
+                    self.db.execute(
+                        "UPDATE accounts SET cash=?,realized=? WHERE id=?",
+                        (
+                            str(D(acct["cash"]) + delta),
+                            str(D(acct["realized"]) + realized),
+                            account,
+                        ),
+                    )
                     if action.kind == "delist":
-                        self.db.execute("DELETE FROM holdings WHERE account=? AND instrument=?", (account, action.instrument.instrument_id))
-                        self.db.execute("DELETE FROM protections WHERE account=? AND instrument=?", (account, action.instrument.instrument_id))
-            self._journal(account, "action:" + action.action_id, action.kind, action.effective_at, action.model_dump_json(), delta)
+                        self.db.execute(
+                            "DELETE FROM holdings WHERE account=? AND instrument=?",
+                            (account, action.instrument.instrument_id),
+                        )
+                        self.db.execute(
+                            "DELETE FROM protections WHERE account=? AND instrument=?",
+                            (account, action.instrument.instrument_id),
+                        )
+            self._journal(
+                account,
+                "action:" + action.action_id,
+                action.kind,
+                action.effective_at,
+                action.model_dump_json(),
+                delta,
+            )
 
     def history(self, account: str) -> list[PortfolioSnapshot]:
-        return [PortfolioSnapshot.model_validate_json(r[0]) for r in self.db.execute("SELECT payload FROM snapshots WHERE account=? ORDER BY at", (account,))]
+        return [
+            PortfolioSnapshot.model_validate_json(r[0])
+            for r in self.db.execute(
+                "SELECT payload FROM snapshots WHERE account=? ORDER BY at", (account,)
+            )
+        ]
 
     def fills(self, account: str) -> list[Fill]:
-        return [Fill.model_validate_json(r[0]) for r in self.db.execute("SELECT payload FROM fills WHERE account=? ORDER BY at,rowid", (account,))]
+        return [
+            Fill.model_validate_json(r[0])
+            for r in self.db.execute(
+                "SELECT payload FROM fills WHERE account=? ORDER BY at,rowid", (account,)
+            )
+        ]
 
     def reconcile(self, account: str) -> dict:
         """Independently replay persisted economic fills/actions to check cash/basis."""
         cash, positions, realized, fees = ZERO, {}, ZERO, ZERO
-        for row in self.db.execute("SELECT * FROM journal WHERE account=? ORDER BY sequence", (account,)):
+        for row in self.db.execute(
+            "SELECT * FROM journal WHERE account=? ORDER BY sequence", (account,)
+        ):
             cash += D(row["cash_delta"])
             if row["kind"] == "fill":
                 f = Fill.model_validate_json(row["payload"])
@@ -386,14 +621,39 @@ class PortfolioLedger:
                 else:
                     realized += qty * a.value - basis
                     positions[key] = ZERO, ZERO
-        stored = {r["instrument"]: (D(r["quantity"]), D(r["basis"])) for r in self.db.execute("SELECT * FROM holdings WHERE account=?", (account,))}
+        stored = {
+            r["instrument"]: (D(r["quantity"]), D(r["basis"]))
+            for r in self.db.execute("SELECT * FROM holdings WHERE account=?", (account,))
+        }
         expected = {k: v for k, v in positions.items() if v[0]}
         state = self._account(account)
-        valid = cash == D(state["cash"]) and stored == expected and realized == D(state["realized"]) and fees == D(state["fees"])
+        valid = (
+            cash == D(state["cash"])
+            and stored == expected
+            and realized == D(state["realized"])
+            and fees == D(state["fees"])
+        )
         if not valid:
             raise LedgerError("ledger reconciliation failed")
-        return {"reconciled": True, "cash": str(cash), "realized_pnl": str(realized), "fees": str(fees), "positions": len(stored)}
+        return {
+            "reconciled": True,
+            "cash": str(cash),
+            "realized_pnl": str(realized),
+            "fees": str(fees),
+            "positions": len(stored),
+        }
 
     def save_run(self, account: str, run_id: str, payload: dict):
         with self.atomic():
-            self.db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?)", (account, run_id, json.dumps(payload, sort_keys=True, allow_nan=False)))
+            current = self.db.execute(
+                "SELECT payload FROM runs WHERE account=? AND id=?", (account, run_id)
+            ).fetchone()
+            if current:
+                old = json.loads(current[0])
+                for key in ("manifest_hash", "manifest"):
+                    if old.get(key) != payload.get(key):
+                        raise LedgerError("run identity cannot replace its immutable manifest")
+            self.db.execute(
+                "INSERT OR REPLACE INTO runs VALUES (?,?,?)",
+                (account, run_id, json.dumps(payload, sort_keys=True, allow_nan=False)),
+            )

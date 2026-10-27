@@ -1,671 +1,765 @@
-"""Walk-forward backtester and validation framework."""
+"""Authoritative chronological portfolio replay; no label-derived NAV paths.
+
+Run ranked predictions or explicit optimizer targets through the exact paper
+execution/ledger implementation. Backtest namespaces cannot access live venues.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from collections import defaultdict
+from datetime import datetime, timedelta
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+from pydantic import BaseModel, ConfigDict, Field
 
-from src.utils.config import AppConfig, get_config
-from src.utils.exceptions import BacktestError
-from src.utils.logger import get_logger
-from src.utils.schemas import (
-    BacktestMetrics,
-    BacktestResult,
-    ValidationCheck,
-    ValidationResult,
-    ValidationVerdict,
-    WalkForwardFold,
+from src.domain.common import RunContext
+from src.domain.portfolio import (
+    AccountSpec,
+    CorporateAction,
+    ExecutionBar,
+    FillPolicy,
+    InstrumentRisk,
+    OrderIntent,
+    PortfolioSnapshot,
+    PortfolioTarget,
+    RankedSignal,
+    RiskPolicy,
+    TargetWeight,
+    UniverseEligibility,
 )
+from src.execution.ledger import LedgerError, PortfolioLedger
+from src.execution.simulator import PaperExecution
+from src.utils.exceptions import BacktestError
 
-logger = get_logger(__name__)
+D = Decimal
 
-_TRADING_DAYS = 252
+
+class ReplayMetrics(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    total_return: float
+    annual_return: float | None
+    sharpe_ratio: float | None
+    max_drawdown: float
+    volatility: float | None
+    sortino_ratio: float | None = None
+    calmar_ratio: float | None = None
+    win_rate: float | None = None
+    total_trades: int = 0
+    turnover: float = 0.0  # one-way traded base notional / pre-trade NAV, summed
+    fees: float = 0.0
+
+
+class FoldEvidence(BaseModel):
+    fold_id: int
+    train_start: str
+    train_end: str
+    validation_start: str
+    validation_end: str
+    test_start: str
+    test_end: str
+    train_rows: int
+    validation_rows: int
+    test_rows: int
+    purged_rows: int
+    embargo_days: int
+    model_version: str
+    train_hash: str
+    validation_hash: str
+    predictions_hash: str
+    label_end_max: str
+    validation_label_end_max: str
+    oos_sharpe: float | None = None
+    ic: float | None = None
+    feature_importance: dict[str, float] = Field(default_factory=dict)
+
+
+class ReplayResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    schema_version: Literal["2.0"] = "2.0"
+    engine: Literal["chronological-ledger-v1"] = "chronological-ledger-v1"
+    status: Literal["complete", "incomplete", "failed"]
+    run_id: str
+    account_id: str
+    manifest: dict
+    metrics: ReplayMetrics
+    daily_returns: list[float]
+    timestamps: list[str]  # includes initial cash observation, as does equity_curve
+    equity_curve: list[float]
+    snapshots: list[PortfolioSnapshot]
+    trades: list[dict]
+    decisions: list[dict]
+    walk_forward_results: list[FoldEvidence] = Field(default_factory=list)
+    cross_sectional_ic: dict[str, float | None] = Field(default_factory=dict)
+    reconciliation: dict
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+def performance_metrics(nav: list[float], samples_per_year: int) -> ReplayMetrics:
+    if len(nav) < 2 or samples_per_year <= 0 or not np.isfinite(nav).all() or min(nav) <= 0:
+        raise BacktestError(
+            "at least two positive finite NAV observations and declared annualization required"
+        )
+    values = np.asarray(nav, dtype=float)
+    returns = values[1:] / values[:-1] - 1
+    std = float(np.std(returns, ddof=1)) if len(returns) > 1 else None
+    vol = std * math.sqrt(samples_per_year) if std is not None else None
+    total = float(values[-1] / values[0] - 1)
+    exponent = math.log(values[-1] / values[0]) * samples_per_year / len(returns)
+    annual = math.expm1(exponent) if abs(exponent) < 700 else None
+    drawdown = float(np.min(values / np.maximum.accumulate(values) - 1))
+    downside = float(np.sqrt(np.mean(np.minimum(returns, 0) ** 2)))
+    return ReplayMetrics(
+        total_return=total,
+        annual_return=annual,
+        sharpe_ratio=float(returns.mean() / std * math.sqrt(samples_per_year))
+        if std and std > 0
+        else None,
+        max_drawdown=drawdown,
+        volatility=vol,
+        sortino_ratio=float(returns.mean() / downside * math.sqrt(samples_per_year))
+        if downside > 0
+        else None,
+        calmar_ratio=annual / abs(drawdown) if annual is not None and drawdown < 0 else None,
+        win_rate=float(np.mean(returns > 0)),
+    )
+
+
+def canonical_hash(value) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+class PortfolioReplay:
+    def __init__(self, ledger_path: str | Path):
+        self.ledger_path = ledger_path
+
+    def run(
+        self,
+        *,
+        context: RunContext,
+        account: AccountSpec,
+        bars: list[ExecutionBar],
+        metadata: list[InstrumentRisk],
+        universes: list[UniverseEligibility],
+        signals: list[RankedSignal] | None = None,
+        targets: list[PortfolioTarget] | None = None,
+        actions: list[CorporateAction] | None = None,
+        topk: int = 30,
+        fill_policy: FillPolicy | None = None,
+        risk_policy: RiskPolicy | None = None,
+        samples_per_year: int = 252,
+        valuation_calendar: str = "declared-equity-sessions",
+        valuation_times: list[datetime] | None = None,
+        provenance: dict | None = None,
+    ) -> ReplayResult:
+        if (
+            context.mode != "backtest"
+            or account.mode != "backtest"
+            or context.account_id != account.account_id
+        ):
+            raise BacktestError("replay requires an isolated backtest account matching RunContext")
+        if (
+            not bars
+            or not metadata
+            or not universes
+            or (not signals and not targets)
+            or (signals and targets)
+        ):
+            raise BacktestError(
+                "actual bars, risk metadata, documented universe eligibility and exactly one signal/target stream are required"
+            )
+        if topk < 1 or samples_per_year <= 0:
+            raise BacktestError("topk and annualization must be positive")
+        signals, targets, actions = signals or [], targets or [], actions or []
+        policy, risk = fill_policy or FillPolicy(), risk_policy or RiskPolicy()
+        bars = sorted(bars, key=lambda b: (b.opened_at, b.instrument.instrument_id))
+        if len({b.event_id for b in bars}) != len(bars):
+            raise BacktestError("duplicate market event IDs")
+        per_instrument = defaultdict(list)
+        for b in bars:
+            per_instrument[b.instrument.instrument_id].append(b)
+        for events in per_instrument.values():
+            if any(a.closed_at > b.opened_at for a, b in zip(events, events[1:])):
+                raise BacktestError("overlapping instrument bars")
+        times = valuation_times or sorted({b.closed_at for b in bars})
+        if times != sorted(set(times)) or any(
+            t <= account.opened_at or t > context.as_of for t in times
+        ):
+            raise BacktestError(
+                "valuation schedule must be unique, increasing and inside run bounds"
+            )
+        if len({t.date() for t in times}) != len(times):
+            raise BacktestError(
+                "daily metrics require an explicit one-observation-per-day valuation schedule"
+            )
+        if account.opened_at > bars[0].opened_at or max(b.closed_at for b in bars) > context.as_of:
+            raise BacktestError("market data outside account/run clock")
+        identities = {}
+        for b in bars:
+            old = identities.setdefault(b.instrument.instrument_id, b.instrument)
+            if old != b.instrument:
+                raise BacktestError("conflicting instrument identities")
+        universe_keys = [(u.universe_version, u.effective_at, u.available_at) for u in universes]
+        if len(set(universe_keys)) != len(universe_keys):
+            raise BacktestError("duplicate/ambiguous universe eligibility snapshot")
+        signal_groups = defaultdict(list)
+        for signal in signals:
+            signal_groups[signal.decision_at].append(signal)
+        if len({s.signal_id for s in signals}) != len(signals):
+            raise BacktestError("duplicate signal IDs")
+        target_groups = {t.decision_at: t for t in targets}
+        if len(target_groups) != len(targets):
+            raise BacktestError(
+                "multiple targets at one decision instant must be netted before replay"
+            )
+
+        def eligible(at, version):
+            candidates = [
+                u
+                for u in universes
+                if u.universe_version == version
+                and u.effective_at <= at
+                and u.available_at <= at
+                and u.data_snapshot_id in context.data_snapshot_ids
+            ]
+            if not candidates:
+                raise BacktestError(
+                    "no documented universe membership available at decision cutoff"
+                )
+            return set(
+                max(candidates, key=lambda u: (u.effective_at, u.available_at)).instrument_ids
+            )
+
+        for at, group in signal_groups.items():
+            if len({s.instrument.instrument_id for s in group}) != len(group):
+                raise BacktestError("duplicate instrument predictions at a decision instant")
+            if len({s.universe_version for s in group}) != 1:
+                raise BacktestError("rankings at one date require a coherent universe version")
+            if len({s.strategy_id for s in group}) != 1:
+                raise BacktestError(
+                    "net multiple strategy sleeves into an explicit PortfolioTarget"
+                )
+            for s in group:
+                if s.instrument.instrument_id not in eligible(at, s.universe_version):
+                    raise BacktestError("prediction instrument was outside point-in-time universe")
+                if (
+                    s.data_snapshot_id not in context.data_snapshot_ids
+                    or identities.get(s.instrument.instrument_id) != s.instrument
+                ):
+                    raise BacktestError("signal instrument/data snapshot provenance mismatch")
+                if not any(
+                    b.opened_at > at and b.tradable
+                    for b in per_instrument[s.instrument.instrument_id]
+                ):
+                    raise BacktestError("signal has no subsequent eligible observed open")
+        for t in targets:
+            if t.data_snapshot_id not in context.data_snapshot_ids:
+                raise BacktestError("target data snapshot provenance mismatch")
+            available_members = eligible(t.decision_at, t.universe_version)
+            for w in t.weights:
+                if w.weight > 0 and w.instrument.instrument_id not in available_members:
+                    raise BacktestError("target instrument outside documented eligible universe")
+                if identities.get(w.instrument.instrument_id) != w.instrument:
+                    raise BacktestError("target instrument is absent from execution data")
+        manifest = {
+            "context": context.model_dump(mode="json"),
+            "account": account.model_dump(mode="json"),
+            "fill_policy": policy.model_dump(mode="json"),
+            "risk_policy": risk.model_dump(mode="json"),
+            "topk": topk,
+            "samples_per_year": samples_per_year,
+            "valuation_calendar": valuation_calendar,
+            "valuation_times": [t.isoformat() for t in times],
+            "cash_return": "zero",
+            "cost_convention": "one-way charged once per fill",
+            "bars_hash": canonical_hash([b.model_dump(mode="json") for b in bars]),
+            "signals_hash": canonical_hash(
+                [s.model_dump(mode="json") for s in sorted(signals, key=lambda s: s.signal_id)]
+            ),
+            "targets_hash": canonical_hash([t.model_dump(mode="json") for t in targets]),
+            "metadata_hash": canonical_hash([m.model_dump(mode="json") for m in metadata]),
+            "universe_hash": canonical_hash([u.model_dump(mode="json") for u in universes]),
+            "actions_hash": canonical_hash([a.model_dump(mode="json") for a in actions]),
+            "provenance": provenance or {},
+        }
+        manifest_hash = canonical_hash(manifest)
+        ledger = PortfolioLedger(self.ledger_path)
+        try:
+            ledger.create_account(account)
+            prior = ledger.db.execute(
+                "SELECT payload FROM runs WHERE account=? AND id=?",
+                (account.account_id, context.run_id),
+            ).fetchone()
+            if prior and json.loads(prior[0])["manifest_hash"] != manifest_hash:
+                raise BacktestError("run inputs changed; use a new isolated account/run")
+            other = ledger.db.execute(
+                "SELECT id FROM runs WHERE account=? AND id<>?",
+                (account.account_id, context.run_id),
+            ).fetchone()
+            if other:
+                raise BacktestError("historical accounts are exclusive to one reproducible run")
+            ledger.save_run(
+                account.account_id,
+                context.run_id,
+                {"status": "running", "manifest_hash": manifest_hash, "manifest": manifest},
+            )
+            with ledger.atomic():
+                for kind, records in (
+                    ("signal", signals),
+                    ("target", targets),
+                    ("metadata", metadata),
+                    ("universe", universes),
+                    ("action", actions),
+                ):
+                    for record in records:
+                        ledger.record_event(
+                            account.account_id,
+                            f"input:{kind}:" + record.content_hash(),
+                            record.model_dump_json(),
+                        )
+            engine = PaperExecution(ledger, account.account_id, policy, risk)
+            if not ledger.history(account.account_id):
+                ledger.snapshot(account.account_id, account.opened_at, risk.max_price_age_seconds)
+            timeline = defaultdict(lambda: defaultdict(list))
+            for b in bars:
+                timeline[b.opened_at]["opens"].append(b)
+                timeline[b.closed_at]["closes"].append(b)
+            for a in actions:
+                timeline[a.effective_at]["actions"].append(a)
+            for t in times:
+                timeline[t]["valuation"] = True
+            for at, group in signal_groups.items():
+                timeline[at]["signals"] = group
+            for at, target in target_groups.items():
+                timeline[at]["target"] = target
+            for at, event in sorted(timeline.items()):
+                if at < account.opened_at or at > context.as_of:
+                    raise BacktestError("event outside account/run clock")
+                with ledger.atomic():
+                    if not ledger.record_event(
+                        account.account_id, "step:" + at.isoformat(), manifest_hash
+                    ):
+                        continue
+                    meta = self._metadata_as_of(metadata, at)
+                    # End of preceding interval precedes next interval's open at the
+                    # same boundary. Signals at that boundary cannot fill that open.
+                    for b in event["closes"]:
+                        engine.close_bar(b)
+                    for a in event["actions"]:
+                        ledger.corporate_action(account.account_id, a)
+                    # Mark all simultaneous opens before evaluating portfolio risk.
+                    from src.domain.portfolio import PriceMark
+
+                    if event["opens"]:
+                        ledger.mark(
+                            account.account_id,
+                            [
+                                PriceMark(
+                                    instrument=b.instrument,
+                                    price=b.open,
+                                    fx_rate=b.fx_rate,
+                                    as_of=at,
+                                )
+                                for b in event["opens"]
+                            ],
+                        )
+                    for b in event["opens"]:
+                        engine.open_bar(b, meta)
+                    if event["signals"] or event["target"]:
+                        target = event["target"] or self._rank_target(event["signals"], topk, risk)
+                        self._rebalance(engine, target, meta, identities, per_instrument)
+                    if event["valuation"]:
+                        ledger.snapshot(account.account_id, at, risk.max_price_age_seconds)
+            # The evaluation ends with marked holdings; unfilled remainders expire,
+            # without fabricated liquidation proceeds or resetting fold cash.
+            with ledger.atomic():
+                for pending in ledger.pending(account.account_id):
+                    ledger.cancel(
+                        account.account_id,
+                        pending["intent"].intent_id,
+                        context.as_of,
+                        "evaluation cutoff",
+                    )
+            reconciliation = ledger.reconcile(account.account_id)
+            snapshots = ledger.history(account.account_id)
+            nav = [float(s.nav) for s in snapshots]
+            metrics = performance_metrics(nav, samples_per_year)
+            fills = ledger.fills(account.account_id)
+            trades = []
+            turnover = 0.0
+            for f in fills:
+                order = ledger.order(account.account_id, f.intent_id)["intent"]
+                previous = [s for s in snapshots if s.as_of < f.executed_at]
+                denominator = previous[-1].nav if previous else account.initial_cash
+                turnover += float(f.quantity * f.price * f.fx_rate / denominator)
+                economic = ledger.db.execute(
+                    "SELECT cash_delta,realized,notional FROM fills WHERE account=? AND id=?",
+                    (account.account_id, f.fill_id),
+                ).fetchone()
+                trades.append(
+                    {
+                        "cash_delta": economic["cash_delta"],
+                        "realized_pnl": economic["realized"],
+                        "notional": economic["notional"],
+                        **f.model_dump(mode="json"),
+                        "instrument_id": order.instrument.instrument_id,
+                        "side": order.side,
+                        "strategy_id": order.strategy_id,
+                        "decision_at": order.decision_at.isoformat(),
+                    }
+                )
+            metrics = metrics.model_copy(
+                update={
+                    "total_trades": len(fills),
+                    "fees": float(snapshots[-1].fees),
+                    "turnover": turnover,
+                }
+            )
+            decisions = [
+                json.loads(r[0])
+                for r in ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id LIKE 'decision:%' ORDER BY rowid",
+                    (account.account_id,),
+                )
+            ]
+            result = ReplayResult(
+                status="complete",
+                run_id=context.run_id,
+                account_id=account.account_id,
+                manifest=manifest,
+                metrics=metrics,
+                daily_returns=[b / a - 1 for a, b in zip(nav, nav[1:])],
+                timestamps=[s.as_of.isoformat() for s in snapshots],
+                equity_curve=nav,
+                snapshots=snapshots,
+                trades=trades,
+                decisions=decisions,
+                reconciliation=reconciliation,
+                diagnostics=[
+                    f"{sum(o['outcome'].startswith('rejected') for d in decisions for o in d['orders'])} order intents rejected by deterministic risk; inspect decisions"
+                ]
+                if any(o["outcome"].startswith("rejected") for d in decisions for o in d["orders"])
+                else [],
+            )
+            ledger.save_run(
+                account.account_id,
+                context.run_id,
+                {
+                    "status": "complete",
+                    "manifest_hash": manifest_hash,
+                    "manifest": manifest,
+                    "result": result.model_dump(mode="json"),
+                },
+            )
+            return result
+        except Exception as exc:
+            if (
+                "manifest_hash" in locals()
+                and ledger.db.execute(
+                    "SELECT id FROM accounts WHERE id=?", (account.account_id,)
+                ).fetchone()
+            ):
+                # A conflicting retry must not overwrite the original run evidence.
+                current = ledger.db.execute(
+                    "SELECT payload FROM runs WHERE account=? AND id=?",
+                    (account.account_id, context.run_id),
+                ).fetchone()
+                if current and json.loads(current[0]).get("manifest_hash") == manifest_hash:
+                    ledger.save_run(
+                        account.account_id,
+                        context.run_id,
+                        {
+                            "status": "failed",
+                            "manifest_hash": manifest_hash,
+                            "manifest": manifest,
+                            "error": str(exc),
+                        },
+                    )
+            if isinstance(exc, BacktestError):
+                raise
+            raise BacktestError(f"chronological replay failed: {exc}") from exc
+        finally:
+            ledger.close()
+
+    @staticmethod
+    def _metadata_as_of(metadata, at):
+        result = {}
+        for m in sorted(metadata, key=lambda m: m.as_of):
+            if m.as_of <= at:
+                result[m.instrument.instrument_id] = m
+        return result
+
+    @staticmethod
+    def _rank_target(signals, topk, risk):
+        ranked = sorted(signals, key=lambda s: (-s.score, s.instrument.instrument_id))[:topk]
+        if not ranked:
+            raise BacktestError("empty date-local ranking")
+        weights = tuple(
+            TargetWeight(
+                instrument=s.instrument,
+                weight=min(
+                    (1 - risk.min_cash) / len(ranked),
+                    risk.crypto_weight
+                    if s.instrument.asset_class == "crypto"
+                    else risk.equity_weight,
+                ),
+            )
+            for s in ranked
+        )
+        return PortfolioTarget(
+            universe_version=ranked[0].universe_version,
+            target_id="rank:" + canonical_hash([s.content_hash() for s in ranked]),
+            decision_at=ranked[0].decision_at,
+            strategy_id=ranked[0].strategy_id,
+            artifact_version=canonical_hash([s.model_version for s in ranked]),
+            data_snapshot_id=ranked[0].data_snapshot_id,
+            weights=weights,
+        )
+
+    @staticmethod
+    def _rebalance(engine, target, metadata, identities, bars):
+        ledger, account = engine.ledger, engine.account_id
+        at = target.decision_at
+        # A new complete target supersedes all old unfilled rebalance intents.
+        for pending in ledger.pending(account):
+            ledger.cancel(account, pending["intent"].intent_id, at, "superseded target")
+        snap = ledger.snapshot(account, at, engine.risk_policy.max_price_age_seconds, persist=False)
+        held = {p.instrument.instrument_id: p.quantity for p in snap.positions}
+        weights = {w.instrument.instrument_id: w.weight for w in target.weights}
+        candidates, diagnostics = [], []
+        for key in sorted(set(held) | set(weights)):
+            mark_row = ledger.db.execute(
+                "SELECT payload FROM marks WHERE account=? AND instrument=?", (account, key)
+            ).fetchone()
+            if mark_row is None or key not in metadata:
+                raise BacktestError(f"target lacks observed price or risk metadata: {key}")
+            from src.domain.portfolio import PriceMark
+
+            mark = PriceMark.model_validate_json(mark_row[0])
+            if (
+                not 0
+                <= (at - mark.as_of).total_seconds()
+                <= engine.risk_policy.max_price_age_seconds
+            ):
+                raise BacktestError(f"target uses stale/future price: {key}")
+            meta = metadata[key]
+            unit = mark.price * mark.fx_rate
+            desired = (snap.nav * weights.get(key, D(0)) / unit / meta.lot_size).to_integral_value(
+                rounding=ROUND_DOWN
+            ) * meta.lot_size
+            delta = desired - held.get(key, D(0))
+            if delta == 0:
+                continue
+            if not any(b.opened_at > at and b.tradable for b in bars[key]):
+                raise BacktestError(f"target has no subsequent executable event: {key}")
+            side = "buy" if delta > 0 else "sell"
+            qty = abs(delta)
+            # Leave room for explicitly modeled fees/slippage at allocation boundary.
+            price = mark.price * (
+                1 + engine.policy.slippage_bps / 10000 * (1 if side == "buy" else -1)
+            )
+            if side == "buy":
+                bps = (
+                    engine.policy.crypto_cost_bps
+                    if identities[key].asset_class == "crypto"
+                    else engine.policy.equity_cost_bps
+                )
+                budget = snap.nav * weights.get(key, D(0))
+                qty = max(
+                    D(0),
+                    (
+                        (budget - engine.policy.minimum_commission)
+                        / (
+                            price * mark.fx_rate * (1 + bps / 10000)
+                            + engine.policy.commission_per_unit
+                        )
+                        - held.get(key, D(0))
+                    )
+                    / meta.lot_size,
+                )
+                qty = qty.to_integral_value(rounding=ROUND_DOWN) * meta.lot_size
+            if qty <= 0:
+                continue
+            intent = OrderIntent(
+                intent_id=target.target_id + ":" + key,
+                account_id=account,
+                run_id=target.target_id,
+                instrument=identities[key],
+                side=side,
+                quantity=qty,
+                decision_at=at,
+                eligible_at=at + timedelta(microseconds=1),
+                reference_price=price,
+                fx_rate=mark.fx_rate,
+                estimated_fee=engine.policy.fee(identities[key], qty, price, mark.fx_rate),
+                strategy_id=target.strategy_id,
+            )
+            candidates.append(intent)
+        for order in sorted(
+            candidates, key=lambda o: (o.side != "sell", o.instrument.instrument_id)
+        ):
+            try:
+                engine.submit(order, metadata)
+                outcome = "submitted"
+            except LedgerError as exc:
+                outcome = "rejected: " + str(exc)
+            diagnostics.append({"intent": order.model_dump(mode="json"), "outcome": outcome})
+        ledger.record_event(
+            account,
+            "decision:" + target.target_id,
+            json.dumps(
+                {"target": target.model_dump(mode="json"), "orders": diagnostics}, sort_keys=True
+            ),
+        )
 
 
 def split_folds(
     dates: pd.DatetimeIndex,
     train_start: str,
-    walk_forward_months: int,
-    embargo_days: int,
+    walk_forward_months: int = 6,
+    embargo_days: int = 5,
+    validation_months: int = 1,
+    initial_train_months: int = 12,
 ) -> list[dict]:
-    """Split dates into expanding walk-forward folds.
-
-    Args:
-        dates: DatetimeIndex of all available trading dates.
-        train_start: ISO date string for the start of the first training window.
-        walk_forward_months: Length of each OOS window in months.
-        embargo_days: Gap between train end and test start.
-
-    Returns:
-        List of dicts with keys: train_start, train_end, test_start, test_end.
-    """
-    folds: list[dict] = []
-    unique_dates = dates.sort_values().unique()
-    total_months = (unique_dates[-1].year - unique_dates[0].year) * 12 + (
-        unique_dates[-1].month - unique_dates[0].month
-    )
-
-    if total_months < walk_forward_months * 2:
+    """Calendar boundaries; row-level label purging is performed by the runner."""
+    if (
+        walk_forward_months <= 0
+        or validation_months <= 0
+        or initial_train_months <= 0
+        or embargo_days < 0
+    ):
+        raise BacktestError("invalid walk-forward split configuration")
+    unique = dates.sort_values().unique()
+    if unique.empty:
         return []
-
-    current_test_start = unique_dates[0] + pd.DateOffset(months=walk_forward_months)
-
-    while True:
-        test_end = current_test_start + pd.DateOffset(months=walk_forward_months) - pd.Timedelta(days=1)
-        if test_end > unique_dates[-1]:
-            break
-
-        train_end_raw = current_test_start - pd.Timedelta(days=embargo_days + 1)
-        train_mask = unique_dates <= train_end_raw
-        if train_mask.sum() < 20:
-            current_test_start += pd.DateOffset(months=walk_forward_months)
-            continue
-
-        train_end = unique_dates[train_mask][-1]
-        test_mask = (unique_dates >= current_test_start) & (unique_dates <= test_end)
-        if test_mask.sum() < 1:
-            current_test_start += pd.DateOffset(months=walk_forward_months)
-            continue
-
-        actual_test_end = unique_dates[test_mask][-1]
+    start = pd.Timestamp(train_start)
+    if unique.tz is not None and start.tzinfo is None:
+        start = start.tz_localize(unique.tz)
+    start = max(start, unique[0])
+    current = (
+        start
+        + pd.DateOffset(months=initial_train_months + validation_months)
+        + pd.Timedelta(days=embargo_days)
+    )
+    folds = []
+    while current <= unique[-1]:
+        end = current + pd.DateOffset(months=walk_forward_months)
+        validation_end = current - pd.Timedelta(days=embargo_days)
+        validation_start = validation_end - pd.DateOffset(months=validation_months)
+        train_end = validation_start - pd.Timedelta(days=embargo_days)
         folds.append(
             {
-                "train_start": str(unique_dates[0].date()),
-                "train_end": str(train_end.date()),
-                "test_start": str(current_test_start.date()),
-                "test_end": str(actual_test_end.date()),
+                "train_start": start.isoformat(),
+                "train_end": train_end.isoformat(),
+                "validation_start": validation_start.isoformat(),
+                "validation_end": validation_end.isoformat(),
+                "test_start": current.isoformat(),
+                "test_end": end.isoformat(),
+                "complete_window": end <= unique[-1] + pd.Timedelta(days=1),
             }
         )
-        current_test_start += pd.DateOffset(months=walk_forward_months)
-
+        current = end
     return folds
 
 
 class WalkForwardBacktester:
-    """Walk-forward backtester operating on pandas DataFrames.
+    """Compatibility entry point delegating to the one chronological runner.
 
-    Each fold uses an expanding training window and a fixed out-of-sample test
-    window.  The top-K equal-weight portfolio is built from model predictions
-    and fold returns are stitched together to form a daily equity curve.
+    Old label-only calls fail: forward labels cannot manufacture executable
+    price bars or NAV. Pass bars, metadata, context, account and ledger_path.
     """
 
-    def __init__(self, config: AppConfig | None = None) -> None:
-        self.config = config or get_config()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def __init__(self, config=None):
+        self.config = config
 
     def run(
         self,
-        features: pd.DataFrame,
-        labels: pd.Series,
-        model: object,
-        topk: int = 30,
-        transaction_cost_bps: float = 10.0,
-        walk_forward_months: int = 3,
-        embargo_days: int = 5,
-    ) -> BacktestResult:
-        """Run walk-forward backtest.
+        features,
+        labels,
+        model=None,
+        topk=30,
+        transaction_cost_bps=10.0,
+        walk_forward_months=6,
+        embargo_days=5,
+        **kwargs,
+    ):
+        from src.core.walk_forward import WalkForwardRunner
 
-        Args:
-            features: Feature matrix.  Rows indexed by date (or MultiIndex
-                (date, ticker)).  Columns are feature names.
-            labels: Forward returns aligned with ``features``.
-            model: Duck-typed model with ``train(X, y)`` and ``predict(X)``.
-            topk: Number of stocks to hold per period.
-            transaction_cost_bps: One-way transaction cost in basis points.
-            walk_forward_months: Length of each OOS window in months.
-            embargo_days: Gap between train end and test start.
+        if model is not None and "model_factory" not in kwargs:
+            raise BacktestError("supply model_factory for a fresh unfitted model per fold")
+        return WalkForwardRunner(self.config).run(
+            features,
+            labels,
+            topk=topk,
+            cost_bps=transaction_cost_bps,
+            walk_months=walk_forward_months,
+            embargo_days=embargo_days,
+            **kwargs,
+        )
 
-        Returns:
-            BacktestResult with metrics, equity curve and fold details.
-        """
-        if features.empty or labels.empty:
-            raise BacktestError("features and labels must not be empty")
+    @staticmethod
+    def _extract_dates(df):
+        return pd.DatetimeIndex(
+            df.index.get_level_values(0) if isinstance(df.index, pd.MultiIndex) else df.index
+        )
 
-        # Normalise index so we always work with a DatetimeIndex of dates
-        dates = self._extract_dates(features)
-        folds = split_folds(dates, str(dates.min().date()), walk_forward_months, embargo_days)
-
-        if not folds:
-            raise BacktestError("No folds produced — dataset may be too small")
-
-        fold_results: list[WalkForwardFold] = []
-        period_returns: list[float] = []
-
-        for fold_id, fold in enumerate(folds):
-            result = self._run_fold(
-                fold_id=fold_id,
-                fold=fold,
-                features=features,
-                labels=labels,
-                model=model,
-                topk=topk,
-                transaction_cost_bps=transaction_cost_bps,
-                embargo_days=embargo_days,
-            )
-            fold_results.append(result.wf_fold)
-            period_returns.extend(result.period_oos_returns)
-
-        # Approximate daily returns by spreading each fold's return uniformly
-        daily_returns = self._to_daily(period_returns, fold_results)
-        equity_curve = (1 + pd.Series(daily_returns)).cumprod() * 100
-        timestamps = [str(dates.min().date() + pd.Timedelta(days=i)) for i in range(len(daily_returns))]
-
-        metrics = self._compute_metrics(pd.Series(daily_returns))
-        metrics.total_trades = topk * len(folds)
-
-        trades = [
-            {"fold": f.fold_id, "test_start": f.test_start, "test_end": f.test_end,
-             "topk": topk, "oos_sharpe": f.oos_sharpe}
-            for f in fold_results
+    @staticmethod
+    def _top_k_period_returns(y, preds, topk, cost_bps=0):
+        """Date-local label diagnostic only, never used as portfolio performance."""
+        if cost_bps:
+            raise BacktestError("costs require actual turnover from executable price replay")
+        if (
+            not isinstance(y.index, pd.MultiIndex)
+            or len(preds) != len(y)
+            or y.index.has_duplicates
+            or topk <= 0
+        ):
+            raise BacktestError("aligned unique (date,instrument) labels and predictions required")
+        frame = pd.DataFrame({"label": y, "prediction": preds}).sort_index()
+        if not np.isfinite(frame.to_numpy()).all():
+            raise BacktestError("finite labels/predictions required")
+        return [
+            float(g.nlargest(topk, "prediction")["label"].mean())
+            for _, g in frame.groupby(level=0, sort=True)
         ]
 
-        logger.info(
-            "Backtest complete: {} folds, Sharpe={:.2f}, MaxDD={:.1%}",
-            len(folds),
-            metrics.sharpe_ratio,
-            metrics.max_drawdown,
-        )
-        return BacktestResult(
-            metrics=metrics,
-            daily_returns=daily_returns,
-            trades=trades,
-            walk_forward_results=fold_results,
-            equity_curve=equity_curve.tolist(),
-            timestamps=timestamps,
-        )
-
-    # ------------------------------------------------------------------
-    # Single fold execution
-    # ------------------------------------------------------------------
-
-    class _FoldOutput:
-        def __init__(self, wf_fold: WalkForwardFold, period_oos_returns: list[float]) -> None:
-            self.wf_fold = wf_fold
-            self.period_oos_returns = period_oos_returns
-
-    def _run_fold(
-        self,
-        fold_id: int,
-        fold: dict,
-        features: pd.DataFrame,
-        labels: pd.Series,
-        model: object,
-        topk: int,
-        transaction_cost_bps: float,
-        embargo_days: int,
-    ) -> _FoldOutput:
-        """Train model on fold and compute OOS top-K return."""
-        dates = self._extract_dates(features)
-
-        train_mask = (dates >= fold["train_start"]) & (dates <= fold["train_end"])
-        test_mask = (dates >= fold["test_start"]) & (dates <= fold["test_end"])
-
-        X_train = features.loc[train_mask]
-        y_train = labels.loc[train_mask]
-        X_test = features.loc[test_mask]
-        y_test = labels.loc[test_mask]
-
-        if X_train.empty or X_test.empty:
-            return self._FoldOutput(
-                WalkForwardFold(
-                    fold_id=fold_id,
-                    train_start=fold["train_start"],
-                    train_end=fold["train_end"],
-                    test_start=fold["test_start"],
-                    test_end=fold["test_end"],
-                ),
-                [],
-            )
-
-        # --- Train ---
-        try:
-            model.train(X_train.values, y_train.values)
-            is_preds = model.predict(X_train.values)
-            oos_preds = model.predict(X_test.values)
-        except Exception as exc:
-            raise BacktestError(f"Model error in fold {fold_id}: {exc}") from exc
-
-        # --- IS Sharpe (for validation purposes) ---
-        is_sharpe = self._top_k_sharpe(y_train, is_preds, topk)
-
-        # --- OOS: build top-K portfolio each period ---
-        oos_returns = self._top_k_period_returns(y_test, oos_preds, topk, transaction_cost_bps)
-        oos_series = pd.Series(oos_returns)
-        oos_sharpe = float(
-            oos_series.mean() / oos_series.std() * math.sqrt(_TRADING_DAYS)
-            if oos_series.std() > 0 and len(oos_series) > 1
-            else 0.0
-        )
-
-        wf_fold = WalkForwardFold(
-            fold_id=fold_id,
-            train_start=fold["train_start"],
-            train_end=fold["train_end"],
-            test_start=fold["test_start"],
-            test_end=fold["test_end"],
-            in_sample_sharpe=is_sharpe,
-            oos_sharpe=oos_sharpe,
-        )
-
-        logger.debug(
-            "Fold {}: IS Sharpe={:.2f}, OOS Sharpe={:.2f}, {} OOS periods",
-            fold_id,
-            is_sharpe,
-            oos_sharpe,
-            len(oos_returns),
-        )
-        return self._FoldOutput(wf_fold, oos_returns)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _extract_dates(df: pd.DataFrame) -> pd.DatetimeIndex:
-        """Return DatetimeIndex from either flat or MultiIndex DataFrame."""
-        if isinstance(df.index, pd.MultiIndex):
-            return pd.DatetimeIndex(df.index.get_level_values(0))
-        return pd.DatetimeIndex(df.index)
-
-    @staticmethod
-    def _top_k_period_returns(
-        y: pd.Series,
-        preds: np.ndarray,
-        topk: int,
-        cost_bps: float,
-    ) -> list[float]:
-        """Select top-K stocks by predicted rank; return net-of-cost period return."""
-        if len(preds) == 0:
-            return []
-
-        k = min(topk, len(preds))
-        top_idx = np.argsort(preds)[-k:]
-        raw_return = float(np.mean(y.values[top_idx]))
-        cost = k * cost_bps * 2 / 10_000  # round-trip
-        return [raw_return - cost]
-
-    @staticmethod
-    def _top_k_sharpe(y: pd.Series, preds: np.ndarray, topk: int) -> float:
-        """Compute approximate IS Sharpe using top-K groups across dates."""
-        if len(preds) == 0 or y.std() == 0:
-            return 0.0
-        k = min(topk, len(preds))
-        top_idx = np.argsort(preds)[-k:]
-        vals = y.values[top_idx]
-        if vals.std() == 0:
-            return 0.0
-        return float(vals.mean() / vals.std() * math.sqrt(_TRADING_DAYS))
-
-    @staticmethod
-    def _to_daily(period_returns: list[float], folds: list[WalkForwardFold]) -> list[float]:
-        """Spread each fold's period return into approximate daily returns."""
-        if not period_returns or not folds:
-            return period_returns
-
-        daily: list[float] = []
-        for ret, fold in zip(period_returns, folds):
-            try:
-                n_days = max(
-                    1,
-                    (
-                        pd.Timestamp(fold.test_end) - pd.Timestamp(fold.test_start)
-                    ).days,
-                )
-            except Exception:
-                n_days = 63  # ~3 months
-
-            daily_ret = (1 + ret) ** (1 / n_days) - 1
-            daily.extend([daily_ret] * n_days)
-
-        return daily
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-
-    def _compute_metrics(self, daily_returns: pd.Series) -> BacktestMetrics:
-        """Compute aggregate performance metrics from daily returns series.
-
-        Args:
-            daily_returns: Series of daily portfolio returns.
-
-        Returns:
-            BacktestMetrics populated with all statistics.
-        """
-        if daily_returns.empty:
-            return BacktestMetrics()
-
-        n = len(daily_returns)
-        years = n / _TRADING_DAYS
-
-        total_return = float((1 + daily_returns).prod() - 1)
-        annual_return = float((1 + total_return) ** (1 / max(years, 1e-9)) - 1)
-
-        vol = float(daily_returns.std() * math.sqrt(_TRADING_DAYS))
-        sharpe = float(annual_return / vol) if vol > 0 else 0.0
-
-        # Downside deviation (Sortino)
-        downside = daily_returns[daily_returns < 0]
-        downside_std = float(downside.std() * math.sqrt(_TRADING_DAYS)) if len(downside) > 1 else vol
-        sortino = float(annual_return / downside_std) if downside_std > 0 else 0.0
-
-        # Max drawdown
-        equity = (1 + daily_returns).cumprod()
-        peak = equity.cummax()
-        drawdown = (equity - peak) / peak
-        max_dd = float(drawdown.min())
-
-        calmar = float(annual_return / abs(max_dd)) if max_dd < 0 else 0.0
-        win_rate = float((daily_returns > 0).mean())
-        avg_trade = float(daily_returns.mean())
-
-        return BacktestMetrics(
-            total_return=total_return,
-            annual_return=annual_return,
-            sharpe_ratio=sharpe,
-            max_drawdown=max_dd,
-            calmar_ratio=calmar,
-            win_rate=win_rate,
-            avg_trade_return=avg_trade,
-            volatility=vol,
-            sortino_ratio=sortino,
-        )
-
-    # ------------------------------------------------------------------
-    # HTML Report
-    # ------------------------------------------------------------------
-
-    def generate_html_report(
-        self,
-        result: BacktestResult,
-        output_path: str = "reports/backtest.html",
-    ) -> str:
-        """Generate interactive HTML report with Plotly.
-
-        Args:
-            result: BacktestResult to visualise.
-            output_path: Destination path for the HTML file.
-
-        Returns:
-            Absolute path to the generated HTML file.
-        """
-        try:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-        except ImportError as exc:
-            raise BacktestError("plotly is required for HTML reports") from exc
-
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        dates = result.timestamps or list(range(len(result.daily_returns)))
-        returns = pd.Series(result.daily_returns, dtype=float)
-        equity = pd.Series(result.equity_curve, dtype=float)
-
-        # Rolling 60d Sharpe
-        rolling_sharpe = (
-            returns.rolling(60).mean() / returns.rolling(60).std() * math.sqrt(_TRADING_DAYS)
-        ).fillna(0)
-
-        # Drawdown
-        equity_norm = equity / equity.iloc[0] if len(equity) > 0 else equity
-        peak = equity_norm.cummax()
-        drawdown = (equity_norm - peak) / peak
-
-        # Fold IS/OOS bars
-        fold_ids = [str(f.fold_id) for f in result.walk_forward_results]
-        is_sharpes = [f.in_sample_sharpe for f in result.walk_forward_results]
-        oos_sharpes = [f.oos_sharpe for f in result.walk_forward_results]
-
-        fig = make_subplots(
-            rows=4,
-            cols=1,
-            subplot_titles=["Equity Curve", "Drawdown", "Rolling 60-Day Sharpe", "IS vs OOS Sharpe by Fold"],
-            vertical_spacing=0.08,
-            row_heights=[0.35, 0.2, 0.2, 0.25],
-        )
-
-        fig.add_trace(go.Scatter(x=dates, y=equity.tolist(), name="Equity", line=dict(color="royalblue")), row=1, col=1)
-        fig.add_trace(
-            go.Scatter(x=dates, y=drawdown.tolist(), name="Drawdown", fill="tozeroy",
-                       line=dict(color="crimson")), row=2, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=dates, y=rolling_sharpe.tolist(), name="Rolling Sharpe",
-                       line=dict(color="darkorange")), row=3, col=1
-        )
-        fig.add_trace(go.Bar(x=fold_ids, y=is_sharpes, name="IS Sharpe", marker_color="steelblue"), row=4, col=1)
-        fig.add_trace(go.Bar(x=fold_ids, y=oos_sharpes, name="OOS Sharpe", marker_color="coral"), row=4, col=1)
-
-        m = result.metrics
-        fig.update_layout(
-            title=(
-                f"Backtest Report | Sharpe={m.sharpe_ratio:.2f} | "
-                f"Ann Return={m.annual_return:.1%} | MaxDD={m.max_drawdown:.1%}"
-            ),
-            height=1000,
-            template="plotly_white",
-            showlegend=True,
-        )
-
-        fig.write_html(str(out), include_plotlyjs="cdn")
-        logger.info("HTML report written to {}", out.resolve())
-        return str(out.resolve())
-
-
-# ---------------------------------------------------------------------------
-# BacktestValidator
-# ---------------------------------------------------------------------------
+    def _compute_metrics(daily_returns):
+        values = np.asarray(daily_returns, dtype=float)
+        return performance_metrics([1.0, *np.cumprod(1 + values)], 252)
 
 
 class BacktestValidator:
-    """Validates a BacktestResult against 8 overfitting and realism checks."""
+    """Legacy return-shape adapter over the authoritative ValidationSuite."""
 
-    CRITICAL_CHECKS = {
-        "overfitting_signals",
-    }
+    def __init__(self, config=None):
+        self.config = config
 
-    def validate(self, result: BacktestResult) -> ValidationResult:
-        """Run all 8 checks and return a ValidationResult.
+    def validate(self, result, **kwargs):
+        from src.core.validation import ValidationSuite
+        from src.utils.schemas import ValidationCheck, ValidationResult, ValidationVerdict
 
-        Args:
-            result: BacktestResult from WalkForwardBacktester.
-
-        Returns:
-            ValidationResult with per-check details and overall verdict.
-        """
-        checks = [
-            self._check_statistical_significance(result),
-            self._check_overfitting_signals(result),
-            self._check_cost_sensitivity(result),
-            self._check_concentration_risk(result),
-            self._check_look_ahead_bias(result),
-            self._check_survivorship_bias(result),
-            self._check_fill_realism(result),
-            self._check_regime_dependence(result),
-        ]
-
-        verdict = self._determine_verdict(checks)
-        passed = sum(1 for c in checks if c.passed)
-        summary = f"{passed}/{len(checks)} checks passed — verdict: {verdict.value}"
-
-        logger.info("Validation: {}", summary)
-        return ValidationResult(checks=checks, verdict=verdict, summary=summary)
-
-    # ------------------------------------------------------------------
-    # Individual checks
-    # ------------------------------------------------------------------
-
-    def _check_statistical_significance(self, result: BacktestResult) -> ValidationCheck:
-        """t-stat of daily returns > 2.0 AND at least 252 trading days."""
-        name = "statistical_significance"
-        returns = np.array(result.daily_returns)
-        n = len(returns)
-
-        if n < 252:
-            return ValidationCheck(
-                name=name,
-                passed=False,
-                details=f"Only {n} days — need ≥252 for significance",
-                severity="critical",
-            )
-
-        t_stat, _ = stats.ttest_1samp(returns, 0)
-        passed = bool(t_stat > 2.0)
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details=f"t-stat={t_stat:.2f} (need >2.0), n={n} days",
-            severity="warning",
-        )
-
-    def _check_overfitting_signals(self, result: BacktestResult) -> ValidationCheck:
-        """Flag if Sharpe > 3 or any fold has OOS Sharpe < 50% of IS Sharpe."""
-        name = "overfitting_signals"
-        issues: list[str] = []
-
-        if result.metrics.sharpe_ratio > 3.0:
-            issues.append(f"Sharpe={result.metrics.sharpe_ratio:.2f} exceeds 3.0 (likely overfit)")
-
-        for fold in result.walk_forward_results:
-            if fold.in_sample_sharpe > 0 and fold.oos_sharpe < 0.5 * fold.in_sample_sharpe:
-                issues.append(
-                    f"Fold {fold.fold_id}: OOS Sharpe {fold.oos_sharpe:.2f} "
-                    f"< 50% of IS Sharpe {fold.in_sample_sharpe:.2f}"
+        report = ValidationSuite(self.config).validate(result, **kwargs)
+        return ValidationResult(
+            checks=[
+                ValidationCheck(
+                    name=c.name,
+                    passed=c.verdict.value == "PASS",
+                    details=c.explanation,
+                    severity="critical" if c.verdict.value == "FAIL" else "warning",
                 )
-
-        passed = len(issues) == 0
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details="; ".join(issues) if issues else "No overfitting signals detected",
-            severity="critical",
+                for c in report.checks
+            ],
+            verdict=ValidationVerdict.APPROVED
+            if report.overall == "RELIABLE"
+            else ValidationVerdict.REJECTED,
+            summary=report.summary,
         )
-
-    def _check_cost_sensitivity(self, result: BacktestResult) -> ValidationCheck:
-        """Flag strategies with Sharpe < 0.5 as likely cost-sensitive."""
-        name = "cost_sensitivity"
-        sharpe = result.metrics.sharpe_ratio
-        passed = sharpe >= 0.5
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details=(
-                f"Sharpe={sharpe:.2f} — strategy appears cost-sensitive"
-                if not passed
-                else f"Sharpe={sharpe:.2f} — cost-robust"
-            ),
-            severity="warning",
-        )
-
-    def _check_concentration_risk(self, result: BacktestResult) -> ValidationCheck:
-        """Check no single position would exceed 30% weight in top-K equal-weight portfolio."""
-        name = "concentration_risk"
-        topk_values = [t.get("topk", 0) for t in result.trades if isinstance(t.get("topk"), (int, float))]
-        if not topk_values:
-            return ValidationCheck(name=name, passed=True,
-                                   details="No trade data — skipping", severity="info")
-
-        min_topk = int(min(topk_values))
-        max_weight = 1 / max(min_topk, 1)
-        passed = max_weight <= 0.30
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details=f"Max position weight = {max_weight:.1%} with topk={min_topk}",
-            severity="warning",
-        )
-
-    def _check_look_ahead_bias(self, result: BacktestResult) -> ValidationCheck:
-        """Verify embargo days > 0 to prevent lookahead bias."""
-        name = "look_ahead_bias"
-        # Proxy: check that OOS windows don't start the same day as train ends
-        issues: list[str] = []
-        for fold in result.walk_forward_results:
-            if fold.train_end >= fold.test_start:
-                issues.append(f"Fold {fold.fold_id}: train_end={fold.train_end} >= test_start={fold.test_start}")
-
-        passed = len(issues) == 0
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details="; ".join(issues) if issues else "No lookahead bias detected — embargo enforced",
-            severity="warning",
-        )
-
-    def _check_survivorship_bias(self, result: BacktestResult) -> ValidationCheck:
-        """Informational: flag if no survivorship-bias information is recorded."""
-        name = "survivorship_bias"
-        return ValidationCheck(
-            name=name,
-            passed=False,
-            details="CAUTION: No survivorship bias information available — results may be optimistic",
-            severity="info",
-        )
-
-    def _check_fill_realism(self, result: BacktestResult) -> ValidationCheck:
-        """Informational check on fill realism via trade count."""
-        name = "fill_realism"
-        total_trades = result.metrics.total_trades
-        if total_trades == 0:
-            return ValidationCheck(name=name, passed=True,
-                                   details="No trades recorded", severity="info")
-        return ValidationCheck(
-            name=name,
-            passed=True,
-            details=f"Total trades={total_trades} — fill realism: informational only",
-            severity="info",
-        )
-
-    def _check_regime_dependence(self, result: BacktestResult) -> ValidationCheck:
-        """Ensure OOS performance holds across both good and bad IS regimes."""
-        name = "regime_dependence"
-        folds = result.walk_forward_results
-        if len(folds) < 2:
-            return ValidationCheck(name=name, passed=True,
-                                   details="Too few folds for regime analysis", severity="info")
-
-        median_is = np.median([f.in_sample_sharpe for f in folds])
-        bad_folds = [f for f in folds if f.in_sample_sharpe < median_is]
-
-        if not bad_folds:
-            return ValidationCheck(name=name, passed=True,
-                                   details="All folds have above-median IS Sharpe", severity="info")
-
-        bad_oos_sharpes = [f.oos_sharpe for f in bad_folds]
-        avg_bad_oos = float(np.mean(bad_oos_sharpes))
-        passed = avg_bad_oos > -0.5
-        return ValidationCheck(
-            name=name,
-            passed=passed,
-            details=f"Avg OOS Sharpe in bad-IS folds = {avg_bad_oos:.2f}",
-            severity="warning",
-        )
-
-    # ------------------------------------------------------------------
-    # Verdict logic
-    # ------------------------------------------------------------------
-
-    def _determine_verdict(self, checks: list[ValidationCheck]) -> ValidationVerdict:
-        """Map check results to overall verdict.
-
-        Returns:
-            APPROVED if all critical checks pass and ≤1 non-critical failure.
-            CAUTION if all critical checks pass but ≥2 non-critical failures.
-            REJECTED if any critical check fails.
-        """
-        failed_critical = [c for c in checks if not c.passed and c.severity == "critical"]
-        if failed_critical:
-            return ValidationVerdict.REJECTED
-
-        failed_warning = [c for c in checks if not c.passed and c.severity == "warning"]
-        if len(failed_warning) >= 2:
-            return ValidationVerdict.CAUTION
-        return ValidationVerdict.APPROVED

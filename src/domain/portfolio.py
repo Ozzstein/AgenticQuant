@@ -5,6 +5,7 @@ Foreign instruments require an explicit quote-to-base FX rate on every mark/fill
 Calendar sessions are supplied by a versioned data artifact, never inferred from
 weekdays. The simulator executes only at observed session/bar opens.
 """
+
 from __future__ import annotations
 
 from datetime import date
@@ -222,4 +223,43 @@ class RankedSignal(VersionedContract):
     def available(self):
         if self.available_at > self.decision_at:
             raise ValueError("signal uses information unavailable at decision time")
+        return self
+
+
+class TargetWeight(VersionedContract):
+    instrument: Instrument
+    weight: Fraction
+
+
+class PortfolioTarget(VersionedContract):
+    universe_version: NonEmptyString
+    target_id: NonEmptyString
+    decision_at: UtcTimestamp
+    strategy_id: NonEmptyString
+    artifact_version: NonEmptyString
+    data_snapshot_id: NonEmptyString
+    weights: tuple[TargetWeight, ...]
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if len({w.instrument.instrument_id for w in self.weights}) != len(self.weights):
+            raise ValueError("duplicate target instrument")
+        if sum((w.weight for w in self.weights), Decimal(0)) > 1:
+            raise ValueError("target is leveraged")
+        return self
+
+
+class UniverseEligibility(VersionedContract):
+    """Documented eligible members, effective and known by a decision cutoff."""
+
+    universe_version: NonEmptyString
+    data_snapshot_id: NonEmptyString
+    effective_at: UtcTimestamp
+    available_at: UtcTimestamp
+    instrument_ids: tuple[NonEmptyString, ...]
+
+    @model_validator(mode="after")
+    def unique_members(self):
+        if len(set(self.instrument_ids)) != len(self.instrument_ids):
+            raise ValueError("duplicate universe member")
         return self
