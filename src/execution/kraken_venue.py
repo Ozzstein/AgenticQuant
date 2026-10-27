@@ -374,7 +374,33 @@ class KrakenVenue(CCXTSpotVenue):
             raise LedgerError("native Kraken cancellation unresolved; retain reservation")
         return report
 
-    def _report(self, intent, client_id, order_id, order, observed, references):
+    @bounded
+    def read_native_order(self, intent, venue_order_id):
+        """Read source-bound native order history, including legacy userref orders."""
+        native, observed, source = self._request(
+            "QueryOrders",
+            params={"txid": venue_order_id, "trades": True, "consolidate_taker": False},
+            missing=True,
+        )
+        if native is None:
+            return None
+        matches = result(native)
+        if set(matches) != {venue_order_id}:
+            raise LedgerError("native Kraken lookup returned missing/different order")
+        order = matches[venue_order_id]
+        return self._report(
+            intent,
+            order.get("cl_ord_id"),
+            venue_order_id,
+            order,
+            observed,
+            [source],
+            report_client_id=order.get("cl_ord_id") or "native-order:" + venue_order_id,
+        )
+
+    def _report(
+        self, intent, client_id, order_id, order, observed, references, *, report_client_id=None
+    ):
         market, description = self._market(intent.instrument), order["descr"]
         if (
             order.get("cl_ord_id") != client_id
@@ -479,7 +505,7 @@ class KrakenVenue(CCXTSpotVenue):
             self.ledger.record_event(self.account_id, identity, canonical(content))
         return VenueOrderReport(
             venue=self.venue,
-            client_order_id=client_id,
+            client_order_id=report_client_id or client_id,
             venue_order_id=order_id,
             observed_at=observed,
             status=status,

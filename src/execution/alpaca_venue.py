@@ -638,6 +638,22 @@ class AlpacaVenue:
         return self._report(intent, client_order_id, order, observed, [reference])
 
     @_bounded
+    def read_native_order(self, intent, venue_order_id):
+        """Read actual executions for an externally owned, source-bound order ID.
+
+        This does not submit, adopt, cancel or book anything. The execution owner
+        must independently bind that broker ID to its durable original intent.
+        """
+        order, observed, reference = self._request(
+            "GET", "/v2/orders/" + quote(venue_order_id, safe=""), missing=True
+        )
+        if order is None:
+            return None
+        if order.get("id") != venue_order_id or not order.get("client_order_id"):
+            raise LedgerError("native Alpaca order identity is missing/different")
+        return self._report(intent, order["client_order_id"], order, observed, [reference])
+
+    @_bounded
     def cancel(self, intent, client_order_id, venue_order_id, as_of):
         if self._now() < _utc(as_of):
             raise LedgerError("cannot cancel against a future decision clock")
@@ -680,6 +696,24 @@ class AlpacaVenue:
                 if has_outbox
                 else None
             )
+            if row is None and activity.get("order_id"):
+                binding = self.ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?",
+                    (
+                        self.account_id,
+                        "lean-native-order:" + _hash([self.venue, activity["order_id"]]),
+                    ),
+                ).fetchone()
+                if binding:
+                    proof = json.loads(binding[0])
+                    bound = self.ledger.order(self.account_id, proof["intent_id"])["intent"]
+                    if (
+                        proof["venue"] != self.venue
+                        or proof["broker_order_id"] != activity["order_id"]
+                        or proof["intent_hash"] != bound.content_hash()
+                    ):
+                        raise LedgerError("LEAN native posted fee attribution binding differs")
+                    row = (bound.intent_id,)
             result.append(
                 AccountFee(
                     fee_id="alpaca:" + activity["id"],

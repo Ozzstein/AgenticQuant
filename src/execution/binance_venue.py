@@ -403,6 +403,20 @@ class BinanceVenue(CCXTSpotVenue):
             raise LedgerError("native cancellation remains ambiguous; retain reservations")
         return report
 
+    @bounded
+    def read_native_order(self, intent, venue_order_id):
+        """Read exact native history; its external owner proves the ID binding."""
+        order, observed, reference = self._request(
+            "order",
+            params={"symbol": self._market(intent.instrument).symbol, "orderId": venue_order_id},
+            missing=True,
+        )
+        if order is None:
+            return None
+        if str(order.get("orderId")) != venue_order_id or not order.get("clientOrderId"):
+            raise LedgerError("native Binance order identity is missing/different")
+        return self._report(intent, order["clientOrderId"], order, observed, [reference])
+
     def _report(self, intent, client_order_id, order, observed, references):
         market = self._market(intent.instrument)
         order_id = native_integer(order.get("orderId"))

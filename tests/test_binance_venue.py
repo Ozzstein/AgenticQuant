@@ -321,6 +321,18 @@ def test_acknowledged_quantity_without_trade_coverage_never_manufactures_fill(tm
     assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
 
 
+def test_read_native_order_keeps_actual_client_and_trade_identity_without_adopting(tmp_path):
+    wire, execution, adapter, order = setup(tmp_path)
+    admit(wire, execution, adapter, order)
+    wire.order["clientOrderId"] = "actual-external-owner-client"
+    wire.add(1, "10", "100", ".01", asset="BTC")
+    wire.now = T + timedelta(seconds=3)
+    report = adapter.read_native_order(order, str(wire.order["orderId"]))
+    assert report.client_order_id == "actual-external-owner-client" and report.executions_complete
+    assert report.fills[0].inventory_fees[0].quantity == D(".01")
+    assert not execution.ledger.fills(order.account_id)
+
+
 def test_lost_ack_restart_and_missing_lookup_never_resubmit(tmp_path):
     wire = Wire()
     wire.lost_ack = True

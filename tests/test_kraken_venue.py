@@ -170,7 +170,9 @@ class Wire:
         elif path == "QueryOrders":
             if self.missing:
                 return {"error": ["EOrder:Unknown order"]}
-            assert params["txid"] == "O-FIXTURE" and params["cl_ord_id"] == self.order["cl_ord_id"]
+            assert params["txid"] == "O-FIXTURE"
+            if "cl_ord_id" in params:
+                assert params["cl_ord_id"] == self.order["cl_ord_id"]
             data = {"O-FIXTURE": self.order}
         elif path == "QueryTrades":
             assert params["ledgers"].lower() == "true"
@@ -356,6 +358,20 @@ def test_partial_cancellation_books_actual_fees_before_release(tmp_path):
     assert engine.ledger.quantity(order.account_id, BTC.instrument_id) == 3
     assert engine.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
     assert engine.ledger.reconcile(order.account_id)["fees"] == "0.3"
+
+
+def test_read_native_order_proves_actual_legacy_userref_trades_without_adopting(tmp_path):
+    wire, engine, adapter, order = setup(tmp_path)
+    admit(wire, engine, adapter, order)
+    wire.order.pop("cl_ord_id")
+    wire.order["userref"] = 12345
+    wire.add("T1", "10", "100", ".01", fee_asset="XXBT")
+    wire.now = T + timedelta(seconds=3)
+    report = adapter.read_native_order(order, "O-FIXTURE")
+    assert report.client_order_id == "native-order:O-FIXTURE" and report.executions_complete
+    assert report.fills[0].inventory_fees[0].quantity == D(".01")
+    assert not engine.ledger.fills(order.account_id)
+    assert len([call for call in wire.calls if call[0] == "AddOrder"]) == 1
 
 
 @pytest.mark.parametrize("gap", ["empty_trades", "empty_ledgers"])

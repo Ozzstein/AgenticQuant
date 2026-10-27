@@ -1,15 +1,15 @@
 """Tests for signal_translator and lean_bridge."""
+
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import pytest
 
 from src.execution.lean_bridge import LEAN_ALGORITHM_TEMPLATE, write_signals_json
 from src.execution.signal_translator import signals_to_orders, target_weights_to_orders
-from src.utils.schemas import Order, OrderSide, Portfolio, Position, Signal, SignalDirection
+from src.utils.schemas import OrderSide, Portfolio, Position, Signal, SignalDirection
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -262,6 +262,6 @@ def test_lean_template_nonempty() -> None:
 def test_lean_template_contains_key_symbols() -> None:
     """LEAN template contains expected class and method identifiers."""
     assert "AIQuantStackAlgorithm" in LEAN_ALGORITHM_TEMPLATE
-    assert "TradeOnSignals" in LEAN_ALGORITHM_TEMPLATE
-    assert "SetHoldings" in LEAN_ALGORITHM_TEMPLATE
-    assert "Liquidate" in LEAN_ALGORITHM_TEMPLATE
+    assert "src.execution.lean_algorithm" in LEAN_ALGORITHM_TEMPLATE
+    assert "SetStartDate" not in LEAN_ALGORITHM_TEMPLATE
+    assert "signals.json" not in LEAN_ALGORITHM_TEMPLATE

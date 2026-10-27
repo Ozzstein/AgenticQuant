@@ -289,6 +289,54 @@ def create_typed_binance_execution(
         raise
 
 
+def create_typed_lean_execution(
+    *,
+    ledger_path,
+    account,
+    deployment,
+    rules,
+    runtime=None,
+    native_reader=None,
+    fee_valuation=None,
+    fill_policy=None,
+    risk_policy=None,
+    allow_live=False,
+    max_balance_age_seconds=30,
+):
+    """Canonical LEAN owner: coordinator prepares; attached runtime dispatches."""
+    from src.execution.lean_venue import LeanVenue
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import VenueExecution
+
+    ledger = PortfolioLedger(ledger_path)
+    try:
+        ledger.create_account(account)
+        adapter = LeanVenue(
+            ledger,
+            account.account_id,
+            deployment=deployment,
+            rules=rules,
+            runtime=runtime,
+            native_reader=native_reader,
+            fee_valuation=fee_valuation,
+            allow_live=allow_live,
+        )
+        return VenueExecution(
+            ledger,
+            account.account_id,
+            {"lean": adapter},
+            {key: "lean" for key in rules},
+            owner="lean",
+            fill_policy=fill_policy,
+            risk_policy=risk_policy,
+            allow_live=allow_live,
+            max_balance_age_seconds=max_balance_age_seconds,
+        )
+    except Exception:
+        ledger.close()
+        raise
+
+
 def create_typed_kraken_execution(
     *,
     ledger_path,
