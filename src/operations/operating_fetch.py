@@ -118,6 +118,7 @@ OPERATIONS = {
     "kraken_calendar": ("start", "end", "reference_id"),
     "binance_bars": ("start", "end", "max_pages"),
     "binance_reference": ("bar_ids", "fx_evidence_id"),
+    "binance_notional_reference": ("network", "average_minutes"),
     "binance_trades": ("start", "end", "calendar_id", "fx_evidence_id"),
     "binance_calendar": ("start", "end", "reference_id"),
     "current_universe": ("instruments", "reference_ids", "universe_version"),
@@ -271,8 +272,18 @@ def fetch_operating(task, context, store):
                     store, http=transports.make("kraken", "https://api.kraken.com")
                 )
             else:
+                network = arguments.pop("network", "mainnet")
+                if network not in ("mainnet", "testnet"):
+                    raise ProviderError("operating", "explicit_binance_network_required")
                 adapter = BinanceOperatingAdapter(
-                    store, http=transports.make("binance", "https://api.binance.com")
+                    store,
+                    network=network,
+                    http=transports.make(
+                        "binance",
+                        "https://api.binance.com"
+                        if network == "mainnet"
+                        else "https://testnet.binance.vision",
+                    ),
                 )
             if method in ("bars", "trades"):
                 for key in ("start", "end"):

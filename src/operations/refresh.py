@@ -75,6 +75,13 @@ class FetchTask(VersionedContract):
             from src.operations.operating_fetch import OPERATIONS
             if self.operation not in OPERATIONS or (set(arguments)|{r.argument for r in self.source_arguments})-set(OPERATIONS[self.operation]):
                 raise ValueError('operating operation/arguments are not permitted')
+            if self.operation=='binance_notional_reference' and (
+                self.instrument is None or self.source_arguments
+                or arguments.get('network','mainnet') not in ('mainnet','testnet')
+                or type(arguments.get('average_minutes')) is not int
+                or arguments['average_minutes']<0
+            ):
+                raise ValueError('Binance reference needs explicit instrument, native network and integer window')
         if self.provider=='mcp':
             if self.mcp_manifest is None:
                 raise ValueError('MCP fetch needs an exact deployed manifest')

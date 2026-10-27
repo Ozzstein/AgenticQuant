@@ -98,6 +98,30 @@ Offline tests cover real SQLite/restart receipts, actual FMP adapter parsing wit
 an HTTP boundary fixture, measured availability, durable caps, generic MCP
 permissions, actual process termination and missing credential redaction.
 
+## Binance native reference refresh
+
+`FetchTask(provider='operating', operation='binance_notional_reference', ...)`
+requires a canonical instrument and strict integer `average_minutes >= 0`.
+Its only other argument is `network='mainnet'|'testnet'` (default `mainnet`).
+The selected network fixes the HTTP origin; no caller URL, price, method or
+source callback is accepted. It captures the actual native reference, or its
+documented absence and exact average-price/individual-last-trade fallback, under
+the same total request allowance. This is a public read operation.
+
+Use the completed refresh's actual context and exact source IDs with
+`freeze_binance_reference`, then `create_evidence_backed_binance_execution`.
+The frozen resolver rechecks full source envelopes/raw bytes on every native
+preflight. Paper accounts require Testnet sources; live accounts require mainnet
+sources and retain the separate execution authorization gate. Missing, stale,
+future, corrupted or wrong-network evidence cannot authorize an order. A refresh
+or a source binding grants no live-capital authority.
+
+Coordinator verification: 119 offline source/refresh/venue-boundary tests passed
+in 19.42 seconds, including all four actual refresh-to-certification combinations
+(mainnet/Testnet, native reference/documented fallback), Decimal fidelity, stale
+rejection and completed-refresh restart without repeated HTTP. HTTP transports
+use synthetic wire fixtures; no vendor calls or authenticated acceptance occurred.
+
 ## Income source admission
 
 Operating refresh permits two additional closed GET operations:
