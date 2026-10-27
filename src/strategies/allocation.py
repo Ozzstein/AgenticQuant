@@ -123,7 +123,10 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
         required = ("data_snapshot_hash", "universe_version", "signal_at", "strategy_hash", "feature_spec_hash", "model_hash")
         if any(key not in frame.attrs for key in required):
             raise StrategyInputError("sleeve source/model/spec provenance is incomplete")
-        identities.append(tuple(frame.attrs[key] for key in ("data_snapshot_hash", "universe_version", "signal_at")))
+        market = frame.attrs.get("market_snapshot_hash", frame.attrs["data_snapshot_hash"])
+        if market != frame.attrs["data_snapshot_hash"] and not {market, frame.attrs["data_snapshot_hash"]}.issubset(context.data_snapshot_ids):
+            raise StrategyInputError("common market and actual feature snapshots must be approved in RunContext")
+        identities.append((market, frame.attrs["universe_version"], frame.attrs["signal_at"]))
         contributions[name] = frame.target_weight * allocations[name]
         previous = current_contributions[name].reindex(frame.index, fill_value=0)
         omitted = current_contributions[name][current_contributions[name] > 0].index.difference(frame.index)
@@ -151,7 +154,10 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
         raise StrategyInputError("preserved holdings plus new sleeve targets exceed available capital")
     result = pd.DataFrame({"target_weight": target})
     result.attrs.update(context=context.model_dump(mode="json"), allocations=dict(allocations),
-                        data_snapshot_hash=identities[0][0], universe_version=identities[0][1], signal_at=identities[0][2],
+                        data_snapshot_hash=identities[0][0], market_snapshot_hash=identities[0][0],
+                        data_snapshot_hashes={name: frame.attrs["data_snapshot_hash"] for name, frame in outputs.items()},
+                        model_training_data_hashes={name: frame.attrs.get("model_training_data_hash") for name, frame in outputs.items()},
+                        universe_version=identities[0][1], signal_at=identities[0][2],
                         strategy_hashes={name: frame.attrs["strategy_hash"] for name, frame in outputs.items()},
                         model_artifact_hashes={name: frame.attrs["model_hash"] for name, frame in outputs.items()},
                         sleeve_provenance={name: dict(frame.attrs) for name, frame in outputs.items()},

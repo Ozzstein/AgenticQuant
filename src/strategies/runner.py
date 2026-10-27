@@ -76,10 +76,13 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
                       consensus: Mapping[str, ConsensusResult] | None = None,
                       resolver: Callable | None = None,
                       approved_baseline_hashes: frozenset[str] = frozenset(),
-                      research_registry=None, trial_id: str | None = None) -> pd.DataFrame:
+                      research_registry=None, trial_id: str | None = None,
+                      market_snapshot_hash: str | None = None) -> pd.DataFrame:
     activation = require_strategy_eligible(spec, context, resolver=resolver, approved_baseline_hashes=approved_baseline_hashes,
                                           research_registry=research_registry, trial_id=trial_id)
     parameters = dict(spec.parameters)
+    if market_snapshot_hash is not None and not {market_snapshot_hash, dataset.snapshot_hash}.issubset(context.data_snapshot_ids):
+        raise StrategyInputError("common market and actual feature snapshots must be approved in RunContext")
     date = pd.Timestamp(signal_at)
     if date.tzinfo is None or date > context.as_of or (pd.Timestamp(context.as_of)-date).total_seconds() > spec.max_signal_age_seconds:
         raise StrategyInputError("signal is future, stale or lacks timezone")
@@ -106,7 +109,8 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     result["action"], result["reason"], result["score"] = "HOLD", "unchanged", np.nan
     result.attrs.update(strategy=spec.name, strategy_hash=spec.content_hash(), activation=activation,
                         context=context.model_dump(mode="json"), signal_at=date.isoformat(),
-                        data_snapshot_hash=dataset.snapshot_hash, feature_spec_hash=dataset.feature_spec_hash,
+                        data_snapshot_hash=dataset.snapshot_hash, market_snapshot_hash=market_snapshot_hash or dataset.snapshot_hash,
+                        feature_spec_hash=dataset.feature_spec_hash, model_training_data_hash=None,
                         universe_version=universe.universe_version, regime_model_hash=regime.model_hash,
                         model_hash=None, cadence_due=False)
     removed = result.index.difference(sorted(eligible))
@@ -158,6 +162,7 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
             raise StrategyInputError("model was trained with a different feature specification")
         prediction = model.predict(rows, context=context, feature_available_at=ready.loc[rows.index]).droplevel("datetime")
         result.attrs["model_hash"] = model.artifact.content_hash()
+        result.attrs["model_training_data_hash"] = model.artifact.training_data_hash
         screen = prediction > parameters["minimum_prediction"]
         if spec.family == "momentum":
             screen &= x.composite_momentum > parameters["minimum_momentum"]

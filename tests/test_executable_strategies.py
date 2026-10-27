@@ -265,3 +265,30 @@ def test_blend_preserves_passive_holdings_and_rejects_mixed_provenance():
     with pytest.raises(StrategyInputError,match='mismatched'):
         blend_sleeves({'agent_consensus':output,'other':other},{'agent_consensus':.5,'other':.5},snapshot.context,
                       current_weights=args['holdings'],current_contributions={'agent_consensus':args['holdings'],'other':pd.Series(dtype=float)})
+
+
+def test_blend_common_market_preserves_distinct_actual_feature_datasets():
+    spec = baseline_specs()['agent_consensus']
+    snapshot, contextual = market_inputs(spec)
+    plain = feature_dataset(snapshot, spec.features)
+    common = snapshot.content_hash()
+    assert contextual.snapshot_hash != plain.snapshot_hash
+    context = snapshot.context.model_copy(update={'data_snapshot_ids':(common,contextual.snapshot_hash,plain.snapshot_hash)})
+    outputs = {}
+    for name,data in [('contextual',contextual),('plain',plain)]:
+        args = args_for(snapshot,data)
+        args['regime'] = regime_for(context)
+        frame = evaluate_strategy(spec,data,context,market_snapshot_hash=common,**args)
+        frame.attrs['strategy'] = name
+        outputs[name] = frame
+    result = blend_sleeves(outputs,{'contextual':.5,'plain':.5},context,current_weights=pd.Series(dtype=float))
+    assert result.attrs['market_snapshot_hash'] == result.attrs['data_snapshot_hash'] == common
+    assert result.attrs['data_snapshot_hashes'] == {'contextual':contextual.snapshot_hash,'plain':plain.snapshot_hash}
+    assert result.attrs['sleeve_provenance']['contextual']['data_snapshot_hash'] == contextual.snapshot_hash
+    assert result.attrs['sleeve_provenance']['plain']['data_snapshot_hash'] == plain.snapshot_hash
+    args = args_for(snapshot,contextual)
+    with pytest.raises(StrategyInputError,match='approved in RunContext'):
+        evaluate_strategy(spec,contextual,snapshot.context,market_snapshot_hash=common,**args)
+    outputs['plain'].attrs['market_snapshot_hash'] = 'f'*64
+    with pytest.raises(StrategyInputError,match='approved in RunContext'):
+        blend_sleeves(outputs,{'contextual':.5,'plain':.5},context,current_weights=pd.Series(dtype=float))
