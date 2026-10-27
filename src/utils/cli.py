@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import Literal
 
 import typer
 from rich.console import Console
@@ -11,6 +12,7 @@ from scripts.run_agents import analyze as analyze_command
 from scripts.run_agents import app as agents_app
 from scripts.run_backtest import app as backtest_app
 from scripts.run_operations import app as operations_app
+from scripts.run_pipeline import app as pipeline_app
 from scripts.run_rd_agent import app as rdagent_app
 
 app = typer.Typer(
@@ -69,126 +71,45 @@ def decision(ctx: typer.Context):
 
 @app.command()
 def trade(
-    action: str = typer.Argument("status", help="Action: status, run, reset"),
-    broker_type: str = typer.Option("auto", "--broker", "-b", help="Broker type: auto, paper, alpaca, ccxt"),
+    action: Literal["status", "run", "dispatch-pending"] = typer.Argument("status"),
+    input: Path | None = typer.Option(None, exists=True, dir_okay=False),
 ):
-    """Paper/live trading operations."""
-    from src.execution.broker import create_broker
-    from src.execution.paper_trader import PaperTrader
-    from src.utils.config import get_config
-
-    config = get_config()
-
-    if broker_type == "paper":
-        broker = PaperTrader(
-            initial_cash=config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0,
-            slippage_bps=5,
-            commission_per_share=0.005,
-        )
-    elif broker_type == "alpaca":
-        from src.execution.alpaca_trader import AlpacaTrader
-
-        broker = AlpacaTrader(config.alpaca)
-    elif broker_type == "ccxt":
-        from src.execution.ccxt_trader import CcxtTrader
-
-        broker = CcxtTrader(config.ccxt)
-    else:  # auto
-        broker = create_broker(config)
-
+    """Use the configured durable paper account and complete operating cycle."""
+    from scripts.run_operations import cycle, dispatch_pending, status
     if action == "status":
-        portfolio = broker.portfolio
-        console.print(f"[green]Broker:[/green] {type(broker).__name__}")
-        console.print(f"[green]NAV:[/green] ${portfolio.nav:,.2f}")
-        console.print(f"[green]Cash:[/green] ${portfolio.cash:,.2f}")
-        console.print(f"[green]Positions:[/green] {len(portfolio.positions)}")
-    else:
-        console.print(f"[red]Unknown action: {action}[/red]")
+        status()
+        return
+    if input is None:
+        raise typer.BadParameter("an immutable PaperCyclePlan is required via --input")
+    (cycle if action == "run" else dispatch_pending)(input)
 
 
-@app.command()
-def pipeline(
-    action: str = typer.Argument("run", help="Action: run, paper-loop, setup"),
-):
-    """Run the daily trading pipeline."""
-    from src.monitoring.scheduler import PipelineScheduler
-    from src.utils.config import get_config
-
-    config = get_config()
-
-    if action == "run":
-        scheduler = PipelineScheduler(config)
-        scheduler.run_once()
-    elif action == "paper-loop":
-        scheduler = PipelineScheduler(config)
-        scheduler.start()
-    elif action == "setup":
-        setup(download_data=True)
-    else:
-        console.print(f"[red]Unknown action: {action}[/red]")
+app.add_typer(pipeline_app, name="pipeline")
 
 
 @app.command()
 def monitor():
-    """Check portfolio health and risk status."""
-    from src.monitoring.portfolio_monitor import PortfolioMonitor
-    from src.utils.config import get_config
-
-    config = get_config()
-    monitor = PortfolioMonitor(config)
-    report = monitor.generate_report()
-    console.print(report)
+    """Read actual ledger, operating, research, data and budget health."""
+    from scripts.run_operations import status
+    status()
 
 
 @app.command()
-def optimize(
-    method: str = typer.Option("risk_parity", "--method", "-m", help="Optimization method"),
-    tickers: Optional[str] = typer.Option(None, "--tickers", "-t", help="Comma-separated tickers"),
-):
-    """Run portfolio optimization."""
-    console.print(f"[cyan]Optimizing with method: {method}[/cyan]")
-
-    if tickers:
-        ticker_list = [t.strip() for t in tickers.split(",")]
-        console.print(f"[dim]Universe: {ticker_list}[/dim]")
-
-
-def _print_backtest_result(result) -> None:
-    """Pretty-print backtest results."""
-    from rich.table import Table
-
-    table = Table(title="Backtest Results")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-
-    m = result.metrics
-    table.add_row("Total Return", f"{m.total_return:.2%}")
-    table.add_row("Annual Return", f"{m.annual_return:.2%}")
-    table.add_row("Sharpe Ratio", f"{m.sharpe_ratio:.2f}")
-    table.add_row("Max Drawdown", f"{m.max_drawdown:.2%}")
-    table.add_row("Calmar Ratio", f"{m.calmar_ratio:.2f}")
-    table.add_row("Win Rate", f"{m.win_rate:.2%}")
-    table.add_row("Total Trades", str(m.total_trades))
-    table.add_row("Volatility", f"{m.volatility:.2%}")
-    table.add_row("Sortino Ratio", f"{m.sortino_ratio:.2f}")
-    console.print(table)
-
-
-def _print_analysis_result(result) -> None:
-    """Pretty-print analysis results."""
-    from rich.panel import Panel
-
-    panel_content = (
-        f"Decision: {result.decision.value} ({result.confidence:.0f}% confidence)\n"
-        f"Target: ${result.target_price:.2f}\n"
-        f"Stop Loss: ${result.stop_loss:.2f}\n"
-        f"Position Size: {result.position_size_pct:.1f}%\n"
-        f"Time Horizon: {result.time_horizon}\n\n"
-        f"Reasoning: {result.reasoning}\n\n"
-        f"Risk Flags: {', '.join(result.risk_flags) or 'None'}\n"
-        f"Catalysts: {', '.join(result.catalysts) or 'None'}"
-    )
-    console.print(Panel(panel_content, title=f"Analysis: {result.ticker}"))
+def optimize(run_id: str = typer.Option(...)):
+    """Inspect the actual constrained optimizer receipt of a paper cycle."""
+    from scripts.run_operations import emit, fail
+    from src.operations.store import OperationsStore
+    from src.utils.config import get_config
+    try:
+        store = OperationsStore(get_config().operations.store_path, read_only=True)
+        if store.manifest(run_id).kind != "paper_cycle":
+            raise ValueError("optimization requires an actual paper-cycle identity")
+        stage = store.status(run_id)["stages"].get("optimization", {})
+        if stage.get("state") != "completed":
+            raise ValueError("no completed optimization receipt for this run")
+        emit(store.artifact(stage["output_hash"]))
+    except Exception as exc:
+        fail(exc)
 
 
 # Canonical and direct research commands share one implementation.

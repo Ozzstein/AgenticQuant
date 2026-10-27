@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from src.domain.common import NonEmptyString, UtcTimestamp, VersionedContract, _utc
 from src.operations.store import OperationBusy, OperationError, OperationsStore, canonical, digest
@@ -19,6 +19,7 @@ from src.operations.store import OperationBusy, OperationError, OperationsStore,
 
 class ScheduleSpec(VersionedContract):
     schedule_id: NonEmptyString
+    execution_lane: Literal['operating','research'] = 'operating'
     starts_at: UtcTimestamp
     kind: Literal['daily','interval']
     timezone: NonEmptyString = 'UTC'
@@ -28,6 +29,13 @@ class ScheduleSpec(VersionedContract):
     calendar: Literal['XNYS','24/7'] = '24/7'
     max_lag_seconds: int = Field(default=3600,ge=0,le=86400*7)
     input_directory: NonEmptyString
+
+    @model_serializer(mode='wrap')
+    def legacy_identity(self, handler):
+        value = handler(self)
+        if self.execution_lane == 'operating':
+            value.pop('execution_lane', None)
+        return value
 
     @model_validator(mode='after')
     def coherent(self):
@@ -92,7 +100,7 @@ class ScheduleSupervisor:
                 return
             db.execute('INSERT INTO schedules VALUES (?,?,?,?)',(spec.schedule_id,spec.content_hash(),spec.model_dump_json(),spec.next_at().isoformat()))
 
-    def tick(self, now: datetime) -> list[dict]:
+    def tick(self, now: datetime, *, lane: Literal['operating','research'] | None = None) -> list[dict]:
         now = _utc(now)
         with self.store.connection() as db:
             rows = db.execute('SELECT * FROM schedules ORDER BY next_at').fetchall()
@@ -101,6 +109,8 @@ class ScheduleSupervisor:
             spec = ScheduleSpec.model_validate_json(row['spec'])
             if spec.content_hash() != row['hash']:
                 raise OperationError('schedule content hash differs')
+            if lane is not None and spec.execution_lane != lane:
+                continue
             at = datetime.fromisoformat(row['next_at'])
             if at > now:
                 continue

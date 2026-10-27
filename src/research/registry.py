@@ -133,6 +133,10 @@ class RegistryError(ValueError):
     """Invalid lifecycle transition, evidence mismatch or stale activation."""
 
 
+class MissingDevelopmentEvaluation(RegistryError):
+    """A registered development trial has no outcome; distinct from corruption."""
+
+
 class ResearchRegistry:
     """Append-only artifacts and atomic active generations on one durable path."""
 
@@ -365,7 +369,7 @@ class ResearchRegistry:
         with self._connection() as db:
             row = db.execute('SELECT hash,payload FROM outcomes WHERE trial=?',(trial_id,)).fetchone()
         if row is None:
-            raise RegistryError('development trial has no recorded outcome')
+            raise MissingDevelopmentEvaluation('development trial has no recorded outcome')
         value = Evaluation.model_validate_json(row[1])
         candidate = self.candidate(trial.candidate_id)
         if (value.content_hash() != row[0] or value.trial_id != trial_id

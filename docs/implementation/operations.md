@@ -8,6 +8,56 @@ The operating store coordinates work; `PortfolioLedger` remains the sole economi
 
 Configuration paths live under `AppConfig.operations` and default to the configured output directory. Explicit approved baseline and model hashes default to empty; file presence and candidate JSON flags never authorize trading. The account uses `paper_ledger_path` and `paper_account_id` consistently.
 
+## Canonical application and scheduler entry points
+
+`src.operations.application.paper_cycle_service` constructs the configured evidence,
+operations, research, ledger and attribution stores. `execute_cycle` enforces the
+configured account. `scripts.run_pipeline`, `aiquant pipeline`, and `aiquant trade`
+delegate to this service; the retired independent schedulers and simulated
+pipeline outputs no longer execute. `aiquant optimize --run-id ID` reads an actual
+completed optimizer receipt, and `monitor` reads configured operational state.
+
+The explicit commands are:
+
+```sh
+python -m scripts.run_operations build-cycle --input preparation.json --output cycle.json
+python -m scripts.run_operations prepare-cycle --template template.json --macro-dataset macro.json --contextual-sources contextual.json --income-authorities income-authorities.json --refresh-run-id REFRESH --run-id CYCLE --scheduled-for 2026-10-27T21:15:00Z --output cycle.json
+python -m scripts.run_operations cycle --input cycle.json
+python -m scripts.run_operations dispatch-pending --input cycle.json
+python -m scripts.run_operations schedule register --input schedule.json
+python -m scripts.run_operations schedule serve --lane operating
+python -m scripts.run_operations schedule serve --lane research
+```
+
+These examples are operator invocation shapes, not executed or approved trading
+jobs. `CyclePreparationRequest` carries the exact template, source-task recipe,
+completed refresh ID, scheduled/run identities, breadth snapshot, historical
+membership and its sources, and explicit income authority references. `build-cycle`
+calls the actual completed-refresh data builder, preserves the original macro
+training prefix, forwards current contextual sources, and archives the preparation
+receipt. Manual `prepare-cycle` takes an already source-bound macro dataset.
+Fresh templates need the explicit income policy and all thirteen economic arrays.
+Missing positive coverage remains a block; the CLI cannot bypass it.
+
+`ScheduleSpec.execution_lane` selects independent operating/research worker
+processes; its default is omitted in serialization to preserve older hashes.
+Scheduled input is a closed typed job: `paper_cycle`, `dispatch_pending`,
+`data_refresh`, or `research_trial`. The exact scheduled timestamp must match the
+durable claim. The scheduler archives input bytes before execution and never
+reruns an interrupted external call blindly. Research jobs execute only previously
+registered development trials; holdout admission and promotion are not scheduled
+permissions. Missing outcomes are distinguished from corrupt outcomes, so
+corruption cannot authorize a new execution. A rolling producer of fully sourced
+future job inputs and full intraday orchestration remain unfinished.
+
+Verification before the income gate: 53 app/CLI/scheduler/registry/accounting tests
+passed in 127.23 seconds, including actual configured full-cycle receipt replay.
+After the gate, 34 isolated scheduler/registry/CLI checks passed; the new configured
+CLI rejection check plus eleven native inventory-fee cases passed in 56.10 seconds.
+The positive full-cycle application case is retained and now has the same missing
+income-source acceptance dependency as H's full suite. This is not a current
+whole-suite success claim.
+
 Verification at this checkpoint: 25 offline tests passed across operating-store subprocess death/restart, cross-process locking, immutable inputs, alert delivery uncertainty, schedule DST/session boundaries/recovery, configuration, and actual Streamlit page rendering. Authenticated notifications, unattended provider refresh, complete cycle composition and external venue operation require their subsequent integration checks; dashboard rendering is not evidence of those executions.
 
 `NotificationPlan` declares Telegram or SMTP destinations and environment-variable credential references. `dispatch_notifications` uses the same durable alert outbox, bounds work, and records transport acceptance separately from recipient delivery. Telegram sends plain text through the fixed official endpoint; SMTP requires TLS and checks every recipient's acceptance. An ambiguous call keeps its reservation and never retries automatically. `resolve_delivery` archives an explicit operator review, with distinct confirmed/abandoned/retry-authorized states and an expected attempt number. Nine offline delivery/store tests passed; no external notification was sent. Implementations were checked against [Telegram sendMessage](https://core.telegram.org/bots/api#sendmessage) and the [Python SMTP API](https://docs.python.org/3/library/smtplib.html).

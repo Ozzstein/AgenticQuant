@@ -1,153 +1,44 @@
-"""Pipeline scheduler using APScheduler."""
-
+"""Programmatic facade over the authoritative durable schedule supervisor."""
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
+from threading import Event
 
-from loguru import logger
-
-try:
-    from apscheduler.schedulers.background import BackgroundScheduler
-except ImportError:  # pragma: no cover
-    BackgroundScheduler = None  # type: ignore[assignment,misc]
+from src.operations.application import execute_cycle, schedule_supervisor
+from src.operations.scheduler import ScheduleSpec
+from src.utils.config import get_config
 
 
 class PipelineScheduler:
-    """Wraps the daily pipeline with APScheduler scheduling.
+    def __init__(self, config=None, *, lane="operating", authorities=None):
+        self.config = config or get_config()
+        self.lane = lane
+        self.supervisor = schedule_supervisor(self.config, lane=lane, authorities=authorities)
+        self._stop = Event()
 
-    Attributes:
-        config: AppConfig instance.
-        _scheduler: APScheduler BackgroundScheduler (or None if not available).
-        _lock_file: Path to lock file preventing concurrent runs.
-    """
+    def register(self, spec: ScheduleSpec):
+        if spec.execution_lane != self.lane:
+            raise ValueError("schedule belongs to another worker lane")
+        self.supervisor.register(spec)
 
-    def __init__(self, config=None) -> None:
-        from src.utils.config import get_config
+    def run_once(self, plan=None):
+        if plan is not None:
+            if self.lane != "operating":
+                raise ValueError("paper cycles require the operating worker")
+            return execute_cycle(plan, self.config)
+        return self.supervisor.tick(datetime.now(timezone.utc), lane=self.lane)
 
-        self._config = config or get_config()
-        self.config = self._config  # backward-compat alias
-        self._scheduler = None
-        self._intraday_job_id: str | None = None
-        self._lock_file = Path("outputs/.pipeline.lock")
-        self._lock_file.parent.mkdir(parents=True, exist_ok=True)
-        if BackgroundScheduler is not None:
-            self._scheduler = BackgroundScheduler()
-            logger.info("APScheduler initialized.")
-        else:
-            logger.warning("APScheduler not installed — scheduler will run manually only.")
+    def start(self):
+        self._stop.clear()
+        while not self._stop.is_set():
+            self.run_once()
+            self._stop.wait(self.config.operations.poll_seconds)
 
-    def run_once(self) -> dict:
-        """Run the pipeline once immediately.
+    def start_intraday(self, spec: ScheduleSpec):
+        """Register an explicit interval input schedule using the same cycle."""
+        if not isinstance(spec, ScheduleSpec) or spec.kind != "interval":
+            raise ValueError("intraday operation requires an explicit interval ScheduleSpec")
+        self.register(spec)
 
-        Returns:
-            dict with: status, tickers_analyzed, orders_placed, timestamp
-        """
-        if self._lock_file.exists():
-            logger.warning("Pipeline lock file exists — skipping (another run in progress).")
-            return {"status": "skipped", "reason": "lock_file_exists"}
-
-        self._lock_file.touch()
-        try:
-            logger.info("PipelineScheduler: running pipeline once...")
-            # Import and run the core pipeline steps
-            from src.agents.graph import analyze_ticker
-            from src.core.data_pipeline import DataPipeline
-
-            config = self.config
-            _UNIVERSE = ["SPY", "AAPL", "MSFT"]  # small universe for scheduler runs
-
-            pipeline = DataPipeline(config)
-            df = pipeline.yfinance_fallback(
-                tickers=_UNIVERSE,
-                start=config.qlib.test_start,
-                end=config.qlib.test_end,
-            )
-
-            tickers_analyzed = 0
-            if not df.empty:
-                for ticker in _UNIVERSE:
-                    try:
-                        analyze_ticker(ticker)  # graceful stubs if no API key
-                        tickers_analyzed += 1
-                    except Exception as exc:
-                        logger.warning("scheduler run_once: {} failed: {}", ticker, exc)
-
-            result = {
-                "status": "completed",
-                "tickers_analyzed": tickers_analyzed,
-                "orders_placed": 0,
-                "timestamp": datetime.now().isoformat(),
-            }
-            logger.info("Pipeline run completed: {}", result)
-            return result
-        except Exception as exc:
-            logger.error("Pipeline run failed: {}", exc)
-            return {"status": "failed", "error": str(exc)}
-        finally:
-            self._lock_file.unlink(missing_ok=True)
-
-    def start(self, schedule_time: str | None = None) -> None:
-        """Schedule the pipeline to run daily at schedule_time.
-
-        Args:
-            schedule_time: Time string "HH:MM" in config.monitoring.schedule_timezone.
-        """
-        if self._scheduler is None:
-            logger.warning("APScheduler not available — cannot schedule.")
-            return
-
-        time_str = schedule_time or self.config.monitoring.schedule_time
-        hour, minute = time_str.split(":")
-        self._scheduler.add_job(
-            self.run_once,
-            trigger="cron",
-            hour=int(hour),
-            minute=int(minute),
-            timezone=self.config.monitoring.schedule_timezone,
-            misfire_grace_time=300,
-        )
-        self._scheduler.start()
-        logger.info(
-            "Pipeline scheduled daily at {} {}", time_str, self.config.monitoring.schedule_timezone
-        )
-
-    def start_intraday(self, runner, interval_minutes: int | None = None) -> None:
-        """Schedule IntradayRunner to execute on a fixed interval.
-
-        Args:
-            runner: IntradayRunner instance whose run() method will be called.
-            interval_minutes: Override interval in minutes. Defaults to
-                config.intraday.interval_minutes.
-        """
-        if self._scheduler is None:
-            logger.warning("APScheduler not available — cannot schedule intraday runs.")
-            return
-        minutes = interval_minutes if interval_minutes is not None else self._config.intraday.interval_minutes
-        job = self._scheduler.add_job(
-            runner.run,
-            trigger="interval",
-            minutes=minutes,
-            id="intraday_runner",
-            replace_existing=True,
-        )
-        self._intraday_job_id = job.id
-        logger.info("Intraday pipeline scheduled every {} minutes.", minutes)
-
-    def stop_intraday(self) -> None:
-        """Remove the intraday job from the scheduler without affecting the daily job."""
-        if self._scheduler is None or self._intraday_job_id is None:
-            return
-        try:
-            self._scheduler.remove_job(self._intraday_job_id)
-            logger.info("Intraday pipeline job removed.")
-        except Exception:
-            pass
-        self._intraday_job_id = None
-
-    def stop(self) -> None:
-        """Stop the scheduler and all jobs."""
-        self.stop_intraday()
-        if self._scheduler and self._scheduler.running:
-            self._scheduler.shutdown()
-            logger.info("PipelineScheduler stopped.")
+    def stop(self):
+        self._stop.set()
