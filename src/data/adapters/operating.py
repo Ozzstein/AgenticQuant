@@ -24,9 +24,10 @@ from src.data.evidence.store import EvidenceStore, canonical_bytes, digest
 from src.domain.common import Instrument, RunContext, _utc
 from src.domain.market import MarketBar, MarketSnapshot
 
-VERSION = "operating-wire-1"
+VERSION = "operating-wire-2"
+SUPPORTED_VERSIONS = frozenset({"operating-wire-1", VERSION})
 KINDS = (
-    "execution_bars",
+    "opening_events",
     "instrument_metadata",
     "universe_history",
     "corporate_actions",
@@ -35,6 +36,7 @@ KINDS = (
     "opening_liquidity",
     "availability_audit",
 )
+LEGACY_KINDS = ("execution_bars", *KINDS[1:])
 UTC = timezone.utc
 
 
@@ -155,6 +157,8 @@ class OperatingCapture:
         if captured < context.as_of:
             _fail("archive_clock_precedes_request")
         sources = tuple(sources)
+        if not sources:
+            _fail("actual_immutable_source_lineage_required")
         for envelope in sources:
             envelope.record.require_available(captured)
             if self.store.get(envelope.record.evidence_id) != envelope:
@@ -261,7 +265,10 @@ def verify_operating_capture(store: EvidenceStore, evidence_id: str, *, as_of: d
         if digest(raw) != envelope.record.raw_hash:
             _fail("source_raw_hash_differs")
         value = store.normalized(key, as_of=as_of)
-        if envelope.record.provider != "operating" or envelope.record.provider_version != VERSION:
+        if (
+            envelope.record.provider != "operating"
+            or envelope.record.provider_version not in SUPPORTED_VERSIONS
+        ):
             _fail("not_operating_capture")
         if envelope.kind == "operating_raw":
             if value["wire_hash"] != digest(raw):
@@ -276,7 +283,8 @@ def verify_operating_capture(store: EvidenceStore, evidence_id: str, *, as_of: d
         if (
             not manifest
             or canonical_bytes(manifest) != raw
-            or manifest["implementation"] != VERSION
+            or manifest["implementation"] != envelope.record.provider_version
+            or not manifest["sources"]
         ):
             _fail("source_manifest_differs")
         for source in manifest["sources"]:
@@ -383,38 +391,34 @@ def _print_capture(
     convention,
 ):
     """Every chosen row is one actual provider print, never candle volume."""
-    from src.domain.portfolio import ExecutionBar
+    from src.domain.portfolio import OpeningEvent
 
     if not trades:
         _fail("no_observed_print_coverage")
     rows, wire_times = [], []
     identities = set()
     for trade_id, timestamp, price, size in trades:
-        if not str(trade_id) or str(trade_id) in identities:
-            _fail("duplicate_or_missing_trade_id")
-        identities.add(str(trade_id))
         opened = _instant(timestamp)
+        wire_instant = pd.Timestamp(timestamp).tz_convert("UTC").value
+        trade_identity = (str(trade_id), wire_instant)
+        if not str(trade_id) or trade_identity in identities:
+            _fail("duplicate_or_missing_trade_id")
+        identities.add(trade_identity)
         matching = [item for item in calendar.values() if item[1] <= opened < item[2]]
         if len(matching) != 1:
             _fail("print_outside_authoritative_session")
         row, session_open, session_close = matching[0]
-        closed = opened + timedelta(microseconds=1)
-        if closed > session_close:
-            _fail("print_interval_exceeds_session")
         p, volume = _decimal(price), _decimal(size)
         event = digest(
-            canonical_bytes([instrument.model_dump(mode="json"), convention, str(trade_id)])
+            canonical_bytes(
+                [instrument.model_dump(mode="json"), convention, str(trade_id), wire_instant]
+            )
         )
-        bar = ExecutionBar(
+        bar = OpeningEvent(
             event_id=event,
             instrument=instrument,
             opened_at=opened,
-            closed_at=closed,
-            open=p,
-            high=p,
-            low=p,
-            close=p,
-            volume=volume,
+            price=p,
             opening_volume=volume,
             fx_rate=fx_rate,
             calendar=row["calendar"],
@@ -432,7 +436,7 @@ def _print_capture(
         context,
         (*wire_sources, *fx_sources),
         lambda at: dict(
-            execution_bars=rows,
+            opening_events=rows,
             opening_liquidity=[
                 {
                     k: r[k]
@@ -673,12 +677,18 @@ class AlpacaOperatingAdapter(OperatingCapture):
         at = self.now()
         calendar = _calendar(self.store, calendar_id, at)
         from src.data.calendars import sessions
-        schedule=sessions((context.as_of.date()-timedelta(days=90)).isoformat(),
-                          context.as_of.date().isoformat(),calendar='XNYS')
-        completed=[(s,times) for s,times in schedule.items() if times[1]<=context.as_of][-20:]
-        wanted=dict(completed)
-        if len(wanted)!=20 or any(s not in calendar or calendar[s][1:]!=times for s,times in completed):
-            _fail('current_twenty_session_calendar_coverage_required')
+
+        schedule = sessions(
+            (context.as_of.date() - timedelta(days=90)).isoformat(),
+            context.as_of.date().isoformat(),
+            calendar="XNYS",
+        )
+        completed = [(s, times) for s, times in schedule.items() if times[1] <= context.as_of][-20:]
+        wanted = dict(completed)
+        if len(wanted) != 20 or any(
+            s not in calendar or calendar[s][1:] != times for s, times in completed
+        ):
+            _fail("current_twenty_session_calendar_coverage_required")
         adv, sources = _daily_adv(self.store, bar_ids, instrument, at, expected_sessions=wanted)
         active = (
             asset.get("status") == "active"
@@ -1214,6 +1224,12 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
         ):
             _fail("binance_spot_identity_mismatch")
         filters = {f["filterType"]: f for f in row["filters"]}
+        maximum_notional = filters.get("NOTIONAL", {})
+        if (
+            maximum_notional.get("applyMaxToMarket") is True
+            and _decimal(maximum_notional.get("maxNotional"), positive=False) > 0
+        ):
+            _fail("unsupported_market_maximum_notional_wire_archived")
         lot = filters["LOT_SIZE"]
         market_lot = filters.get("MARKET_LOT_SIZE", lot)
         step = _decimal(lot["stepSize"])
@@ -1380,6 +1396,7 @@ def economic_sources(
         CorporateAction,
         ExecutionBar,
         InstrumentRisk,
+        OpeningEvent,
         UniverseEligibility,
     )
     from src.execution.venue import VenueRules
@@ -1390,13 +1407,29 @@ def economic_sources(
     if snapshot.context.as_of > at or context.as_of > at:
         _fail("bundle_clock_precedes_source_context")
     identities = {b.instrument.instrument_id: b.instrument for b in snapshot.bars}
-    bindings = {kind: [] for kind in KINDS}
-    selected = {kind: [] for kind in KINDS}
+    if not print_ids:
+        _fail("explicit_opening_event_sources_required")
+    print_values = [verify_operating_capture(store, key, as_of=at) for key in print_ids]
+    current = all(
+        "opening_events" in value and "execution_bars" not in value for value in print_values
+    )
+    legacy = all(
+        "execution_bars" in value
+        and "opening_events" not in value
+        and store.get(key).record.provider_version == "operating-wire-1"
+        for key, value in zip(print_ids, print_values, strict=True)
+    )
+    if not (current or legacy):
+        _fail("mixed_or_unsupported_opening_source_versions")
+    execution_kind = "opening_events" if current else "execution_bars"
+    kinds_schema = KINDS if current else LEGACY_KINDS
+    bindings = {kind: [] for kind in kinds_schema}
+    selected = {kind: [] for kind in kinds_schema}
     groups = [
         (reference_ids, ("instrument_metadata", "venue_rules")),
         (universe_ids, ("universe_history",)),
         (calendar_ids, ("calendar",)),
-        (print_ids, ("execution_bars", "opening_liquidity")),
+        (print_ids, (execution_kind, "opening_liquidity")),
         (action_ids, ("corporate_actions",)),
     ]
     all_sources = []
@@ -1437,7 +1470,8 @@ def economic_sources(
                             available_at=envelope.record.available_at,
                         )
                     )
-    bars = [ExecutionBar.model_validate(row) for row, _ in selected["execution_bars"]]
+    contract = OpeningEvent if current else ExecutionBar
+    bars = [contract.model_validate(row) for row, _ in selected[execution_kind]]
     if not bars or len({b.event_id for b in bars}) != len(bars):
         _fail("unique_actual_execution_events_required")
     for b in bars:
@@ -1447,11 +1481,11 @@ def economic_sources(
     def ordering(pair):
         return (pair[0]["opened_at"], pair[0]["instrument"]["instrument_id"], pair[0]["event_id"])
 
-    selected["execution_bars"].sort(key=ordering)
+    selected[execution_kind].sort(key=ordering)
     selected["opening_liquidity"].sort(key=ordering)
     expected = [
         {k: row[k] for k in ("event_id", "instrument", "opened_at", "opening_volume", "fx_rate")}
-        for row, _ in selected["execution_bars"]
+        for row, _ in selected[execution_kind]
     ]
     if [r for r, _ in selected["opening_liquidity"]] != expected:
         _fail("opening_liquidity_differs_from_actual_prints")
@@ -1520,7 +1554,7 @@ def economic_sources(
             available_at=audit.record.available_at,
         )
     ]
-    for kind in KINDS:
+    for kind in kinds_schema:
         if kind != "availability_audit":
             bindings[kind].extend(binding for _, binding in selected[kind])
-    return tuple((kind, tuple(bindings[kind])) for kind in KINDS)
+    return tuple((kind, tuple(bindings[kind])) for kind in kinds_schema)

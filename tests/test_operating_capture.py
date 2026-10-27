@@ -268,9 +268,10 @@ def test_measured_post_fetch_clocks_exact_adv_and_capture_only_membership(equity
 
 def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_capture):
     from src.domain.portfolio import (
+        AccountSpec,
         CorporateAction,
-        ExecutionBar,
         InstrumentRisk,
+        OpeningEvent,
         UniverseEligibility,
     )
     from src.research.evidence import expected_artifacts, json_pointer
@@ -311,9 +312,10 @@ def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_ca
         "operating_prints",
     )
     values = read(f.store, prints, f.clock)
-    event = values["execution_bars"][0]
-    assert event["opening_volume"] == event["volume"] == "7"
-    assert Decimal(event["open"]) == Decimal("101.000000000000000001")
+    event = values["opening_events"][0]
+    assert event["opening_volume"] == "7"
+    assert {"open", "high", "low", "close", "volume", "closed_at"}.isdisjoint(event)
+    assert Decimal(event["price"]) == Decimal("101.000000000000000001")
     assert event["opened_at"] == "2024-03-12T13:30:00.123457Z"
     assert values["prints"][0]["trade_id"] == "V:9007199254740993123"
     assert values["prints"][0]["event_time_wire"] == "2024-03-12T13:30:00.123456789Z"
@@ -349,8 +351,17 @@ def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_ca
         for kind, bindings in sources
     }
     inputs = SimpleNamespace(
+        context=final,
+        account=AccountSpec(
+            account_id=final.account_id,
+            mode="paper",
+            base_currency="USD",
+            initial_cash=10000,
+            opened_at=datetime(2024, 3, 11, tzinfo=UTC),
+        ),
         snapshot=market,
-        bars=tuple(ExecutionBar.model_validate(v) for v in arrays["execution_bars"]),
+        bars=(),
+        opening_events=tuple(OpeningEvent.model_validate(v) for v in arrays["opening_events"]),
         metadata=tuple(InstrumentRisk.model_validate(v) for v in arrays["instrument_metadata"]),
         universes=tuple(UniverseEligibility.model_validate(v) for v in arrays["universe_history"]),
         actions=tuple(CorporateAction.model_validate(v) for v in arrays["corporate_actions"]),
@@ -368,7 +379,6 @@ def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_ca
 
     # Exercise the real root verifier over typed economics. The structural
     # fixture adds H's receipt container, not a parallel runtime schema.
-    from src.domain.portfolio import AccountSpec
     from src.execution.venue import VenueRules
     from src.operations.evidence import verify_paper_provenance
     from src.research.evidence import BoundArtifact, verify_provenance
@@ -400,7 +410,7 @@ def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_ca
         "availability_audit": "availability_audit_id",
         "calendar": "calendar_artifact_id",
         "corporate_actions": "corporate_actions_id",
-        "execution_bars": "execution_bars_id",
+        "opening_events": "opening_events_id",
         "opening_liquidity": "opening_liquidity_id",
         "instrument_metadata": "instrument_metadata_id",
     }
@@ -428,6 +438,61 @@ def test_eight_source_arrays_bind_late_individual_print_and_full_audit(equity_ca
         )
         == refs
     )
+    from src.domain.portfolio import FillPolicy, OrderIntent, RiskPolicy
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import PaperVenue, VenueExecution
+
+    ledger = PortfolioLedger(f.store.path.parent / "actual-print.sqlite")
+    ledger.create_account(inputs.account)
+    costs = FillPolicy(opening_participation=1)
+    risk = RiskPolicy(min_adv=100000)  # Explicit small-liquidity synthetic fixture.
+    rules = {r.instrument.instrument_id: r for r in inputs.rules}
+    venue = PaperVenue(
+        ledger, inputs.account.account_id, rules, fill_policy=costs, risk_policy=risk
+    )
+    execution = VenueExecution(
+        ledger,
+        inputs.account.account_id,
+        {"paper": venue},
+        {f.instrument.instrument_id: "paper"},
+        owner="direct",
+        fill_policy=costs,
+        risk_policy=risk,
+    )
+    admitted = f.reference.record.available_at + timedelta(minutes=1)
+    order = OrderIntent(
+        intent_id="source-bound-print",
+        account_id=inputs.account.account_id,
+        run_id=final.run_id,
+        instrument=f.instrument,
+        side="buy",
+        quantity=1,
+        decision_at=admitted,
+        eligible_at=admitted + timedelta(microseconds=1),
+        reference_price=101,
+        estimated_fee=".101",
+        strategy_id="fixture",
+        tif="DAY",
+        expires_at=inputs.opening_events[0].session_close,
+    )
+    metadata = {m.instrument.instrument_id: m for m in inputs.metadata}
+    execution.prepare(order, metadata, as_of=admitted)
+    execution.dispatch(order.intent_id, as_of=order.eligible_at)
+    assert order.intent_id in venue.accepted_intent_ids_before(inputs.opening_events[0].opened_at)
+    retained = {order.intent_id: execution.admission_metadata(order.intent_id)}
+    receipt_kwargs = dict(
+        observed_at=receipt.observed_at,
+        available_at=receipt.available_at,
+        as_of=final.as_of,
+        evidence_id=receipt.evidence_id,
+        evidence_hash=receipt.evidence_hash,
+    )
+    fills = venue.settle_open(inputs.opening_events[0], retained, **receipt_kwargs)
+    assert len(fills) == 1 and fills[0].quantity == 1
+    assert fills[0].price == Decimal("101.000000000000000001")
+    assert venue.settle_open(inputs.opening_events[0], retained, **receipt_kwargs) == []
+    assert ledger.reconcile(inputs.account.account_id)["reconciled"]
+    ledger.close()
     receipt.evidence_hash = prints.record.raw_hash
     with pytest.raises(RegistryError, match="source identity"):
         verify_paper_provenance(
@@ -626,6 +691,16 @@ def crypto_capture(tmp_path, request):
             )
             if state["market_error"]:
                 row["quoteAsset"] = "USD"
+            if state.get("maximum_notional"):
+                row["filters"].append(
+                    dict(
+                        filterType="NOTIONAL",
+                        applyMaxToMarket=True,
+                        maxNotional="100",
+                        applyMinToMarket=True,
+                        minNotional="5",
+                    )
+                )
             return httpx.Response(200, json={"symbols": [row]})
         if path == "/api/v3/trades":
             events = [
@@ -740,11 +815,11 @@ def test_crypto_exact_turnover_limits_individual_print_size_and_wire_ids(crypto_
     )
     proof = primary(result, "operating_prints")
     normalized = verify_operating_capture(f.store, proof.record.evidence_id, as_of=f.clock())
-    assert len(normalized["execution_bars"]) == 1
-    bar = normalized["execution_bars"][0]
+    assert len(normalized["opening_events"]) == 1
+    bar = normalized["opening_events"][0]
     assert Decimal(bar["opening_volume"]) == Decimal("0.000000123456789")
-    assert bar["volume"] == bar["opening_volume"]
-    assert Decimal(bar["open"]) == Decimal("101.123456789123456789")
+    assert {"open", "high", "low", "close", "volume", "closed_at"}.isdisjoint(bar)
+    assert Decimal(bar["price"]) == Decimal("101.123456789123456789")
     assert normalized["prints"][0]["trade_id"] == "9007199254740993123"
     assert Decimal(bar["fx_rate"]) == (Decimal(".9997") if f.fx else 1)
     assert all("/aggTrades" not in r.url.path for r in f.requests)
@@ -865,30 +940,178 @@ def test_missing_reference_authority_never_uses_default_sector_or_lot(equity_cap
 
 
 def test_equity_reference_uses_actual_request_cutoff_not_truncated_calendar(equity_capture):
-    f=equity_capture
+    f = equity_capture
     # Before today's close, yesterday's completed 20 are the actual window.
-    f.clock.at=datetime(2024,3,12,13,32,tzinfo=UTC)
-    before=context(datetime(2024,3,12,13,31,tzinfo=UTC))
-    current=f.adapter.reference(f.instrument,before,asset_id='asset-123',bar_ids=f.bar_ids,
-        calendar_id=f.calendar.record.evidence_id)
-    assert read(f.store,primary(current,'operating_reference'),f.clock)['adv_sessions'][-1]=='2024-03-11'
+    f.clock.at = datetime(2024, 3, 12, 13, 32, tzinfo=UTC)
+    before = context(datetime(2024, 3, 12, 13, 31, tzinfo=UTC))
+    current = f.adapter.reference(
+        f.instrument,
+        before,
+        asset_id="asset-123",
+        bar_ids=f.bar_ids,
+        calendar_id=f.calendar.record.evidence_id,
+    )
+    assert (
+        read(f.store, primary(current, "operating_reference"), f.clock)["adv_sessions"][-1]
+        == "2024-03-11"
+    )
     # After that close, the same 20 are missing today's actual completed day.
-    f.clock.at=datetime(2024,3,12,20,5,tzinfo=UTC)
-    after=context(datetime(2024,3,12,20,tzinfo=UTC))
-    with pytest.raises(ProviderError,match='twenty_complete'):
-        f.adapter.reference(f.instrument,after,asset_id='asset-123',bar_ids=f.bar_ids,
-            calendar_id=f.calendar.record.evidence_id)
-    f.clock.at=datetime(2026,3,12,20,5,tzinfo=UTC)
-    later=context(datetime(2026,3,12,20,tzinfo=UTC))
-    with pytest.raises(ProviderError,match='current_twenty_session_calendar'):
-        f.adapter.reference(f.instrument,later,asset_id='asset-123',bar_ids=f.bar_ids,
-            calendar_id=f.calendar.record.evidence_id)
+    f.clock.at = datetime(2024, 3, 12, 20, 5, tzinfo=UTC)
+    after = context(datetime(2024, 3, 12, 20, tzinfo=UTC))
+    with pytest.raises(ProviderError, match="twenty_complete"):
+        f.adapter.reference(
+            f.instrument,
+            after,
+            asset_id="asset-123",
+            bar_ids=f.bar_ids,
+            calendar_id=f.calendar.record.evidence_id,
+        )
+    f.clock.at = datetime(2026, 3, 12, 20, 5, tzinfo=UTC)
+    later = context(datetime(2026, 3, 12, 20, tzinfo=UTC))
+    with pytest.raises(ProviderError, match="current_twenty_session_calendar"):
+        f.adapter.reference(
+            f.instrument,
+            later,
+            asset_id="asset-123",
+            bar_ids=f.bar_ids,
+            calendar_id=f.calendar.record.evidence_id,
+        )
 
 
 def test_crypto_reference_cannot_relabel_old_turnover_as_current(crypto_capture):
-    f=crypto_capture
-    f.clock.at=datetime(2026,3,22,0,5,tzinfo=UTC)
-    later=context(datetime(2026,3,22,tzinfo=UTC))
-    with pytest.raises(ProviderError,match='twenty_complete|fx_missing_stale'):
-        f.adapter.reference(f.instrument,later,bar_ids=f.bar_ids,
-            fx_evidence_id=f.fx.record.evidence_id if f.fx else None,**f.kwargs)
+    f = crypto_capture
+    f.clock.at = datetime(2026, 3, 22, 0, 5, tzinfo=UTC)
+    later = context(datetime(2026, 3, 22, tzinfo=UTC))
+    with pytest.raises(ProviderError, match="twenty_complete|fx_missing_stale"):
+        f.adapter.reference(
+            f.instrument,
+            later,
+            bar_ids=f.bar_ids,
+            fx_evidence_id=f.fx.record.evidence_id if f.fx else None,
+            **f.kwargs,
+        )
+
+
+def test_v1_capture_readability_and_mixed_format_rejection(equity_capture):
+    # Legacy fixtures are test-only archived v1 observations. Runtime v2 never
+    # constructs this completed-bar shape from a print.
+    from src.domain.portfolio import ExecutionBar
+
+    from src.data.adapters.operating import VERSION
+    from src.data.evidence.store import canonical_bytes, digest
+
+    f = equity_capture
+    f.clock.at = datetime(2024, 3, 12, 13, 32, tzinfo=UTC)
+    requested = context(datetime(2024, 3, 12, 13, 31, tzinfo=UTC))
+    result = f.adapter.trades(
+        f.instrument,
+        requested,
+        start=datetime(2024, 3, 12, 13, 30, tzinfo=UTC),
+        end=requested.as_of,
+        calendar_id=f.calendar.record.evidence_id,
+        feed="iex",
+        symbol_asof="2024-03-12",
+    )
+    current = primary(result, "operating_prints")
+    opening = read(f.store, current, f.clock)["opening_events"][0]
+    legacy = ExecutionBar(
+        event_id="archived-v1-event",
+        instrument=f.instrument,
+        opened_at=opening["opened_at"],
+        closed_at="2024-03-12T13:31:00Z",
+        open=101,
+        high=102,
+        low=100,
+        close=102,
+        volume=1000,
+        opening_volume=7,
+        calendar=opening["calendar"],
+        calendar_version=opening["calendar_version"],
+        session=opening["session"],
+        session_open=opening["session_open"],
+        session_close=opening["session_close"],
+    )
+    wire_bytes = canonical_bytes({"archived_completed_bar": legacy.model_dump(mode="json")})
+    old_wire = store_observation(
+        f.store,
+        raw=wire_bytes,
+        normalized={
+            "wire_hash": digest(wire_bytes),
+            "upstream": "synthetic-v1-fixture",
+            "request": {"path": "/test-archive", "params": {}},
+        },
+        provider="operating",
+        version="operating-wire-1",
+        source_uri="test://legacy",
+        kind="operating_raw",
+        logical_key="old-wire",
+        context=requested,
+        ingested_at=f.clock(),
+        instrument=f.instrument,
+    )
+    manifest = dict(
+        implementation="operating-wire-1",
+        policy="individual-print-size-1",
+        sources=[
+            dict(
+                evidence_id=old_wire.record.evidence_id,
+                envelope_hash=old_wire.content_hash(),
+                raw_hash=old_wire.record.raw_hash,
+            )
+        ],
+    )
+    raw = canonical_bytes(manifest)
+    old = store_observation(
+        f.store,
+        raw=raw,
+        normalized=dict(
+            source_manifest=manifest,
+            execution_bars=[legacy.model_dump(mode="json")],
+            opening_liquidity=[
+                {
+                    k: legacy.model_dump(mode="json")[k]
+                    for k in ("event_id", "instrument", "opened_at", "opening_volume", "fx_rate")
+                }
+            ],
+        ),
+        provider="operating",
+        version="operating-wire-1",
+        source_uri="test://legacy",
+        kind="operating_prints",
+        logical_key=f.instrument.instrument_id,
+        context=requested,
+        ingested_at=f.clock(),
+        instrument=f.instrument,
+    )
+    original_hash = old.content_hash()
+    assert VERSION == "operating-wire-2"
+    assert verify_operating_capture(f.store, old.record.evidence_id, as_of=f.clock())[
+        "execution_bars"
+    ] == [legacy.model_dump(mode="json")]
+    assert digest(f.store.raw(old.record.evidence_id)) == old.record.raw_hash
+    snapshot = EvidenceService(f.store).market_snapshot(
+        (f.instrument,), context(f.clock()), start=datetime(2024, 2, 1, tzinfo=UTC)
+    )
+    with pytest.raises(ProviderError, match="mixed_or_unsupported"):
+        economic_sources(
+            f.store,
+            snapshot,
+            reference_ids=(f.reference.record.evidence_id,),
+            universe_ids=(),
+            calendar_ids=(f.calendar.record.evidence_id,),
+            print_ids=(old.record.evidence_id, current.record.evidence_id),
+            action_ids=(),
+            context=context(f.clock()),
+            clock=f.clock,
+        )
+    assert f.store.get(old.record.evidence_id).content_hash() == original_hash
+
+
+@pytest.mark.parametrize("crypto_capture", ["binance"], indirect=True)
+def test_unsupported_actual_market_maximum_is_archived_and_blocks_reference(crypto_capture):
+    f = crypto_capture
+    f.state["maximum_notional"] = True
+    with pytest.raises(ProviderError, match="unsupported_market_maximum_notional_wire_archived"):
+        f.adapter.reference(
+            f.instrument, f.req, bar_ids=f.bar_ids, fx_evidence_id=f.fx.record.evidence_id
+        )
