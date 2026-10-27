@@ -40,6 +40,25 @@ class DeskHistoryReceipt(VersionedContract):
     inputs_json: str
 
 
+def memory_projection(receipts):
+    """Bound prose without truncating its exact authority references."""
+    entries = []
+    for receipt in reversed(receipts):
+        entry = {
+            "decision_hash": receipt.decision_hash,
+            "receipt_hash": receipt.content_hash(),
+            "as_of": receipt.decision.context.as_of.isoformat(),
+            "available_at": receipt.available_at.isoformat(),
+            "action": receipt.decision.action.value,
+            "reasoning": receipt.decision.reasoning[:500],
+        }
+        if len(canonical([entry, *entries])) > 2000:
+            break
+        entries.insert(0, entry)
+    references = tuple((v["decision_hash"], v["receipt_hash"]) for v in entries)
+    return (canonical(entries) if entries else ""), references
+
+
 def _validate(receipt):
     if (
         receipt.decision.content_hash() != receipt.decision_hash
@@ -162,6 +181,8 @@ class DeskHistoryStore:
             for key in (
                 "qlib_context",
                 "memory_context",
+                "memory_receipts",
+                "memory_status",
                 "market_context",
                 "macro_regime",
                 "macro_confidence",
@@ -192,6 +213,32 @@ class DeskHistoryStore:
             )
         return receipt.decision_hash
 
+    def retrieve(self, instrument_id, *, as_of, limit=10, **authorities):
+        """Bounded projection from existing immutable history, never a second store."""
+        if as_of.tzinfo is None or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("aware cutoff and bounded positive limit required")
+        candidates = []
+        with sqlite3.connect(self.path) as db:
+            # Validate headers before filtering: a changed instrument/time cannot
+            # silently hide a corrupt formerly eligible row from the query.
+            for identity, receipt_hash, payload in db.execute(
+                "SELECT decision_hash,receipt_hash,payload FROM certified_desk_history"
+            ):
+                receipt = DeskHistoryReceipt.model_validate_json(payload)
+                if receipt.decision_hash != identity or receipt.content_hash() != receipt_hash:
+                    raise ValueError("history payload hash mismatch")
+                _validate(receipt)
+                if (
+                    receipt.decision.instrument.instrument_id == instrument_id
+                    and receipt.available_at <= as_of
+                    and receipt.decision.context.as_of <= as_of
+                ):
+                    candidates.append(receipt)
+        selected = sorted(candidates, key=lambda r: (r.decision.context.as_of, r.decision_hash))[
+            -limit:
+        ]
+        return tuple(self.export(r.decision_hash, as_of=as_of, **authorities) for r in selected)
+
     def export(
         self,
         decision_hash: str,
@@ -200,10 +247,13 @@ class DeskHistoryStore:
         evidence_store,
         decision_store,
         budget_store_path: str | Path,
+        _ancestors: frozenset[str] = frozenset(),
     ) -> DeskHistoryReceipt:
         """Verify recorded proof against stores and historical cutoff; no network."""
         if as_of.tzinfo is None:
             raise ValueError("history export requires timezone-aware signal cutoff")
+        if decision_hash in _ancestors:
+            raise ValueError("cyclic memory history")
         with sqlite3.connect(self.path) as db:
             row = db.execute(
                 "SELECT receipt_hash,payload FROM certified_desk_history WHERE decision_hash=?",
@@ -242,4 +292,28 @@ class DeskHistoryStore:
         ]
         if canonical(expected) != receipt.jev_observations_json:
             raise ValueError("history Jev observation differs from authority")
+        inputs = json.loads(receipt.inputs_json)
+        references = inputs.get("memory_receipts") or ()
+        prior = []
+        for identity, proof_hash in references:
+            value = self.export(
+                identity,
+                as_of=receipt.decision.context.as_of,
+                evidence_store=evidence_store,
+                decision_store=decision_store,
+                budget_store_path=budget_store_path,
+                _ancestors=_ancestors | {decision_hash},
+            )
+            if (
+                value.content_hash() != proof_hash
+                or value.decision.instrument != receipt.decision.instrument
+            ):
+                raise ValueError("memory receipt identity differs")
+            prior.append(value)
+        projection, verified = memory_projection(prior)
+        if (
+            projection != (inputs.get("memory_context") or "")
+            or tuple(map(tuple, references)) != verified
+        ):
+            raise ValueError("memory projection lacks exact certified history")
         return receipt

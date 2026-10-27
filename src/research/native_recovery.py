@@ -19,12 +19,12 @@ from typing import Literal
 
 import httpx
 from pydantic import Field, model_validator
+
+from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
 from src.research.native import NativeRequest, NativeSupervisor
 from src.research.native_mounts import NativeMountAuthority, canonical_path
 from src.research.native_runtime.overlay import UPSTREAM_REVISION
 from src.research.registry import RegistryError, ResearchRegistry, canonical, content_hash
-
-from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
 
 
 class NativeFile(VersionedContract):

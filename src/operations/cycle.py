@@ -19,9 +19,22 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from src.agents.consensus import consensus_recommendation
+from src.agents.contracts import PortfolioReviewContext, hmm_context_from_result
+from src.agents.graph import analyze_instrument
+from src.agents.history import DeskHistoryStore
+from src.core.macro_regime import CausalHMMRegimeDetector, CausalRegimeResult
+from src.core.model_zoo import ModelWrapper
+from src.core.walk_forward import frame_hash
 from src.data.evidence.service import ROLE_KINDS, EvidenceService
 from src.data.features.contextual import materialize_evidence_fields
 from src.data.features.dataset import FeatureDataset, feature_dataset
+from src.decision.evidence import source_from_passage
+from src.decision.service import DecisionService
+from src.decision.store import DecisionStore
+from src.domain.common import RunContext
+from src.domain.decisions import AgentDecision
 from src.domain.portfolio import (
     ActionCoverage,
     CashDividend,
@@ -38,9 +51,18 @@ from src.domain.portfolio import (
     SleeveSnapshot,
     UniverseEligibility,
 )
+from src.execution.portfolio_optimizer import AllocationConstraints, PortfolioOptimizer
 from src.execution.routing import target_from_blended_frame
 from src.execution.sleeves import SleeveBook, exact_sum, partition
 from src.execution.venue import PaperVenue, VenueExecution, VenueRules
+from src.operations.contracts import (
+    INCOME_FIELDS,
+    CycleResult,
+    ObservedOpenReceipt,
+    PaperCycleInputs,
+    PaperCyclePlan,
+    PaperCycleTemplate,
+)
 from src.operations.store import RecoveryRequired, RunManifest, canonical, digest
 from src.research.evidence import (
     BoundArtifact,
@@ -56,28 +78,6 @@ from src.research.regime_experiments import (
 )
 from src.strategies.allocation import blend_sleeves, select_allocations
 from src.strategies.runner import evaluate_strategy, require_strategy_eligible
-
-from src.agents.consensus import consensus_recommendation
-from src.agents.contracts import PortfolioReviewContext, hmm_context_from_result
-from src.agents.graph import analyze_instrument
-from src.agents.history import DeskHistoryStore
-from src.core.macro_regime import CausalHMMRegimeDetector, CausalRegimeResult
-from src.core.model_zoo import ModelWrapper
-from src.core.walk_forward import frame_hash
-from src.decision.evidence import source_from_passage
-from src.decision.service import DecisionService
-from src.decision.store import DecisionStore
-from src.domain.common import RunContext
-from src.domain.decisions import AgentDecision
-from src.execution.portfolio_optimizer import AllocationConstraints, PortfolioOptimizer
-from src.operations.contracts import (
-    INCOME_FIELDS,
-    CycleResult,
-    ObservedOpenReceipt,
-    PaperCycleInputs,
-    PaperCyclePlan,
-    PaperCycleTemplate,
-)
 from src.utils.config import AppConfig, QlibConfig
 
 D = Decimal
@@ -1317,6 +1317,7 @@ class PaperCycleService:
                 qlib_context=json.dumps(quantitative, sort_keys=True, allow_nan=False),
                 config=self.config,
                 decision_service=self.decisions,
+                evidence_store=self.evidence,
                 policy=self.policy,
                 llm_factory=self.llm_factory,
             )

@@ -24,6 +24,8 @@ class TradingDeskState(TypedDict, total=False):
     macro_regime: str
     macro_confidence: float | None
     memory_context: str
+    memory_receipts: tuple
+    memory_status: str
     app_config: object
     llm_factory: object
     workflow: object

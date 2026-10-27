@@ -6,7 +6,16 @@ from decimal import Decimal
 from typing import Literal
 
 from pydantic import Field, model_serializer, model_validator
+
 from src.data.features.contextual import NumericEvidenceBinding
+from src.domain.common import (
+    Instrument,
+    NonEmptyString,
+    RunContext,
+    Sha256,
+    UtcTimestamp,
+    VersionedContract,
+)
 from src.domain.market import MarketSnapshot
 from src.domain.portfolio import (
     AccountSpec,
@@ -28,15 +37,6 @@ from src.execution.venue import VenueRules
 from src.research.evidence import SourceBinding
 from src.research.regime_experiments import FrozenEvidence, HMMVariantSpec, MacroDatasetSpec
 from src.strategies.specification import StrategySpec
-
-from src.domain.common import (
-    Instrument,
-    NonEmptyString,
-    RunContext,
-    Sha256,
-    UtcTimestamp,
-    VersionedContract,
-)
 
 INCOME_FIELDS = (
     "cash_dividends",

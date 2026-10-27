@@ -272,7 +272,7 @@ class TestMemoryGraphNodes:
         result = load_memory_node(self._make_state(), config=config)
         assert result["memory_context"] == ""
 
-    def test_load_memory_returns_context_when_history_exists(
+    def test_unverified_display_history_never_enters_model_context(
         self, tmp_path, decision_context, decision_instrument
     ):
         from datetime import timedelta
@@ -300,7 +300,9 @@ class TestMemoryGraphNodes:
             },
             config=config,
         )
-        assert "Prior eligible reasoning" in result["memory_context"]
+        assert result["memory_context"] == ""
+        assert result["memory_status"] == "unavailable"
+        assert result["new_exposure_blocked"]
 
     def test_load_memory_disabled_returns_empty(self, tmp_path: Path) -> None:
         """When memory.enabled=False, load_memory_node returns empty string without reading."""
@@ -313,7 +315,7 @@ class TestMemoryGraphNodes:
         store.save(analysis)
 
         result = load_memory_node(self._make_state(), config=config)
-        assert result == {"memory_context": ""}
+        assert result == {"memory_context": "", "memory_receipts": (), "memory_status": "disabled"}
 
     def test_save_memory_persists_result(self, tmp_path: Path) -> None:
         """save_memory_node writes the AnalysisResult to a JSONL file."""
@@ -412,7 +414,7 @@ class TestMemoryGraphIntegration:
             desk_hmm,
             desk_portfolio,
         )
-        assert result.action.value == "BUY"
+        assert result.action.value == "ABSTAIN"  # Memory authority was not supplied.
         store = DeskMemoryStore(tmp_path / "graph.desk.sqlite")
         assert store.retrieve(decision_instrument.instrument_id, as_of=decision_context.as_of) == []
         # Generation happened now, not at the historical simulated decision clock.

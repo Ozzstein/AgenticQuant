@@ -27,7 +27,13 @@ from src.utils.config import get_config
 
 
 def build_trading_desk_graph(
-    config=None, *, decision_service=None, policy=None, llm_factory=None, observation_mode="cache"
+    config=None,
+    *,
+    decision_service=None,
+    policy=None,
+    llm_factory=None,
+    observation_mode="cache",
+    evidence_store=None,
 ):
     config = config or get_config()
     service = decision_service or DecisionService(
@@ -207,7 +213,9 @@ def build_trading_desk_graph(
         "prepare": prepare,
         "market_context": bind(market_context_node),
         "macro_regime": bind(macro_regime_node),
-        "load_memory": lambda state: load_memory_node(state, config),
+        "load_memory": lambda state: load_memory_node(
+            state, config, evidence_store=evidence_store, decision_store=service.store
+        ),
         "evidence": evidence_node,
         "fundamental": bind(fundamental_node),
         "sentiment": bind(sentiment_node),
@@ -253,6 +261,7 @@ def analyze_instrument(
     policy=None,
     llm_factory=None,
     observation_mode="cache",
+    evidence_store=None,
 ) -> AgentDecision:
     config = config or get_config()
     graph = build_trading_desk_graph(
@@ -261,6 +270,7 @@ def analyze_instrument(
         policy=policy,
         llm_factory=llm_factory,
         observation_mode=observation_mode,
+        evidence_store=evidence_store,
     )
     initial = {
         "instrument": instrument,

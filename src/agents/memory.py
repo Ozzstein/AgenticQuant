@@ -163,47 +163,41 @@ class AnalysisMemoryStore:
 # ---------------------------------------------------------------------------
 
 
-def load_memory_node(state: TradingDeskState, config: "AppConfig | None" = None) -> dict:
-    """Load prior analyses for state['ticker'] and format as context string.
-
-    Args:
-        state: Current trading desk state.
-        config: Optional AppConfig override. Uses get_config() singleton if None.
-
-    Returns:
-        Partial state dict with memory_context set to formatted history string.
-    """
+def load_memory_node(
+    state: TradingDeskState,
+    config: "AppConfig | None" = None,
+    *,
+    evidence_store=None,
+    decision_store=None,
+) -> dict:
+    """Only certified source/model/budget-backed history may reach a model."""
+    from src.agents.history import DeskHistoryStore, memory_projection
     from src.utils.config import get_config
 
-    if config is None:
-        config = get_config()
-
+    config = config or get_config()
+    empty = {"memory_context": "", "memory_receipts": ()}
     if not config.memory.enabled:
-        return {"memory_context": ""}
-
-    store = AnalysisMemoryStore(
-        store_path=config.memory.store_path,
-        max_history=config.memory.max_history,
-    )
-    ticker = state["ticker"]
-    context = state.get("context")
-    if context is None:
-        return {"memory_context": ""}
-    # Canonical replay history is read from the append-only decision store below.
-    canonical = DeskMemoryStore(Path(config.memory.store_path).with_suffix(".desk.sqlite"))
-    results = canonical.retrieve(state["instrument"].instrument_id, as_of=context.as_of)
-    if results:
-        return {
-            "memory_context": "\n".join(
-                f"[{r.context.as_of.isoformat()}] {r.action.value}: {r.reasoning}" for r in results
-            )[-_CHAR_BUDGET:]
-        }
-    # Legacy records do not preserve a separate publication/generation timestamp.
-    # They cannot become point-in-time evidence merely from an analysis date.
-    if context.mode in ("backtest", "research"):
-        return {"memory_context": ""}
-    results = store.retrieve(ticker, as_of=context.as_of)
-    return {"memory_context": store.format_memory_context(results)}
+        return {**empty, "memory_status": "disabled"}
+    context, instrument = state.get("context"), state.get("instrument")
+    if context is None or instrument is None or evidence_store is None or decision_store is None:
+        return {**empty, "memory_status": "unavailable", "new_exposure_blocked": True}
+    try:
+        receipts = DeskHistoryStore(Path(config.output_dir) / "desk-history.sqlite3").retrieve(
+            instrument.instrument_id,
+            as_of=context.as_of,
+            limit=min(10, config.memory.max_history),
+            evidence_store=evidence_store,
+            decision_store=decision_store,
+            budget_store_path=config.agents.budget_store_path,
+        )
+        projection, references = memory_projection(receipts)
+    except Exception:
+        return {**empty, "memory_status": "unavailable", "new_exposure_blocked": True}
+    return {
+        "memory_context": projection,
+        "memory_receipts": references,
+        "memory_status": "available" if references else "empty",
+    }
 
 
 def save_memory_node(state: TradingDeskState, config: "AppConfig | None" = None) -> dict:
@@ -240,7 +234,7 @@ def save_memory_node(state: TradingDeskState, config: "AppConfig | None" = None)
 
 
 class DeskMemoryStore:
-    """Durable canonical history with separate decision and publication clocks."""
+    """Legacy display projection only; never authority for model-visible memory."""
 
     def __init__(self, path):
         import sqlite3
