@@ -284,6 +284,8 @@ class DecisionService:
                     cost=reserve_cost,
                     now=now.timestamp(),
                     limits=self.limits,
+                    observation_id=identity,
+                    attempt=attempts + 1,
                 )
                 if not allowed:
                     if wait and wait < remaining:

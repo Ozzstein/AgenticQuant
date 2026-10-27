@@ -40,6 +40,9 @@ from tests.test_decision_contracts import (  # noqa: F401
 @pytest.fixture
 def desk_config(tmp_path, decision_context):
     cfg = AppConfig(output_dir=str(tmp_path / "outputs"), log_dir=str(tmp_path / "logs"))
+    cfg.agents = cfg.agents.model_copy(
+        update={"llm_model": "fixture-chat", "deep_think_model": "fixture-chat"}
+    )
     prices = [
         SimpleNamespace(
             provider=cfg.agents.llm_provider,

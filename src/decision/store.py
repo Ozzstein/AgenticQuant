@@ -42,6 +42,14 @@ class DecisionStore:
                 CREATE TRIGGER IF NOT EXISTS attempt_immutable_delete BEFORE DELETE
                     ON attempts BEGIN SELECT RAISE(ABORT, 'immutable attempt'); END;
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(reservations)")}
+            for name, kind in (("observation_id", "TEXT"), ("attempt", "INTEGER")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE reservations ADD COLUMN {name} {kind}")
+            for action in ("UPDATE", "DELETE"):
+                db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS reservation_{action.lower()} BEFORE {action} ON reservations BEGIN SELECT RAISE(ABORT, 'immutable reservation'); END"
+                )
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -83,7 +91,9 @@ class DecisionStore:
                 (observation_id, attempt, status, body, elapsed_ms, failure),
             )
 
-    def reserve(self, *, run_id, day, tokens, cost, now, limits) -> tuple[bool, str, float]:
+    def reserve(
+        self, *, run_id, day, tokens, cost, now, limits, observation_id=None, attempt=None
+    ) -> tuple[bool, str, float]:
         """Atomic reservation; rate delay returned before consuming a request."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -106,8 +116,69 @@ class DecisionStore:
             if wait:
                 return False, "rate_limit", wait
             db.execute(
-                "INSERT INTO reservations(run_id,day,reserved_tokens,reserved_cost,at) "
-                "VALUES(?,?,?,?,?)",
-                (run_id, day, tokens, cost, now),
+                "INSERT INTO reservations(run_id,day,reserved_tokens,reserved_cost,at,observation_id,attempt) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (run_id, day, tokens, cost, now, observation_id, attempt),
             )
             return True, "", 0
+
+    def export_observation(self, observation_id: str) -> dict:
+        """Read the exact authoritative request/result, attempts and reservations.
+
+        Cache/replay dependencies are included recursively; supplied observation
+        objects are never accepted as proof. Old unlinked charges fail closed.
+        """
+        return self._export_observation(observation_id, set())
+
+    def _export_observation(self, observation_id, seen):
+        if observation_id in seen or len(seen) >= 128:
+            raise ValueError("cyclic or excessive observation reuse")
+        seen.add(observation_id)
+        with self.connect() as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM observations WHERE observation_id=?", (observation_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown authoritative Jev observation")
+            request = DecisionRequest.model_validate_json(row["request_json"])
+            result = DecisionResult.model_validate_json(row["result_json"])
+            attempts = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM attempts WHERE observation_id=? ORDER BY attempt",
+                    (observation_id,),
+                )
+            ]
+            reservations = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM reservations WHERE observation_id=? ORDER BY attempt",
+                    (observation_id,),
+                )
+            ]
+        if (
+            result.observation_id != observation_id
+            or result.request_hash != request.content_hash()
+            or result.cache_key != request.cache_key()
+            or row["cache_key"] != result.cache_key
+            or result.policy_hash != request.policy.content_hash()
+            or result.state_hash != request.state_hash
+            or result.run_id != request.context.run_id
+            or result.source_hashes != tuple(s.content_hash() for s in request.sources)
+            or result.completed_at < result.started_at
+        ):
+            raise ValueError("Jev observation identity differs from request")
+        if len(reservations) != result.attempts or any(
+            r["run_id"] != result.run_id for r in reservations
+        ):
+            raise ValueError("missing authoritative Jev admission linkage")
+        return {
+            "request": request.model_dump(mode="json"),
+            "result": result.model_dump(mode="json"),
+            "attempts": attempts,
+            "reservations": reservations,
+            "reused": self._export_observation(result.reused_observation_id, seen)
+            if result.reused_observation_id
+            else None,
+        }

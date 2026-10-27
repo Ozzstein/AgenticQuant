@@ -1,0 +1,245 @@
+"""Authoritative prospective desk history for point-in-time consensus research.
+
+Export accepts an identity, never a user-supplied receipt. The receipt is an
+archiveable snapshot after re-verification against source, model and budget
+stores. Its hash is not a substitute for those checks. Legacy memory is not an
+admissible generation history and cannot be upgraded by backdating an import.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+from src.agents.receipts import (
+    AgentCallReceipt,
+    GenerationReceipt,
+    canonical,
+    read_call,
+    read_generation,
+    session_calls,
+)
+from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
+from src.domain.decisions import AgentDecision, DecisionRequest, DecisionResult, DecisionSource
+
+
+class DeskHistoryReceipt(VersionedContract):
+    decision_hash: Sha256
+    decision: AgentDecision
+    session_id: NonEmptyString
+    started_at: UtcTimestamp
+    completed_at: UtcTimestamp
+    available_at: UtcTimestamp
+    sources: tuple[DecisionSource, ...]
+    calls: tuple[AgentCallReceipt, ...]
+    generations: tuple[GenerationReceipt, ...]
+    jev_observations_json: str
+    inputs_json: str
+
+
+def _validate(receipt):
+    if (
+        receipt.decision.content_hash() != receipt.decision_hash
+        or not receipt.started_at <= receipt.completed_at <= receipt.available_at
+        or receipt.decision.context.as_of > receipt.available_at
+    ):
+        raise ValueError("history identities or clocks disagree")
+    calls = {c.call_id: c for c in receipt.calls}
+    source_hashes = {s.content_hash() for s in receipt.sources}
+    if len(calls) != len(receipt.calls):
+        raise ValueError("duplicate generation admission")
+    for call in calls.values():
+        if (
+            call.session_id != receipt.session_id
+            or call.run_id
+            != receipt.decision.context.run_id + "/" + receipt.decision.instrument.instrument_id
+            or not receipt.started_at
+            <= call.started_at
+            <= call.completed_at
+            <= receipt.completed_at
+        ):
+            raise ValueError("call does not belong to this history session")
+    for generation in receipt.generations:
+        call = calls.get(generation.call_id)
+        if (
+            call is None
+            or call.status != "ok"
+            or call.model != call.actual_model
+            or generation.report.provider_model != call.actual_model
+            or generation.report.role != generation.role
+            or not set(generation.source_hashes).issubset(source_hashes)
+            or not call.completed_at <= generation.available_at <= receipt.completed_at
+        ):
+            raise ValueError("report lacks a settled exact-model source-bound generation")
+        source_map = {
+            (s.record.evidence_id, s.passage_hash): s
+            for s in receipt.sources
+            if s.content_hash() in generation.source_hashes
+        }
+        for claim in generation.report.claims:
+            source = source_map.get((claim.evidence_id, claim.passage_hash))
+            if source is None or claim.quote not in source.text:
+                raise ValueError("report quote absent from its exact generation sources")
+    for report in receipt.decision.reports:
+        if report.status != "ok":
+            continue
+        # Graph-owned transformations are limited to derived strategist provenance
+        # and monotone CRO veto, never a new independent vote or liquidation.
+        possible = []
+        for generation in receipt.generations:
+            raw = generation.report
+            updated = raw.model_dump()
+            if report.role == "strategist":
+                updated["derived_from"] = report.derived_from
+            if report.role == "risk_manager" and report.action.value == "VETO":
+                if report.reasoning.endswith("\nQualitative review: " + raw.reasoning):
+                    updated.update(action=report.action, reasoning=report.reasoning)
+            if updated == report.model_dump():
+                possible.append(generation)
+        if not possible:
+            raise ValueError("decision report is not backed by exact generation history")
+    observations = json.loads(receipt.jev_observations_json)
+    if [o["result"]["observation_id"] for o in observations] != list(
+        receipt.decision.judgment_observation_ids
+    ):
+        raise ValueError("decision Jev references differ from history")
+
+    def observation(value, *, reused=False):
+        request = DecisionRequest.model_validate(value["request"])
+        result = DecisionResult.model_validate(value["result"])
+        if (
+            (not reused and request.context != receipt.decision.context)
+            or request.context.as_of != receipt.decision.context.as_of
+            or request.instrument != receipt.decision.instrument
+            or not set(result.source_hashes).issubset(source_hashes)
+            or result.completed_at > receipt.completed_at
+        ):
+            raise ValueError("Jev observation belongs to a different decision or future")
+        if value["reused"] is not None:
+            if value["reused"]["result"]["cache_key"] != result.cache_key:
+                raise ValueError("reused Jev observation has a different question/model/state key")
+            observation(value["reused"], reused=True)
+
+    for value in observations:
+        observation(value)
+
+
+class DeskHistoryStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS certified_desk_history(decision_hash TEXT PRIMARY KEY, receipt_hash TEXT NOT NULL, payload TEXT NOT NULL)"
+            )
+            for action in ("UPDATE", "DELETE"):
+                db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS certified_desk_{action.lower()} BEFORE {action} ON certified_desk_history BEGIN SELECT RAISE(ABORT, 'immutable desk history'); END"
+                )
+
+    def record_graph_completion(self, state, *, decision_store):
+        """Graph write boundary; timestamps are measured here, never supplied."""
+        budget = state["call_budget"]
+        decision = AgentDecision.model_validate(state["agent_decision"].model_dump())
+        calls = session_calls(budget.path, budget.session_id)
+        generations = []
+        for call in calls:
+            try:
+                generations.append(read_generation(budget.path, call.call_id))
+            except ValueError:
+                # Failed/malformed calls retain a charge but generate no report.
+                continue
+        observations = [
+            decision_store.export_observation(identity)
+            for identity in decision.judgment_observation_ids
+        ]
+        now = datetime.now(timezone.utc)
+        inputs = {
+            key: state.get(key)
+            for key in (
+                "qlib_context",
+                "memory_context",
+                "market_context",
+                "macro_regime",
+                "macro_confidence",
+                "evidence_issues",
+                "risk_veto_reason",
+            )
+        }
+        for key in ("hmm_context", "portfolio_context"):
+            inputs[key] = state[key].model_dump(mode="json") if state.get(key) is not None else None
+        receipt = DeskHistoryReceipt(
+            decision_hash=decision.content_hash(),
+            decision=decision,
+            session_id=budget.session_id,
+            started_at=budget.started_at,
+            completed_at=now,
+            available_at=max(now, decision.context.as_of),
+            sources=tuple(state.get("sources", ())),
+            calls=calls,
+            generations=tuple(generations),
+            jev_observations_json=canonical(observations),
+            inputs_json=canonical(inputs),
+        )
+        _validate(receipt)
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                "INSERT OR IGNORE INTO certified_desk_history VALUES(?,?,?)",
+                (receipt.decision_hash, receipt.content_hash(), receipt.model_dump_json()),
+            )
+        return receipt.decision_hash
+
+    def export(
+        self,
+        decision_hash: str,
+        *,
+        as_of: datetime,
+        evidence_store,
+        decision_store,
+        budget_store_path: str | Path,
+    ) -> DeskHistoryReceipt:
+        """Verify recorded proof against stores and historical cutoff; no network."""
+        if as_of.tzinfo is None:
+            raise ValueError("history export requires timezone-aware signal cutoff")
+        with sqlite3.connect(self.path) as db:
+            row = db.execute(
+                "SELECT receipt_hash,payload FROM certified_desk_history WHERE decision_hash=?",
+                (decision_hash,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("no authoritative generation history for decision")
+        receipt = DeskHistoryReceipt.model_validate_json(row[1])
+        if receipt.decision_hash != decision_hash or receipt.content_hash() != row[0]:
+            raise ValueError("history payload hash mismatch")
+        _validate(receipt)
+        if receipt.available_at > as_of or receipt.decision.context.as_of > as_of:
+            raise ValueError("decision generation/publication is after signal_at")
+        for source in receipt.sources:
+            source.record.require_available(receipt.decision.context.as_of)
+            document = evidence_store.document(
+                source.record.evidence_id, as_of=receipt.decision.context.as_of
+            )
+            if (
+                document.evidence != source.record
+                or document.document_hash != source.document_hash
+                or document.text[source.start : source.end] != source.text
+                or hashlib.sha256(evidence_store.raw(source.record.evidence_id)).hexdigest()
+                != source.record.raw_hash
+            ):
+                raise ValueError("history source differs from authoritative exact document span")
+        for call in receipt.calls:
+            if read_call(budget_store_path, call.call_id) != call:
+                raise ValueError("history budget receipt differs from authority")
+        for generation in receipt.generations:
+            if read_generation(budget_store_path, generation.call_id) != generation:
+                raise ValueError("history generation differs from authority")
+        expected = [
+            decision_store.export_observation(identity)
+            for identity in receipt.decision.judgment_observation_ids
+        ]
+        if canonical(expected) != receipt.jev_observations_json:
+            raise ValueError("history Jev observation differs from authority")
+        return receipt

@@ -181,6 +181,11 @@ def structured_report(state, role, mandate, *, llm=None, kinds=(), extra=None):
                     )
                 }
             )
+        from src.agents.receipts import record_generation
+
+        record_generation(
+            budget, call_id, role=role, messages=messages, sources=sources, report=report
+        )
     except AgentBudgetError as exc:
         return unavailable(role, str(exc))
     except Exception as exc:

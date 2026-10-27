@@ -18,9 +18,14 @@ class AgentBudgetError(RuntimeError):
 class AgentCallBudget:
     def __init__(self, config, run_id, *, deadline):
         self.config, self.run_id, self.deadline = config, run_id, deadline
+        self.session_id = str(uuid4())
+        self.started_at = datetime.now(timezone.utc)
         self.path = Path(getattr(config, "budget_store_path", "outputs/agent-budgets.sqlite3"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
+            from src.agents.receipts import create_tables
+
+            create_tables(db)
             db.execute("""CREATE TABLE IF NOT EXISTS calls (
                 id TEXT PRIMARY KEY, run_id TEXT, day TEXT, provider TEXT, model TEXT,
                 pricing_version TEXT, reserved_tokens INTEGER, charged_tokens INTEGER,
@@ -111,6 +116,9 @@ class AgentCallBudget:
                     None,
                 ),
             )
+            from src.agents.receipts import admission
+
+            admission(db, identity, self, model, price, now, tokens, cost)
         return identity, price, remaining
 
     def finish(self, identity, price, *, raw=None, status="failed", elapsed_ms=0):
@@ -154,6 +162,9 @@ class AgentCallBudget:
                     identity,
                 ),
             )
+            from src.agents.receipts import settlement
+
+            settlement(db, identity, self.run_id)
         # Raise only after commit: an overrun must never roll back its actual charge.
         if overrun:
             raise AgentBudgetError("provider usage exceeded conservative reservation")

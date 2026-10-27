@@ -174,6 +174,11 @@ def build_trading_desk_graph(
 
     def persist(state):
         try:
+            from src.agents.history import DeskHistoryStore
+
+            DeskHistoryStore(
+                Path(config.output_dir) / "desk-history.sqlite3"
+            ).record_graph_completion(state, decision_store=service.store)
             return save_memory_node(state, config)
         except Exception as exc:
             # Preserve completed reasoning and qualitative vetoes if persistence

@@ -123,3 +123,41 @@ A final history-save failure preserves the completed reports, debate, judgment l
 Verification: **63 passed in 8.00 s** (`tests/test_decision_workflows.py`, `tests/test_agent_desk_invariants.py`, `tests/test_agents_graph.py`) with the same read-only environment/PYTHONPATH and `--disable-socket --allow-unix-socket --basetemp=/tmp/quantagentlab-jev-boundary-tests`. Nine additional cases cover canonical abstention/HOLD against BUY/REDUCE/EXIT votes, duplicate/unattributed votes, explicit valid HOLD, risk-manager veto and persistence failure with/without a qualitative veto.
 
 The actual coordinator `c791850` config/schema contract was also reloaded from the previously extracted read-only scratch modules: **48 passed in 7.64 s** for `test_agent_desk_invariants.py` and `test_agents_graph.py`, including the persistence-failure legacy export path. Ruff and `git diff --check` pass.
+
+### Prospective consensus history proof (owned follow-on)
+
+`src.agents.history.DeskHistoryStore(Path(config.output_dir) / "desk-history.sqlite3")`
+now records every completed graph even when optional display memory is disabled.
+`export(decision_hash, *, as_of, evidence_store, decision_store, budget_store_path)`
+returns immutable `DeskHistoryReceipt`; `receipt.decision` is the existing
+`AgentDecision` for `consensus_recommendation`. Export only accepts a decision
+identity and reads the authoritative stores. A caller-supplied receipt-shaped
+blob is never an admission input.
+
+The receipt includes measured session start/completion/publication, exact source
+records/document hashes/Unicode spans, complete specialist generation requests
+and reports, pinned/actual models, immutable budget admissions and settlements
+(with verified pricing, caps and run/day usage at admission), all Jev requests,
+results, reuse dependencies, attempts and linked conservative reservations, and
+HMM/portfolio/memory/quantitative input context. Export rechecks every source
+against EvidenceStore, every call against the mutable accounting authority AND
+its immutable settlement, and every Jev record against DecisionStore. It checks
+report-generation linkage and exact quotes before returning the proof.
+
+This is prospective evidence: graph completion/publication use measured UTC
+clock time. Interpreting old text today cannot qualify at an earlier historical
+signal. Old `DeskMemoryStore` rows have no such proof and are rejected; no
+retroactive backfill or supplied publication timestamp is supported. Receipts
+provide evidence for the existing consensus logic, never order authority.
+`AgentCallBudget` now appends immutable admission/settlement records. Jev
+reservations now link to observation ID and attempt. Missing old linkage is
+explicitly ineligible for certification. Unknown usage and interrupted calls
+retain their conservative charges. Report generation requires exact returned
+model identity and known settled usage.
+
+Offline verification: 110 existing service/desk/gateway tests passed in 17.87s;
+9 new authoritative history tests passed in 6.01s, including complete 17-call
+role/debate linkage, as-of exclusion, old-memory rejection, corrupted/missing
+source/model/budget/Jev authorities and immutable triggers. History source tests
+loaded the actual data-lane EvidenceStore read-only while every owned module
+resolved from this worktree. Authenticated provider validation remains unverified.
