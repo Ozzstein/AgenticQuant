@@ -4,7 +4,9 @@ qlib:
   region: us
   dataset: Alpha158
   train_start: "2010-01-01"
-  train_end: "2022-12-31"
+  train_end: "2021-12-31"
+  valid_start: "2022-01-01"
+  valid_end: "2022-12-31"
   test_start: "2023-01-01"
   test_end: "2024-12-31"
 
@@ -22,7 +24,7 @@ crypto:
 models:
   default_model: LightGBM
   topk: 30
-  walk_forward_months: 3
+  walk_forward_months: 6
   embargo_days: 5
   transaction_cost_bps: 10.0
   ensemble_models: ["LightGBM", "XGBoost", "Linear"]
@@ -43,6 +45,8 @@ strategy:
   default_strategy: momentum_topk
 
 rd_agent:
+  min_ic: 0.03
+  min_icir: 0.5
   min_backtest_sharpe: 0.5
 
 alpaca:

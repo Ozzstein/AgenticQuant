@@ -29,26 +29,20 @@ def _reset_config_cache():
 
 
 @pytest.fixture(autouse=True)
-def _cleanup_generated_artifacts():
-    """Remove generated output artifacts that interfere with unit tests."""
-    from pathlib import Path
-    _ARTIFACTS = [
-        Path("outputs/best_model_config.yaml"),
-    ]
-    for p in _ARTIFACTS:
-        p.unlink(missing_ok=True)
-    yield
-    for p in _ARTIFACTS:
-        p.unlink(missing_ok=True)
+def _isolated_output_paths(tmp_path, monkeypatch):
+    """Keep tests away from operating ledgers and promoted model artifacts."""
+    monkeypatch.setenv("AIQUANT_OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setenv("AIQUANT_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AIQUANT_PAPER_LEDGER_PATH", str(tmp_path / "paper.sqlite3"))
 
 
 @pytest.fixture
-def mock_config() -> AppConfig:
+def mock_config(tmp_path) -> AppConfig:
     """Return a test AppConfig with defaults."""
     return AppConfig(
         log_level="DEBUG",
-        output_dir="/tmp/aiquant_test/outputs",
-        log_dir="/tmp/aiquant_test/logs",
+        output_dir=str(tmp_path / "outputs"),
+        log_dir=str(tmp_path / "logs"),
         anthropic_api_key="test-key-123",
         finnhub_api_key="test-finnhub-key",
     )

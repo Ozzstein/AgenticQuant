@@ -1,61 +1,40 @@
-version: '3.8'
+x-runtime: &runtime
+  image: quantagentlab:local
+  build:
+    context: .
+  env_file:
+    - path: config/.env
+      required: false
+  environment:
+    AIQUANT_OUTPUT_DIR: /app/outputs
+    AIQUANT_LOG_DIR: /app/logs
+    AIQUANT_PAPER_LEDGER_PATH: /app/outputs/paper-ledger.sqlite3
+    AIQUANT_PAPER_ACCOUNT_ID: ${AIQUANT_PAPER_ACCOUNT_ID:-paper:default}
+    AIQUANT_PAPER_BASE_CURRENCY: ${AIQUANT_PAPER_BASE_CURRENCY:-USD}
+  volumes:
+    - data:/app/data
+    - outputs:/app/outputs
+    - logs:/app/logs
 
 services:
-  app:
-    image: aiquant:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: aiquant-app
-    environment:
-      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
-      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
-      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
-      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
-    env_file: .env
-    volumes:
-      - qlib_data:/app/data/qlib_data
-      - ./outputs:/app/outputs
-      - ./logs:/app/logs
-    depends_on:
-      - scheduler
-    restart: unless-stopped
-    command: python scripts/run_pipeline.py --mode paper
-
   scheduler:
-    image: aiquant:latest
-    container_name: aiquant-scheduler
-    environment:
-      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
-      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
-      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
-      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
-    env_file: .env
-    volumes:
-      - qlib_data:/app/data/qlib_data
-      - ./outputs:/app/outputs
-      - ./logs:/app/logs
+    <<: *runtime
     restart: unless-stopped
-    command: python src/scheduler.py --loop
+    command: ["python", "-m", "src.scheduler", "--loop"]
+
+  app:
+    <<: *runtime
+    profiles: ["manual"]
+    command: ["python", "scripts/run_pipeline.py", "run", "--mode", "paper"]
 
   dashboard:
-    image: aiquant:latest
-    container_name: aiquant-dashboard
-    environment:
-      - AIQUANT_ANTHROPIC_API_KEY=${AIQUANT_ANTHROPIC_API_KEY}
-      - AIQUANT_FINNHUB_KEY=${AIQUANT_FINNHUB_KEY}
-      - AIQUANT_TELEGRAM_TOKEN=${AIQUANT_TELEGRAM_TOKEN}
-      - AIQUANT_TELEGRAM_CHAT_ID=${AIQUANT_TELEGRAM_CHAT_ID}
-    env_file: .env
-    ports:
-      - "8501:8501"
-    volumes:
-      - qlib_data:/app/data/qlib_data
-      - ./outputs:/app/outputs
-      - ./logs:/app/logs
+    <<: *runtime
     restart: unless-stopped
-    command: streamlit run src/dashboard.py --server.port 8501 --server.headless true
+    ports:
+      - "127.0.0.1:8501:8501"
+    command: ["streamlit", "run", "src/dashboard.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.headless", "true"]
 
 volumes:
-  qlib_data:
-    driver: local
+  data:
+  outputs:
+  logs:

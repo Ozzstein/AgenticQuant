@@ -1,0 +1,40 @@
+name: Reproducible checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONHASHSEED: "0"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.18"
+          enable-cache: true
+      - run: uv sync --locked --extra dev --extra dashboard --extra alpaca --extra qlib
+      - run: uv pip check
+      - run: uv run --locked --no-sync ruff check src scripts
+      - run: uv run --locked --no-sync python scripts/check_environment.py
+      - run: uv run --locked --no-sync pytest tests/ -m 'not integration' --disable-socket
+      - run: uv build
+
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build --tag quantagentlab:ci .
+      - run: docker run --rm quantagentlab:ci python scripts/check_environment.py
+      - run: docker run --rm quantagentlab:ci aiquant --help
+      - run: docker compose config --quiet

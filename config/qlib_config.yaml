@@ -4,12 +4,12 @@ qlib:
   region: us
   dataset: Alpha158
   train_start: "2010-01-01"
-  train_end: "2022-12-31"
+  train_end: "2021-12-31"
   valid_start: "2022-01-01"
   valid_end: "2022-12-31"
   test_start: "2023-01-01"
   test_end: "2024-12-31"
-  universe: csi300
+  universe: us_all
   model_name: LightGBM
   model_params:
     n_estimators: 500
@@ -22,13 +22,13 @@ qlib:
   cost_fixed: 0
   cost_rate: 0.0002
 
-rdagent:
+rd_agent:
   enabled: false
   factor_library_dir: outputs/factor_library
   best_model_config_path: outputs/best_model_config.yaml
   factor_iterations: 50
-  min_ic: 0.02
-  min_icir: 0.3
+  min_ic: 0.03
+  min_icir: 0.5
   budget: 10
   model_iterations: 20
   schedule: weekly

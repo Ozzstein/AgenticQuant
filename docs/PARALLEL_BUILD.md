@@ -2,6 +2,15 @@
 
 Started: 2026-10-27. Coordinator thread: `67e24814-0156-42fb-8442-ebe1563b1d38`.
 
+Active isolated worktrees (base checkpoint `6844b89`):
+
+| Thread | Branch | Stable deliveries integrated by coordinator |
+|---|---|---|
+| `mcp:4cdc3e7e-410b-476a-96ab-11c9a386f3d5` | `build/accounting-backtesting` | `693c768` → `db05c24`: portfolio contracts, ledger, paper execution |
+| `mcp:c6065855-9311-421f-94df-3e66d1cda3f1` | `build/data-quant` | `67c5086` → `717c908`: market contracts and evidence store |
+| `mcp:8f3ff1c4-5616-4111-a59d-9a3821348bb0` | `build/jev-agents` | `4cac664` → `575d1dc`: decision and agent-action contracts |
+| Coordinator | `build/full-system` | Integration, configuration, reproducibility, research and operation |
+
 The [full system build plan](FULL_SYSTEM_BUILD_PLAN.md) is the completion authority. Read the [verified assessment](BRIEF_ASSESSMENT_AND_PLAN.md), [MCP decision](MCP_INTEGRATION_DECISION.md), and [Jev decision](JEV_INTEGRATION_DECISION.md) before implementation. Intermediate deliveries are integration checkpoints, not reduced releases. No mocks, invented metrics, or silent feature substitution may satisfy a runtime requirement.
 
 ## Ownership

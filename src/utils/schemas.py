@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.domain.decisions import AgentDecision
+
 # --- Enums ---
 
 
@@ -72,6 +74,7 @@ class AgentReport(BaseModel):
     agent_name: str
     decision: Decision
     confidence: float = Field(ge=0, le=100, description="Confidence 0-100")
+    confidence_semantics: Literal["legacy_unvalidated"] = "legacy_unvalidated"
     reasoning: str
     data_points: dict[str, str | float | int | bool | None] = Field(default_factory=dict)
 
@@ -79,6 +82,9 @@ class AgentReport(BaseModel):
 class AnalysisResult(BaseModel):
     """Complete multi-agent analysis output."""
 
+    schema_version: Literal["2.0"] = "2.0"
+    agent_decision: AgentDecision | None = None
+    confidence_semantics: Literal["legacy_unvalidated"] = "legacy_unvalidated"
     ticker: str
     asset_class: AssetClass = AssetClass.EQUITY
     decision: Decision

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, EnvSettingsSource
+
+from src.domain.common import NonEmptyString, UtcTimestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -18,7 +22,7 @@ class QlibConfig(BaseModel):
     region: str = "us"
     dataset: str = "Alpha158"
     train_start: str = "2010-01-01"
-    train_end: str = "2022-12-31"
+    train_end: str = "2021-12-31"
     valid_start: str = "2022-01-01"
     valid_end: str = "2022-12-31"
     test_start: str = "2023-01-01"
@@ -34,6 +38,30 @@ class QlibConfig(BaseModel):
     cost_fixed: float = 0.0
     cost_rate: float = 0.0002
 
+    @model_validator(mode="after")
+    def chronological_segments(self) -> QlibConfig:
+        """Reject overlapping or inverted inclusive research segments."""
+        boundaries = [date.fromisoformat(getattr(self, name)) for name in (
+            "train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"
+        )]
+        train_start, train_end, valid_start, valid_end, test_start, test_end = boundaries
+        if not train_start <= train_end < valid_start <= valid_end < test_start <= test_end:
+            raise ValueError("Qlib train, validation and test segments must be ordered and disjoint")
+        return self
+
+
+class ModelPricing(BaseModel):
+    """Explicit versioned model rates; absence is not free inference."""
+
+    model_config = {"extra": "forbid", "frozen": True, "allow_inf_nan": False}
+    provider: NonEmptyString
+    model: NonEmptyString
+    price_version: NonEmptyString
+    source_uri: NonEmptyString
+    effective_at: UtcTimestamp
+    input_usd_per_million: Decimal = Field(ge=0)
+    output_usd_per_million: Decimal = Field(ge=0)
+
 
 class AgentConfig(BaseModel):
     llm_provider: str = "anthropic"
@@ -42,6 +70,7 @@ class AgentConfig(BaseModel):
     quick_think_model: str = "claude-haiku-4-5-20251001"
     temperature: float = 0.2
     max_tokens: int = 4096
+    analysis_timeout_seconds: float = Field(default=180.0, gt=0)
     max_debate_rounds: int = 2
     debate_confidence_threshold: float = 20.0
     debate_trigger_spread: float = 40.0
@@ -57,7 +86,14 @@ class AgentConfig(BaseModel):
     risk_manager_enabled: bool = True
     strategist_enabled: bool = True
     # Cost controls
-    max_cost_per_analysis: float = 0.50
+    max_cost_per_analysis: float = Field(default=0.50, gt=0)
+    pricing: list[ModelPricing] = Field(default_factory=list)
+    budget_store_path: str = ""
+    max_cost_per_day_usd: Decimal = Field(default=Decimal("10"), gt=0)
+    max_requests_per_analysis: int = Field(default=30, gt=0)
+    max_requests_per_day: int = Field(default=600, gt=0)
+    max_tokens_per_analysis: int = Field(default=100_000, gt=0)
+    max_tokens_per_day: int = Field(default=1_000_000, gt=0)
     cache_ttl_seconds: int = 3600
     tools_enabled: list[str] = Field(default_factory=lambda: [
         "get_stock_price", "get_stock_history", "get_financials",
@@ -107,8 +143,8 @@ class MonitoringConfig(BaseModel):
 class ModelConfig(BaseModel):
     default_model: str = "LightGBM"
     topk: int = 30
-    walk_forward_months: int = 3
-    embargo_days: int = 5
+    walk_forward_months: int = Field(default=6, ge=1)
+    embargo_days: int = Field(default=5, ge=0)
     transaction_cost_bps: float = 10.0
     retrain_frequency: str = "monthly"
     ensemble_models: list[str] = Field(
@@ -216,6 +252,9 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"
     output_dir: str = str(PROJECT_ROOT / "outputs")
     log_dir: str = str(PROJECT_ROOT / "logs")
+    paper_ledger_path: str = ""
+    paper_account_id: str = Field(default="paper:default", min_length=1)
+    paper_base_currency: str = Field(default="USD", pattern=r"^[A-Z]{3,10}$")
 
     anthropic_api_key: str = ""
     openai_api_key: str = ""
@@ -237,6 +276,19 @@ class AppConfig(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     intraday: IntradayConfig = Field(default_factory=IntradayConfig)
 
+    @model_validator(mode="after")
+    def persistent_paper_account(self) -> AppConfig:
+        """Derive the ledger location after resolving the output directory."""
+        if not self.paper_ledger_path:
+            self.paper_ledger_path = str(Path(self.output_dir) / "paper-ledger.sqlite3")
+        if not self.agents.budget_store_path:
+            self.agents.budget_store_path = str(Path(self.output_dir) / "agent-budgets.sqlite3")
+        if self.paper_ledger_path == ":memory:" or not self.paper_ledger_path.strip():
+            raise ValueError("paper_ledger_path must identify a persistent database")
+        if not self.paper_account_id.strip():
+            raise ValueError("paper_account_id must not be blank")
+        return self
+
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
@@ -251,7 +303,10 @@ def _load_yaml_config(path: Path) -> dict[str, Any]:
     """Load configuration from YAML file if it exists."""
     if path.exists():
         with open(path) as f:
-            return yaml.safe_load(f) or {}
+            result = yaml.safe_load(f) or {}
+        if not isinstance(result, dict):
+            raise ValueError(f"Configuration must be a YAML mapping: {path}")
+        return result
     return {}
 
 
@@ -262,20 +317,47 @@ def _load_dotenv(path: Path) -> None:
         load_dotenv(path)
 
 
-@lru_cache(maxsize=1)
-def get_config() -> AppConfig:
-    """Get singleton application config. Reads settings.yaml + .env, then env vars."""
+SettingsType = TypeVar("SettingsType", bound=AppConfig)
+
+
+def _merge_settings(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_settings(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_settings(settings_type: type[SettingsType]) -> SettingsType:
+    """Resolve defaults < YAML < dotenv < process environment for either schema.
+
+    Passing YAML as BaseSettings constructor arguments would give it precedence
+    over environment variables. Resolve environment overrides explicitly first,
+    recursively preserving unaffected YAML fields in nested configuration.
+    """
     config_dir = PROJECT_ROOT / "config"
     _load_dotenv(config_dir / ".env")
-
     yaml_data = _load_yaml_config(config_dir / "settings.yaml")
-    # Strip keys unknown to AppConfig so rd_agent (and any future FullAppConfig-only
-    # sections) do not cause extra-field validation errors.
-    known_fields = set(AppConfig.model_fields)
+    known_fields = set(settings_type.model_fields)
     yaml_data = {k: v for k, v in yaml_data.items() if k in known_fields}
-    return AppConfig(**yaml_data)
+    overrides = EnvSettingsSource(settings_type)()
+    return settings_type(**_merge_settings(yaml_data, overrides))
+
+
+@lru_cache(maxsize=1)
+def get_config() -> AppConfig:
+    """Get singleton application configuration with environment overrides."""
+    return load_settings(AppConfig)
 
 
 def reset_config() -> None:
     """Clear cached config (for testing)."""
     get_config.cache_clear()
+    # Avoid importing the extended loader while it is importing this module.
+    import sys
+
+    extended = sys.modules.get("src.utils.config_loader")
+    if extended is not None and hasattr(extended, "get_full_config"):
+        extended.get_full_config.cache_clear()

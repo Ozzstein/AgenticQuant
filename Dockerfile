@@ -1,60 +1,31 @@
-# Multi-stage build for QuantAgentLab
-FROM python:3.11-slim as builder
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
+# syntax=docker/dockerfile:1
+FROM ghcr.io/astral-sh/uv:0.12.18 AS uv
+FROM python:3.11.16-slim-bookworm AS builder
+COPY --from=uv /uv /uvx /bin/
 WORKDIR /app
-
-# Copy pyproject.toml first for better layer caching
-COPY pyproject.toml .
-
-# Install Python dependencies
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install -e ".[dev]"
-
-# Final stage
-FROM python:3.11-slim
-
-# Install runtime system dependencies (minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+ENV UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user and set up /app directory
-RUN useradd --create-home --shell /bin/bash appuser && \
-    mkdir -p /app && \
-    chown appuser:appuser /app
-
-WORKDIR /app
-
-# Copy Python dependencies from builder stage
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Switch to non-root user
-USER appuser
-
-# Copy application code
+COPY pyproject.toml uv.lock .python-version ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-install-project --no-dev --extra dashboard --extra alpaca --extra qlib
 COPY src/ src/
-COPY scripts/ scripts/
-COPY config/ config/
-COPY lean/ lean/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-editable --no-dev --extra dashboard --extra alpaca --extra qlib
 
-# Create necessary directories for logs and outputs
-RUN mkdir -p logs outputs data/qlib_data
-
-# Expose port for Streamlit dashboard
+FROM python:3.11.16-slim-bookworm AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data /app/outputs /app/logs \
+    && chown -R appuser:appuser /app
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY --chown=appuser:appuser src/ src/
+COPY --chown=appuser:appuser scripts/ scripts/
+COPY --chown=appuser:appuser config/ config/
+COPY --chown=appuser:appuser lean/ lean/
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH="/app/.venv/bin:$PATH"
+USER appuser
 EXPOSE 8501
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/usr/local/bin:$PATH"
-
-# Default command: run paper trading pipeline
-CMD ["python", "scripts/run_pipeline.py", "--mode", "paper"]
+CMD ["python", "scripts/run_pipeline.py", "run", "--mode", "paper"]

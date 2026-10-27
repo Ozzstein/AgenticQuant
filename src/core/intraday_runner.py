@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from loguru import logger
 
 from src.utils.config import AppConfig
-from src.utils.schemas import IntradayRunResult, OrderSide, Signal, SignalDirection
-
+from src.utils.schemas import IntradayRunResult, Signal, SignalDirection
 
 _TIMEFRAME_MAP: dict[int, str] = {
     60: "1h",
