@@ -47,7 +47,13 @@ class ReadHTTP:
         if self._owned_client:
             self.client.close()
 
-    def get(self, path: str, *, params: dict | None = None, headers: dict | None = None) -> bytes:
+    def get(self, path: str, *, params: dict | None = None, headers: dict | None = None,
+            allowed_error_statuses: tuple[int, ...] = ()) -> bytes:
+        # A closed adapter may archive a documented native error as evidence
+        # (e.g. Binance -2043). Authentication/entitlement/rate failures cannot
+        # be turned into successful source reads by this opt-in.
+        if any(type(status) is not int or status not in (400, 404) for status in allowed_error_statuses):
+            raise ValueError("only explicit native client-error bodies may be archived")
         if not path.startswith("/") or path.startswith("//") or ".." in path or "?" in path:
             raise ProviderError(self.provider, "invalid_path")
         for attempt in range(self.attempts):
@@ -65,7 +71,7 @@ class ReadHTTP:
                     raise ProviderError(self.provider, "transport_unavailable") from None
             else:
                 status = response.status_code
-                if 200 <= status < 300:
+                if 200 <= status < 300 or status in allowed_error_statuses:
                     return response.content
                 if status not in (429, 500, 502, 503, 504):
                     code = "credentials_missing_or_rejected" if status == 401 else "entitlement_or_access_denied" if status == 403 else "http_failure"

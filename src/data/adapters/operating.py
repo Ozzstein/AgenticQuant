@@ -117,9 +117,24 @@ class OperatingCapture:
         return now
 
     def wire(
-        self, http: ReadHTTP, path, context, *, upstream, params=None, headers=None, instrument=None
+        self,
+        http: ReadHTTP,
+        path,
+        context,
+        *,
+        upstream,
+        params=None,
+        headers=None,
+        instrument=None,
+        allowed_error_statuses=(),
+        timestamp_unit=None,
     ):
-        raw = http.get(path, params=params, headers=headers)
+        options = (
+            {"allowed_error_statuses": tuple(allowed_error_statuses)}
+            if allowed_error_statuses
+            else {}
+        )
+        raw = http.get(path, params=params, headers=headers, **options)
         observed = self.now()  # After the blocking request, before any normalization.
         safe = {
             k: v
@@ -131,7 +146,25 @@ class OperatingCapture:
             raw=raw,
             normalized={
                 "upstream": upstream,
-                "request": {"path": path, "params": safe},
+                "request": {
+                    "path": path,
+                    "params": safe,
+                    **(
+                        {
+                            "timestamp_unit": timestamp_unit,
+                            "time_unit_header": next(
+                                (
+                                    v
+                                    for k, v in (headers or {}).items()
+                                    if k.lower() == "x-mbx-time-unit"
+                                ),
+                                None,
+                            ),
+                        }
+                        if timestamp_unit is not None
+                        else {}
+                    ),
+                },
                 "wire_hash": digest(raw),
             },
             provider="operating",
@@ -940,7 +973,9 @@ class _CryptoOperatingAdapter(OperatingCapture):
         )
         return self.result([proof])
 
-    def _reference(self, instrument, context, wire, market, bar_ids, *, fx_evidence_id=None):
+    def _reference(
+        self, instrument, context, wire, market, bar_ids, *, fx_evidence_id=None, extra_sources=()
+    ):
         from src.domain.portfolio import InstrumentRisk
         from src.execution.venue import VenueRules
 
@@ -959,8 +994,8 @@ class _CryptoOperatingAdapter(OperatingCapture):
                 sector="crypto",
                 adv_base=adv * fx,
                 as_of=captured,
-                lot_size=market["step"],
-                min_notional=market["minimum_notional"],
+                lot_size=market.get("risk_step", market["step"]),
+                min_notional=market["minimum_notional"] * fx,
             )
             rules = VenueRules(
                 venue="paper",
@@ -976,6 +1011,7 @@ class _CryptoOperatingAdapter(OperatingCapture):
                 time_in_force=("GTC",),
                 market_type="spot",
                 active=market["active"],
+                **market.get("rules_extra", {}),
             )
             return dict(
                 instrument=instrument.model_dump(mode="json"),
@@ -986,18 +1022,23 @@ class _CryptoOperatingAdapter(OperatingCapture):
                 adv_sessions=sorted(wanted),
                 adv_convention="mean-of-20-completed-UTC-day-quote-turnover-times-observed-FX",
                 sector_convention="declared-crypto-asset-class-risk-group",
-                rule_policy="paper-market-only-native-spot-increments-1",
+                rule_policy=market.get("rule_policy", "paper-market-only-native-spot-increments-1"),
+                **(
+                    {"native_filters": market["native_filters"]}
+                    if "native_filters" in market
+                    else {}
+                ),
             )
 
         proof = self.derived(
             context,
-            [wire, *bar_sources, *fx_sources],
+            [wire, *extra_sources, *bar_sources, *fx_sources],
             normalized,
             kind="operating_reference",
             logical_key=instrument.instrument_id,
             instrument=instrument,
         )
-        return self.result([wire, proof])
+        return self.result([wire, *extra_sources, proof])
 
 
 class KrakenOperatingAdapter(_CryptoOperatingAdapter):
@@ -1206,6 +1247,47 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
             _fail("canonical_binance_spot_symbol_required")
         return instrument.symbol.replace("/", "")
 
+    def _notional_sources(self, instrument, context, average_minutes):
+        from src.data.binance_reference import parse_binance_notional_reference
+
+        symbol = self._symbol(instrument)
+
+        def fetch(operation, params):
+            return self.wire(
+                self.http,
+                "/api/v3/" + operation,
+                context,
+                upstream="binance-spot-v3",
+                params=params,
+                instrument=instrument,
+                timestamp_unit="MILLISECOND",
+                allowed_error_statuses=(400,) if operation == "referencePrice" else (),
+            )
+
+        source, value = fetch("referencePrice", {"symbol": symbol})
+        sources = [source]
+        ids = {}
+        if isinstance(value, dict) and (
+            value.get("referencePrice", object()) is None or value.get("code") == -2043
+        ):
+            operation = "avgPrice" if average_minutes else "trades"
+            params = {"symbol": symbol, **({} if average_minutes else {"limit": 1})}
+            fallback, _ = fetch(operation, params)
+            sources.append(fallback)
+            ids["average_evidence_id" if average_minutes else "last_trade_evidence_id"] = (
+                fallback.record.evidence_id
+            )
+        actual = context.model_copy(update={"as_of": self.now()})
+        reference = parse_binance_notional_reference(
+            self.store,
+            instrument,
+            actual,
+            reference_evidence_id=source.record.evidence_id,
+            average_minutes=average_minutes,
+            **ids,
+        )
+        return reference, sources
+
     @_operation
     def reference(self, instrument, context, *, bar_ids, fx_evidence_id=None):
         _crypto_identity(instrument, self.venue)
@@ -1224,41 +1306,91 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
         ):
             _fail("binance_spot_identity_mismatch")
         filters = {f["filterType"]: f for f in row["filters"]}
-        maximum_notional = filters.get("NOTIONAL", {})
-        if (
-            maximum_notional.get("applyMaxToMarket") is True
-            and _decimal(maximum_notional.get("maxNotional"), positive=False) > 0
-        ):
-            _fail("unsupported_market_maximum_notional_wire_archived")
+        if len(filters) != len(row["filters"]):
+            _fail("conflicting_duplicate_binance_filters")
         lot = filters["LOT_SIZE"]
-        market_lot = filters.get("MARKET_LOT_SIZE", lot)
+        market_lot = filters.get("MARKET_LOT_SIZE", dict(stepSize="0", minQty="0", maxQty="0"))
         step = _decimal(lot["stepSize"])
         extra = _decimal(market_lot["stepSize"], positive=False)
-        if extra and (max(step, extra) % min(step, extra)) != 0:
-            _fail("incompatible_market_quantity_steps")
-        step = max(step, extra)
-        notionals = []
-        for name, flag in [("MIN_NOTIONAL", "applyToMarket"), ("NOTIONAL", "applyMinToMarket")]:
-            if name in filters and filters[name].get(flag) is True:
-                notionals.append(_decimal(filters[name]["minNotional"]))
-        if not notionals:
-            _fail("market_minimum_notional_coverage_missing")
-        maximums = [
-            _decimal(f["maxQty"])
-            for f in (lot, market_lot)
-            if _decimal(f["maxQty"], positive=False) > 0
-        ]
+        from decimal import localcontext
+        from math import lcm
+
+        exponent = (
+            min(step.as_tuple().exponent, extra.as_tuple().exponent)
+            if extra
+            else step.as_tuple().exponent
+        )
+        with localcontext() as arithmetic:
+            arithmetic.prec = max(
+                40, len(step.as_tuple().digits) + len(extra.as_tuple().digits) + abs(exponent) + 4
+            )
+            unit = Decimal(10) ** exponent
+            risk_step = Decimal(lcm(int(step / unit), int(extra / unit))) * unit if extra else step
+        notionals, windows, maxima = [], set(), []
+        for name in ("MIN_NOTIONAL", "NOTIONAL"):
+            if name not in filters:
+                continue
+            native = filters[name]
+            flags = (
+                ("applyToMarket",)
+                if name == "MIN_NOTIONAL"
+                else ("applyMinToMarket", "applyMaxToMarket")
+            )
+            if (
+                any(type(native.get(flag)) is not bool for flag in flags)
+                or type(native.get("avgPriceMins")) is not int
+                or native["avgPriceMins"] < 0
+            ):
+                _fail("native_notional_applicability_or_window_missing")
+            if native[flags[0]]:
+                minimum = _decimal(native["minNotional"], positive=False)
+                if minimum:
+                    notionals.append(minimum)
+                    windows.add(native["avgPriceMins"])
+            if name == "NOTIONAL" and native["applyMaxToMarket"]:
+                maxima.append(_decimal(native["maxNotional"]))
+                windows.add(native["avgPriceMins"])
+        if len(windows) > 1:
+            _fail("independent_native_notional_windows_not_representable")
+        reference, sources = (None, [])
+        if windows:
+            reference, sources = self._notional_sources(instrument, context, next(iter(windows)))
+        price_filter = filters["PRICE_FILTER"]
+
+        def optional(value):
+            return _decimal(value, positive=False) or None
+
+        extras = dict(
+            maximum_notional=min(maxima) if maxima else None,
+            market_notional_average_minutes=next(iter(windows)) if windows else None,
+            market_notional_reference=reference,
+            minimum_price=optional(price_filter["minPrice"]),
+            maximum_price=optional(price_filter["maxPrice"]),
+            market_quantity_step=extra or None,
+            market_minimum_quantity=optional(market_lot["minQty"]),
+            market_maximum_quantity=optional(market_lot["maxQty"]),
+        )
         market = dict(
             id=symbol,
             step=step,
-            tick=_decimal(filters["PRICE_FILTER"]["tickSize"]),
-            minimum_quantity=max(_decimal(f["minQty"], positive=False) for f in (lot, market_lot)),
-            maximum_quantity=min(maximums) if maximums else None,
-            minimum_notional=max(notionals),
+            risk_step=risk_step,
+            tick=_decimal(price_filter["tickSize"]),
+            minimum_quantity=_decimal(lot["minQty"], positive=False),
+            maximum_quantity=optional(lot["maxQty"]),
+            minimum_notional=max(notionals) if notionals else Decimal(0),
             active=row.get("status") == "TRADING",
+            rules_extra=extras,
+            native_filters=row["filters"],
+            rule_policy="paper-market-only-lot-price-notional-intersection-1",
         )
         return self._reference(
-            instrument, context, wire, market, bar_ids, fx_evidence_id=fx_evidence_id
+            instrument,
+            context,
+            wire,
+            market,
+            bar_ids,
+            fx_evidence_id=fx_evidence_id,
+            extra_sources=sources,
         )
 
     @_operation

@@ -685,8 +685,18 @@ def crypto_capture(tmp_path, request):
                         filterType="LOT_SIZE", minQty="0.00001", maxQty="1000", stepSize="0.00001"
                     ),
                     dict(filterType="MARKET_LOT_SIZE", minQty="0", maxQty="500", stepSize="0"),
-                    dict(filterType="PRICE_FILTER", tickSize="0.01"),
-                    dict(filterType="MIN_NOTIONAL", minNotional="5", applyToMarket=True),
+                    dict(
+                        filterType="PRICE_FILTER",
+                        tickSize="0.01",
+                        minPrice="0.01",
+                        maxPrice="1000000",
+                    ),
+                    dict(
+                        filterType="MIN_NOTIONAL",
+                        minNotional="5",
+                        applyToMarket=True,
+                        avgPriceMins=5,
+                    ),
                 ],
             )
             if state["market_error"]:
@@ -699,10 +709,54 @@ def crypto_capture(tmp_path, request):
                         maxNotional="100",
                         applyMinToMarket=True,
                         minNotional="5",
+                        avgPriceMins=5,
                     )
                 )
+            for native in row["filters"]:
+                native.update(state.get("filter_changes", {}).get(native["filterType"], {}))
+                if state.get("omit_window") and "avgPriceMins" in native:
+                    native.pop("avgPriceMins")
+            row["filters"] = [
+                native
+                for native in row["filters"]
+                if native["filterType"] not in state.get("omit_filters", ())
+            ]
             return httpx.Response(200, json={"symbols": [row]})
+        if path == "/api/v3/referencePrice":
+            if state.get("reference_error"):
+                return httpx.Response(
+                    400, json={"code": state["reference_error"], "msg": "native error"}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "symbol": "BTCUSDT",
+                    "referencePrice": state.get("reference_price", "110.123456789123456789"),
+                    "timestamp": int((clock() - timedelta(seconds=1)).timestamp() * 1000),
+                },
+            )
+        if path == "/api/v3/avgPrice":
+            return httpx.Response(
+                200,
+                json={
+                    "mins": state.get("average_mins", 5),
+                    "price": "109.123456789123456789",
+                    "closeTime": int((clock() - timedelta(seconds=1)).timestamp() * 1000),
+                },
+            )
         if path == "/api/v3/trades":
+            if r.url.params.get("limit") == "1":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": 9007199254740993123,
+                            "time": int((clock() - timedelta(seconds=1)).timestamp() * 1000),
+                            "price": "108.123456789123456789",
+                            "qty": ".1",
+                        }
+                    ],
+                )
             events = [
                 dict(
                     id=9007199254740993122,
@@ -730,6 +784,8 @@ def crypto_capture(tmp_path, request):
         raise AssertionError(path)
 
     http, requests = transport(clock, handler)
+    if venue == "binance":
+        http.base_url = "https://api.binance.com"
     adapter = (KrakenOperatingAdapter if venue == "kraken" else BinanceOperatingAdapter)(
         store, http=http, clock=clock
     )
@@ -801,7 +857,9 @@ def test_crypto_exact_turnover_limits_individual_print_size_and_wire_ids(crypto_
     assert len(f.bar_ids) == 20
     if f.venue == "binance":
         rules = read(f.store, f.reference, f.clock)["venue_rules"][0]
-        assert rules["quantity_step"] == "0.00001" and rules["maximum_quantity"] == "500"
+        assert rules["quantity_step"] == "0.00001" and rules["maximum_quantity"] == "1000"
+        assert rules["market_maximum_quantity"] == "500"
+        assert rules["market_notional_reference"]["kind"] == "venue-reference"
     f.clock.at = datetime(2024, 3, 22, 0, 8, tzinfo=UTC)
     req = context(datetime(2024, 3, 22, 0, 7, tzinfo=UTC))
     result = f.adapter.trades(
@@ -1138,10 +1196,32 @@ def test_v1_capture_readability_and_mixed_format_rejection(equity_capture):
 
 
 @pytest.mark.parametrize("crypto_capture", ["binance"], indirect=True)
-def test_unsupported_actual_market_maximum_is_archived_and_blocks_reference(crypto_capture):
+def test_actual_market_maximum_uses_authenticated_native_price(crypto_capture):
+    from src.domain.portfolio import OrderIntent
+    from src.execution.ledger import LedgerError
+    from src.execution.venue import VenueRules
+
     f = crypto_capture
     f.state["maximum_notional"] = True
-    with pytest.raises(ProviderError, match="unsupported_market_maximum_notional_wire_archived"):
-        f.adapter.reference(
-            f.instrument, f.req, bar_ids=f.bar_ids, fx_evidence_id=f.fx.record.evidence_id
-        )
+    result = f.adapter.reference(
+        f.instrument, f.req, bar_ids=f.bar_ids, fx_evidence_id=f.fx.record.evidence_id
+    )
+    value = read(f.store, primary(result, "operating_reference"), f.clock)
+    rules = VenueRules.model_validate(value["venue_rules"][0])
+    assert rules.maximum_notional == 100
+    assert rules.market_notional_average_minutes == 5
+    order = OrderIntent(
+        intent_id="native-cap",
+        account_id="paper:fixture",
+        run_id="native-test",
+        instrument=f.instrument,
+        side="buy",
+        quantity=1,
+        decision_at=f.clock(),
+        eligible_at=f.clock() + timedelta(microseconds=1),
+        reference_price=1,
+        strategy_id="test",
+    )
+    with pytest.raises(LedgerError, match="maximum quote notional"):
+        rules.require_order(order, f.clock())
+    rules.require_order(order.model_copy(update={"quantity": Decimal(".5")}), f.clock())
