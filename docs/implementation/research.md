@@ -38,6 +38,53 @@ Native admission additionally requires explicit `gateway_limits` and `gateway_da
 
 Observed coordinator checks: 77 offline checkpoint integration tests passed (actual strategies/models/replay, text availability, venue recovery and desk boundaries); 72 migrated research/native/canonical CLI/regime tests passed; 32 subsequent registry/source-proof/native tests passed and cover value substitution, restricted development access, renamed-family multiplicity and changed-context holdout reuse. Wheel build succeeded and contains all six strategy JSON specifications, the native source pin manifest and canonical CLI scripts. These are software/invariant checks, not historical profitability, authenticated vendor, venue or prospective trading acceptance.
 
+## Managed native gateway lifecycle
+
+`GatewayDeployment` binds the complete `GatewayConfig`, a digest-pinned image,
+loopback receipt port, external bridge network, memory limit and startup deadline.
+Its container budget path is exactly `/state/budgets.sqlite3`. The gateway uses a
+private internal network with alias `gateway`; only the gateway also joins the
+external bridge. Native generated code receives a run bearer and has no provider
+key mount or external network. Both images must include the current runtime code.
+
+```bash
+python -m scripts.run_rd_agent managed-native \
+  --request native-request.json --deployment gateway-deployment.json \
+  --provider-key-file /private/keys/research-provider \
+  --gateway-state /private/quantagent-gateways --workdir /work/quantagent-jobs
+```
+
+`gateway-start` and `gateway-stop` expose the same explicit lifecycle for operator
+reconciliation. Each accepts `--deployment` and `--gateway-state`; start also
+requires `--provider-key-file`. Files contain no credential fields. The provider
+file must be an owned ordinary file with mode 0600 or stricter; symlinks fail.
+The private state directory must have mode 0700. No credential is passed in
+Docker arguments or container configuration. The container entrypoint loads
+private files into the gateway process only and stops it at the immutable expiry.
+
+Every run in one gateway state directory shares the same budget database and
+immutable daily cap policy. Restart preserves the run bearer, original full
+configuration, reserved/unknown charges and actual usage. Starting a new run does
+not reset daily spending. The manager checks the exact image, entrypoint, mounts,
+permissions, published address and network attachments before reusing a container.
+Job, Qlib and document mounts must be disjoint from the private gateway state tree.
+The manager always attempts to stop its exact owned container after a managed job;
+a cleanup failure is recorded without replacing the original execution error.
+
+The container-local watchdog enforces elapsed time and counted output bytes,
+including child stdout/stderr, even if the host Docker client dies. Admission,
+scenario and request files are read-only mounts. Completed native runs persist a
+final authenticated gateway receipt with actual/reserved/unknown usage; missing
+or inconsistent final evidence produces `audit_unavailable`, never a successful
+discovery record. Outputs remain quarantined regardless of native exit status.
+
+Verification: 93 offline tests passed across gateway deployment, native adapter,
+gateway protocol/budgets and research CLI. Tests exercise real local child process
+timeouts/output bounds, actual shared SQLite admission across runs, immutable
+restart, mount/network drift and failure cleanup; Docker uses explicit boundary
+fixtures. Docker execution, native workflow acceptance and authenticated provider
+usage remain unverified on this host because the Docker engine is unavailable.
+
 ## Registered strategy, paired regime and copilot integration
 
 `rd-agent register --kind strategy|regime` parses the owned `StrategyExperimentPlan` or `RegimeExperimentPlan`. Actual fresh models, frozen contextual evidence, causal HMM observations and holdings-aware callbacks feed the same ledger engine. `ResearchRunner` binds the callback benchmark to the original ledger through `ledger_path`, preserves the opportunity artifact, and supplies durable cost artifacts to evaluation.

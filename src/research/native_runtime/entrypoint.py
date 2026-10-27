@@ -11,7 +11,7 @@ from pathlib import Path
 from src.research.native_runtime.overlay import prepare_overlay
 
 
-def main():
+def worker():
     if not Path('/.dockerenv').exists() or os.environ.get('QUANTAGENT_NATIVE_SANDBOX') != '1':
         raise RuntimeError('native RD entrypoint requires the isolated supervisor container')
     work = Path('/work')
@@ -79,6 +79,21 @@ def main():
     health.test_embedding = checked(health.test_embedding)
     sys.argv = ['rdagent', *request['native_args']]
     runpy.run_module('rdagent.app.cli', run_name='__main__')
+
+
+def main():
+    if not Path('/.dockerenv').exists() or os.environ.get('QUANTAGENT_NATIVE_SANDBOX') != '1':
+        raise RuntimeError('native RD entrypoint requires the isolated supervisor container')
+    if sys.argv[1:] == ['--worker']:
+        return worker()
+    if sys.argv[1:]:
+        raise ValueError('unexpected native entrypoint arguments')
+    from src.research.native_runtime.watchdog import supervise
+    work = Path('/work')
+    request = json.loads((work/'request.json').read_text())
+    result = supervise([sys.executable, '-m', 'src.research.native_runtime.entrypoint', '--worker'],
+                       work, max_seconds=request['max_seconds'], max_output_bytes=request['max_output_bytes'])
+    raise SystemExit(result['exit_code'])
 
 
 if __name__ == '__main__':

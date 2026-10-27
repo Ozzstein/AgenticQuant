@@ -111,14 +111,7 @@ class NativeSupervisor:
         network = json.loads(self._docker('network','inspect',request.network))[0]
         if not network.get('Internal'):
             raise ValueError('native generated code requires an internal Docker network with no direct internet route')
-        token = gateway_token_path.read_text().strip()
-        if not token:
-            raise ValueError('scoped gateway bearer is empty')
-        with httpx.Client(timeout=10,follow_redirects=False,trust_env=False) as client:
-            response = client.get(request.gateway_receipt_url.rstrip('/')+'/v1/budget',
-                                  headers={'Authorization':'Bearer '+token})
-            response.raise_for_status()
-            receipt = response.json()
+        receipt = self.gateway_receipt(request, gateway_token_path)
         self.verify_receipt(request, receipt, now=datetime.now(timezone.utc))
         return {'upstream_revision':UPSTREAM_REVISION,'image_id':image['Id'], 'network_id':network['Id'],
                 'scenario_hash':request.scenario.content_hash(),'bundle_hash':request.scenario.bundle_hash,
@@ -126,19 +119,36 @@ class NativeSupervisor:
                 'gateway_receipt':receipt}
 
     @staticmethod
-    def verify_receipt(request: NativeRequest, receipt: dict, *, now: datetime) -> None:
+    def gateway_receipt(request: NativeRequest, token_path: Path) -> dict:
+        from src.research.gateway_deployment import private_secret
+        token = private_secret(token_path)
+        deadline = time.monotonic()+10
+        with httpx.Client(timeout=10,follow_redirects=False,trust_env=False) as client:
+            with client.stream('GET',request.gateway_receipt_url.rstrip('/')+'/v1/budget',
+                               headers={'Authorization':'Bearer '+token}) as response:
+                response.raise_for_status()
+                raw = bytearray()
+                for chunk in response.iter_bytes():
+                    raw.extend(chunk)
+                    if len(raw)>1024*1024 or time.monotonic()>deadline:
+                        raise ValueError('gateway receipt exceeds its bounded size/deadline')
+        return json.loads(raw)
+
+    @staticmethod
+    def verify_receipt(request: NativeRequest, receipt: dict, *, now: datetime, final: bool=False) -> None:
         if receipt.get('run_id') != request.run_id or receipt.get('config_hash') != request.gateway_config_hash:
             raise ValueError('gateway admission does not match native run/config identity')
-        if not receipt.get('ready') or not receipt.get('provider_configured') or receipt.get('streaming') is not False:
+        if ((not final and not receipt.get('ready')) or not receipt.get('provider_configured')
+                or receipt.get('streaming') is not False):
             raise ValueError('metered model gateway is not ready')
         expires = datetime.fromisoformat(receipt['expires_at'].replace('Z','+00:00'))
-        if expires.tzinfo is None or expires < now+timedelta(seconds=request.max_seconds):
+        if expires.tzinfo is None or (not final and expires < now+timedelta(seconds=request.max_seconds)):
             raise ValueError('gateway expiry does not cover the bounded native run')
         for scope, model in (('chat',request.chat_model),('embedding',request.embedding_model)):
             declared = receipt['models'][scope]
             if declared['model'] != model.removeprefix('openai/') or declared['provider'] != 'openai':
                 raise ValueError('gateway model differs from the native request')
-            if receipt.get('admission_available',{}).get(scope) is not True:
+            if not final and receipt.get('admission_available',{}).get(scope) is not True:
                 raise ValueError('gateway scope is exhausted')
         for name, expected in (('limits',request.gateway_limits),('day_limits',request.gateway_day_limits)):
             actual = NativeBudgetLimits.model_validate(receipt[name])
@@ -155,11 +165,15 @@ class NativeSupervisor:
         command = ['docker','run','--rm','--name','quantagent-rd-'+request.run_id,
                    '--read-only','--cap-drop','ALL','--security-opt','no-new-privileges',
                    '--pids-limit','256','--memory',f'{request.memory_mb}m','--cpus',str(request.cpus),
+                   '--log-driver','none','--label','quantagent.native-run='+request.run_id,
+                   '--label','quantagent.request='+request.content_hash(),
                    '--user',f'{os.getuid()}:{os.getgid()}', '--network',request.network,
                    '--tmpfs','/tmp:rw,nosuid,nodev,size=512m',
                    '--mount',f'type=bind,src={work},dst=/work',
                    '--mount',f'type=bind,src={Path(request.scenario.provider_uri).resolve()},dst=/data/qlib,readonly',
                    '--mount',f'type=bind,src={token.resolve()},dst=/run/gateway-token,readonly']
+        for name in ('request.json','scenario.json','admission.json'):
+            command += ['--mount',f'type=bind,src={work/name},dst=/work/{name},readonly']
         if request.document:
             source = Path(request.document).resolve()
             if not source.exists() or ',' in str(source):
@@ -198,7 +212,7 @@ class NativeSupervisor:
         return [*command,request.image]
 
     def run(self, request: NativeRequest, *, gateway_token_path: str | Path) -> dict:
-        token = Path(gateway_token_path).resolve()
+        token = Path(gateway_token_path).absolute()
         evidence = self.preflight(request,gateway_token_path=token)
         work = self.root/request.run_id
         work.mkdir()  # Run identities and discovery output directories are immutable.
@@ -223,7 +237,7 @@ class NativeSupervisor:
                     time.sleep(.25)
                 else:
                     code = process.returncode
-                    state = 'discovery_complete' if code == 0 else 'failed'
+                    state = {0:'discovery_complete',124:'timeout',125:'output_limit',130:'interrupted'}.get(code,'failed')
             except BaseException:
                 state = 'interrupted'
                 raise
@@ -239,6 +253,14 @@ class NativeSupervisor:
                         process.kill()
                         process.wait(timeout=10)
                 code = process.returncode
+                final_receipt, audit_error = None, None
+                try:
+                    final_receipt = self.gateway_receipt(request, token)
+                    self.verify_receipt(request, final_receipt, now=datetime.now(timezone.utc), final=True)
+                except Exception as exc:
+                    audit_error = type(exc).__name__
+                    if state == 'discovery_complete':
+                        state = 'audit_unavailable'
                 files = {}
                 for path in work.rglob('*'):
                     if path.is_file() and not path.is_symlink():
@@ -247,6 +269,7 @@ class NativeSupervisor:
                 result = {'status':state,'returncode':code,'run_id':request.run_id,
                           'elapsed_seconds':time.monotonic()-started,'request_hash':request.content_hash(),
                           'upstream_revision':UPSTREAM_REVISION,'files':files,'activation':'quarantined',
-                          'cleanup_error':cleanup_error}
+                          'cleanup_error':cleanup_error,'gateway_final_receipt':final_receipt,
+                          'gateway_audit_error':audit_error}
                 (work/'result.json').write_text(json.dumps(result,indent=2))
         return result

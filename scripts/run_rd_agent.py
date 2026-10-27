@@ -135,5 +135,49 @@ for _command in ('fin_factor','fin_model','fin_quant','fin_factor_report','gener
     app.command(_command)(_native_command(_command))
 
 
+@app.command('managed-native')
+def managed_native(request: Path=typer.Option(...,exists=True,dir_okay=False),
+                   deployment: Path=typer.Option(...,exists=True,dir_okay=False),
+                   provider_key_file: Path=typer.Option(...,exists=True,dir_okay=False),
+                   gateway_state: Path=typer.Option(...),workdir: Path=typer.Option(...)):
+    """Start an isolated metered gateway, run the pinned job, retain budgets, stop."""
+    from src.research.gateway_deployment import GatewayDeployment, GatewayDeploymentManager
+    try:
+        result=GatewayDeploymentManager(gateway_state).run_native(
+            GatewayDeployment.model_validate_json(deployment.read_text()),
+            NativeRequest.model_validate_json(request.read_text()),
+            provider_key_path=provider_key_file,workdir=workdir)
+        typer.echo(json.dumps(result,indent=2))
+    except Exception as exc:
+        fail(exc)
+    if result['status']!='discovery_complete':
+        raise typer.Exit(2)
+
+
+@app.command('gateway-start')
+def gateway_start(deployment: Path=typer.Option(...,exists=True,dir_okay=False),
+                  provider_key_file: Path=typer.Option(...,exists=True,dir_okay=False),
+                  gateway_state: Path=typer.Option(...)):
+    """Start/reconcile one exact deployment; expiry and existing caps remain fixed."""
+    from src.research.gateway_deployment import GatewayDeployment, GatewayDeploymentManager
+    try:
+        result=GatewayDeploymentManager(gateway_state).start(
+            GatewayDeployment.model_validate_json(deployment.read_text()),provider_key_path=provider_key_file)
+        typer.echo(json.dumps(result,indent=2))
+    except Exception as exc:
+        fail(exc)
+
+
+@app.command('gateway-stop')
+def gateway_stop(deployment: Path=typer.Option(...,exists=True,dir_okay=False),gateway_state: Path=typer.Option(...)):
+    """Stop only the exact owned container; preserve all admissions and usage."""
+    from src.research.gateway_deployment import GatewayDeployment, GatewayDeploymentManager
+    try:
+        result=GatewayDeploymentManager(gateway_state).stop(GatewayDeployment.model_validate_json(deployment.read_text()))
+        typer.echo(json.dumps(result,indent=2))
+    except Exception as exc:
+        fail(exc)
+
+
 if __name__=='__main__':
     app()
