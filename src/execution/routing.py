@@ -181,6 +181,21 @@ def target_from_blended_frame(frame, context, instruments, *, target_id, current
         raise LedgerError("all actual sleeves, decisions and provenance must be represented")
     if not frame.index.is_unique or current_snapshot.nav <= 0:
         raise LedgerError("unique instrument rows and positive actual NAV required")
+    identity_maps = {"market_snapshot_hash", "data_snapshot_hashes", "model_training_data_hashes"}
+    has_identity_maps = bool(identity_maps & attrs.keys())
+    if has_identity_maps:
+        if (
+            identity_maps - attrs.keys()
+            or attrs["market_snapshot_hash"] != attrs["data_snapshot_hash"]
+            or any(names != set(attrs[k]) for k in identity_maps - {"market_snapshot_hash"})
+            or any(
+                value not in context.data_snapshot_ids
+                for value in attrs["data_snapshot_hashes"].values()
+            )
+        ):
+            raise LedgerError(
+                "complete approved common-market and exact sleeve identity maps required"
+            )
     projected = pd.DataFrame(attrs["contributions"]).fillna(0).sum(axis=1).reindex(frame.index)
     if not np.isfinite(frame.target_weight).all() or not np.array_equal(
         projected.to_numpy(), frame.target_weight.to_numpy()
@@ -197,9 +212,21 @@ def target_from_blended_frame(frame, context, instruments, *, target_id, current
             or provenance.get("model_hash") != attrs["model_artifact_hashes"][name]
         ):
             raise LedgerError("per-sleeve output differs from bound provenance")
-        if any(
-            provenance.get(k) != attrs[k]
-            for k in ("context", "signal_at", "data_snapshot_hash", "universe_version")
+        if any(provenance.get(k) != attrs[k] for k in ("context", "signal_at", "universe_version")):
+            raise LedgerError("per-sleeve causal evidence mismatch")
+        if has_identity_maps:
+            if (
+                provenance.get("market_snapshot_hash", provenance.get("data_snapshot_hash"))
+                != attrs["market_snapshot_hash"]
+                or provenance.get("data_snapshot_hash") != attrs["data_snapshot_hashes"][name]
+                or provenance.get("model_training_data_hash")
+                != attrs["model_training_data_hashes"][name]
+            ):
+                raise LedgerError("per-sleeve market, feature or training identity mismatch")
+        elif (
+            provenance.get("data_snapshot_hash") != attrs["data_snapshot_hash"]
+            or provenance.get("market_snapshot_hash", provenance.get("data_snapshot_hash"))
+            != attrs["data_snapshot_hash"]
         ):
             raise LedgerError("per-sleeve causal evidence mismatch")
         if not output.index.is_unique or not {"target_weight", "action", "reason", "score"} <= set(
@@ -300,6 +327,8 @@ def target_from_strategy_frame(frame, context, instruments, *, target_id, curren
         raise LedgerError("strategy frame requires exact causal context and provenance")
     if (
         attrs["data_snapshot_hash"] not in context.data_snapshot_ids
+        or attrs.get("market_snapshot_hash", attrs["data_snapshot_hash"])
+        not in context.data_snapshot_ids
         or current_snapshot.as_of != context.as_of
         or current_snapshot.account_id != context.account_id
     ):
@@ -356,7 +385,7 @@ def target_from_strategy_frame(frame, context, instruments, *, target_id, curren
         universe_version=attrs["universe_version"],
         strategy_id=attrs["strategy"],
         artifact_version=artifact,
-        data_snapshot_id=attrs["data_snapshot_hash"],
+        data_snapshot_id=attrs.get("market_snapshot_hash", attrs["data_snapshot_hash"]),
         weights=tuple(weights),
         preserve_quantities=preserve,
     )

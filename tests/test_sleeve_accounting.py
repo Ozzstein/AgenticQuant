@@ -509,7 +509,12 @@ def test_purchase_plan_cannot_spend_same_sleeve_cash_twice(tmp_path):
 
 
 @pytest.mark.parametrize("blended", [False, True])
-def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, blended):
+@pytest.mark.parametrize("distinct_data", [False, True])
+def test_actual_decision_may_follow_signal_close_but_never_precede_it(
+    tmp_path, blended, distinct_data
+):
+    from copy import deepcopy
+
     import pandas as pd
 
     from src.domain.common import RunContext
@@ -524,7 +529,9 @@ def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, 
         account_id="backtest:test",
         config_hash="a" * 64,
         code_version="test",
-        data_snapshot_ids=("fixture",),
+        data_snapshot_ids=("fixture", "alpha-features", "beta-features")
+        if distinct_data
+        else ("fixture",),
     )
     snapshot = ledger.snapshot("backtest:test", decision, 86400, persist=False)
     output = pd.DataFrame(
@@ -540,10 +547,18 @@ def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, 
         universe_version="fixture",
         model_hash="b" * 64,
     )
+    if distinct_data:
+        output.attrs.update(
+            market_snapshot_hash="fixture",
+            data_snapshot_hash="alpha-features",
+            model_training_data_hash="d" * 64,
+        )
     if blended:
         snapshot = snapshot.model_copy(update={"sleeves": book.snapshot(decision)})
         beta = output.copy(deep=True)
         beta.attrs = {**output.attrs, "strategy": "beta", "strategy_hash": "c" * 64}
+        if distinct_data:
+            beta.attrs.update(data_snapshot_hash="beta-features", model_training_data_hash="e" * 64)
         outputs = {"alpha": output, "beta": beta}
         frame = pd.DataFrame({"target_weight": [0.2]}, index=[A.instrument_id])
         frame.attrs.update(
@@ -558,6 +573,14 @@ def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, 
             contributions={k: {A.instrument_id: 0.1} for k in outputs},
             vetoed=(),
         )
+        if distinct_data:
+            frame.attrs.update(
+                market_snapshot_hash="fixture",
+                data_snapshot_hashes={k: v.attrs["data_snapshot_hash"] for k, v in outputs.items()},
+                model_training_data_hashes={
+                    k: v.attrs["model_training_data_hash"] for k, v in outputs.items()
+                },
+            )
 
         def adapt():
             return target_from_blended_frame(
@@ -571,7 +594,45 @@ def test_actual_decision_may_follow_signal_close_but_never_precede_it(tmp_path, 
                 frame, context, [A], target_id="cycle", current_snapshot=snapshot
             )
 
-    assert adapt().decision_at == decision
+    original = adapt()
+    assert original.decision_at == decision and original.data_snapshot_id == "fixture"
+    if blended and not distinct_data:
+        # New D blends can retain unchanged legacy same-dataset sleeve attrs.
+        frame.attrs.update(
+            market_snapshot_hash="fixture",
+            data_snapshot_hashes={name: "fixture" for name in outputs},
+            model_training_data_hashes={name: None for name in outputs},
+        )
+        assert adapt() == original
+    if distinct_data:
+        saved = deepcopy(frame.attrs)
+        if blended:
+            for key, changed in (
+                ("data_snapshot_hashes", {"alpha": "beta-features", "beta": "alpha-features"}),
+                ("data_snapshot_hashes", {"alpha": "unapproved", "beta": "beta-features"}),
+                ("model_training_data_hashes", {"alpha": "0" * 64, "beta": "e" * 64}),
+                ("market_snapshot_hash", "alpha-features"),
+            ):
+                frame.attrs = {**deepcopy(saved), key: changed}
+                with pytest.raises(LedgerError, match="identity|common-market"):
+                    adapt()
+            frame.attrs = deepcopy(saved)
+            del frame.attrs["model_training_data_hashes"]
+            with pytest.raises(LedgerError, match="complete approved"):
+                adapt()
+            frame.attrs = deepcopy(saved)
+            output.attrs["market_snapshot_hash"] = "beta-features"
+            frame.attrs["sleeve_provenance"]["alpha"] = dict(output.attrs)
+            with pytest.raises(LedgerError, match="identity mismatch"):
+                adapt()
+            output.attrs["market_snapshot_hash"] = "fixture"
+        else:
+            for key in ("market_snapshot_hash", "data_snapshot_hash"):
+                frame.attrs = {**saved, key: "unapproved"}
+                with pytest.raises(LedgerError, match="data/account cutoff"):
+                    adapt()
+        frame.attrs = saved
+        assert adapt() == original
     for invalid in (decision + timedelta(seconds=1), decision.replace(tzinfo=None)):
         frame.attrs["signal_at"] = invalid.isoformat()
         with pytest.raises(LedgerError, match="causal context"):
