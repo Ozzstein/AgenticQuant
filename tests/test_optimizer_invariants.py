@@ -210,3 +210,75 @@ def test_real_optimizer_to_typed_target_to_durable_replay(method, tmp_path):
     assert replay.metrics.fees > 0
     assert replay.equity_curve[-1] < replay.equity_curve[0]
     assert replay.metrics.max_drawdown < 0
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_asset_floors_preserve_ownership_and_zero_caps_block_revival(method, monkeypatch):
+    import src.execution.portfolio_optimizer as module
+
+    keys = ["A", "B", "EXIT"]
+    cov = pd.DataFrame(np.diag([1.0, 0.01, 0.001]), index=keys, columns=keys)
+    limits = AllocationConstraints(
+        asset_caps={"A": 0.4, "B": 0.4, "EXIT": 0},
+        asset_mins={"A": 0.2},
+        sectors={k: k for k in keys},
+        sector_cap=0.5,
+        previous_weights={"A": 0.2, "B": 0.1, "EXIT": 0.1},
+        buy_cost_rates=dict.fromkeys(keys, 0.02),
+        sell_cost_rates=dict.fromkeys(keys, 0.02),
+        min_cash=0.2,
+    )
+    result = allocate(method, cov, limits)
+    assert result.weights["A"] >= 0.2 - 1e-9
+    assert result.weights["EXIT"] == 0
+    assert limits.violations(result.weights) == []
+    changed = {**result.weights, "A": 0.19999}
+    assert "asset_min" in limits.violations(changed)
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("solver unavailable")
+
+    monkeypatch.setattr(module, "minimize", unavailable)
+    fallback = allocate(method, cov, limits)
+    assert fallback.status == "fallback_feasible"
+    assert fallback.weights["A"] >= 0.2
+    assert fallback.weights["EXIT"] == 0
+    assert limits.violations(fallback.weights) == []
+
+
+def test_asset_floor_infeasibility_and_decimal_lot_revalidation():
+    cov = pd.DataFrame(np.diag([0.01, 0.02]), index=["A", "B"], columns=["A", "B"])
+    for limits in (
+        replace(loose(), asset_mins={"A": 1.1}),
+        replace(loose(), asset_mins={"A": 0.8}, min_cash=0.3),
+        replace(loose(), asset_mins={"A": 0.2}, previous_weights={"A": 0.1, "B": 0}, buy_halt=True),
+        # Fees must not shrink the preserved quantity floor to make a position
+        # cap seem feasible; an exact held floor at the cap conflicts with fees.
+        replace(
+            loose(),
+            asset_mins={"A": 0.2},
+            asset_caps={"A": 0.2, "B": 1},
+            buy_cost_rates={"A": 0.01},
+        ),
+    ):
+        with pytest.raises(ValueError, match="infeasible"):
+            allocate("risk_parity", cov, limits)
+    for floors in ({"unknown": 0.1}, {"A": float("nan")}, {"A": -0.1}):
+        with pytest.raises(ValueError, match="invalid"):
+            replace(loose(), asset_mins=floors).validate(["A", "B"])
+    result = allocate("mean_variance", cov, replace(loose(), asset_mins={"A": 0.201}))
+    result.weights = {"A": 0.201, "B": 0.3}
+    metadata = {m.instrument.instrument_id: m for m in replay_inputs()["metadata"]}
+    with pytest.raises(ValueError, match="asset_min"):
+        result.to_target(
+            instruments={"A": A, "B": B},
+            target_id="floor-rounding",
+            decision_at=START,
+            strategy_id="test",
+            artifact_version="test",
+            data_snapshot_id="fixture",
+            universe_version="test-universe",
+            nav=D(10000),
+            prices={"A": D(100), "B": D(100)},
+            metadata=metadata,
+        )

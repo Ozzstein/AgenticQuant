@@ -50,6 +50,9 @@ class AllocationConstraints:
     buy_cost_rates: dict[str, float] = field(default_factory=dict)
     sell_cost_rates: dict[str, float] = field(default_factory=dict)
     buy_halt: bool = False
+    # Absolute fractions of opening NAV, so transaction costs cannot erode an
+    # actual held-quantity preservation floor. Missing keys have zero floor.
+    asset_mins: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def for_portfolio(
@@ -61,6 +64,7 @@ class AllocationConstraints:
         *,
         pending: list[dict],
         crypto_min: float = 0,
+        asset_mins: dict[str, float] | None = None,
     ) -> AllocationConstraints:
         if pending or snapshot.reserved_cash:
             raise ValueError(
@@ -126,6 +130,7 @@ class AllocationConstraints:
             buy_cost_rates=rates,
             sell_cost_rates=rates,
             buy_halt=snapshot.nav <= snapshot.high_water_mark * (1 - policy.max_drawdown),
+            asset_mins=dict(asset_mins or {}),
         )
 
     def validate(self, keys: list[str]) -> None:
@@ -139,11 +144,18 @@ class AllocationConstraints:
             raise ValueError("complete unique asset caps and sectors required")
         if not self.crypto_assets <= ids or any(not s for s in self.sectors.values()):
             raise ValueError("unknown crypto assets or missing sectors")
-        for mapping in (self.trade_caps, self.buy_cost_rates, self.sell_cost_rates):
+        for mapping in (
+            self.trade_caps,
+            self.buy_cost_rates,
+            self.sell_cost_rates,
+            self.asset_mins,
+        ):
             if not set(mapping) <= ids or any(
                 not np.isfinite(v) or v < 0 for v in mapping.values()
             ):
                 raise ValueError("unknown or invalid trade/cost constraints")
+        if any(value > self.asset_caps[key] for key, value in self.asset_mins.items()):
+            raise ValueError("infeasible asset minimum exceeds asset cap")
         values = [
             *self.asset_caps.values(),
             self.sector_cap,
@@ -188,6 +200,8 @@ class AllocationConstraints:
             failures.append("long_only/solvency")
         if any(weights[k] > self.asset_caps[k] * nav + tolerance for k in keys):
             failures.append("asset_cap")
+        if any(weights[k] < floor - tolerance for k, floor in self.asset_mins.items()):
+            failures.append("asset_min")
         if sum(weights.values()) > (1 - self.min_cash) * nav + tolerance:
             failures.append("cash_reserve")
         for sector in set(self.sectors.values()):
@@ -258,6 +272,10 @@ class OptimizationResult:
                     rounding=ROUND_DOWN
                 ) * lot
                 weights[key] = qty * prices[key] / nav
+        if self.constraints and any(
+            weights[key] < Decimal(str(floor)) for key, floor in self.constraints.asset_mins.items()
+        ):
+            raise ValueError("target failed post-rounding constraints: asset_min")
         if self.constraints is None or (
             failures := self.constraints.violations({k: float(v) for k, v in weights.items()})
         ):
@@ -422,9 +440,13 @@ class PortfolioOptimizer:
                 rhs.append(limits.trade_caps[key])
         # w - buys + sells = previous; buy/sell simultaneity only consumes limits.
         equality = np.c_[np.eye(n), -np.eye(n), np.eye(n)]
-        bounds = [(0.0, float(old[i]) if limits.buy_halt else 1.0) for i in range(n)] + [
-            (0.0, 1.0)
-        ] * (2 * n)
+        bounds = [
+            (
+                limits.asset_mins.get(key, 0.0),
+                min(limits.asset_caps[key], float(old[i]) if limits.buy_halt else 1.0),
+            )
+            for i, key in enumerate(keys)
+        ] + [(0.0, 1.0)] * (2 * n)
         return np.array(rows), np.array(rhs), equality, old, bounds
 
     def _solve(self, method, cov, objective, *, limits=None, full_budget=True, diagnostics=None):
@@ -432,6 +454,10 @@ class PortfolioOptimizer:
         limits = self._limits(keys, limits)
         n = len(keys)
         a, b, eq, old, bounds = self._polytope(keys, limits)
+        if any(low > high for low, high in bounds):
+            raise ValueError(
+                "infeasible allocation constraints: asset minimum conflicts with buy halt"
+            )
         seed = linprog(
             np.r_[-np.ones(n), np.full(2 * n, 1e-10)],
             A_ub=a,
