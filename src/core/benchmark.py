@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from src.core.backtester import (
     PortfolioReplay,
@@ -54,7 +54,19 @@ class MatchedComparison(BaseModel):
 class OpportunityCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     instrument_id: str
-    prediction: float
+    prediction: float | None
+    decision_hash: Sha256 | None = None
+    receipt_hash: Sha256 | None = None
+    consensus_action: Literal["BUY", "HOLD", "REDUCE", "EXIT", "ABSTAIN", "VETO"] | None = None
+    original_review_snapshot_hash: Sha256 | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        return {
+            key: value
+            for key, value in handler(self).items()
+            if key in ("instrument_id", "prediction") or value is not None
+        }
 
 
 class OpportunityRow(BaseModel):
@@ -62,8 +74,8 @@ class OpportunityRow(BaseModel):
     at: UtcTimestamp
     universe_hash: Sha256
     universe_version: str
-    model_payload_hash: Sha256
-    model_artifact_hash: Sha256
+    model_payload_hash: Sha256 | None
+    model_artifact_hash: Sha256 | None
     regime_observation_hash: Sha256
     rebalance_due: bool
     eligible: tuple[OpportunityCandidate, ...]
@@ -79,8 +91,59 @@ class CallbackOpportunities(BaseModel):
     feature_data_hash: Sha256
     feature_spec_hash: Sha256
     cadence: str
+    advice_policy: Literal["historical-advice-current-ledger-sizing-1"] | None = None
+    actual_decision_hashes: tuple[Sha256, ...] = ()
     decision_times: tuple[UtcTimestamp, ...]
     rows: tuple[OpportunityRow, ...]
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.advice_policy is None:
+            result.pop("advice_policy")
+            result.pop("actual_decision_hashes")
+        return result
+
+    @model_validator(mode="after")
+    def evidence_branch(self):
+        observed = set()
+        for row in self.rows:
+            if self.advice_policy:
+                if row.model_payload_hash is not None or row.model_artifact_hash is not None:
+                    raise ValueError(
+                        "model-free advice cannot invent model payload/artifact hashes"
+                    )
+            elif row.model_payload_hash is None or row.model_artifact_hash is None:
+                raise ValueError("numeric opportunities require actual model hashes")
+            for candidate in row.eligible:
+                advice = (
+                    candidate.decision_hash,
+                    candidate.receipt_hash,
+                    candidate.consensus_action,
+                    candidate.original_review_snapshot_hash,
+                )
+                if self.advice_policy:
+                    if candidate.prediction is not None or any(value is None for value in advice):
+                        raise ValueError(
+                            "model-free opportunities require explicit complete advice evidence and no prediction"
+                        )
+                    observed.add(candidate.decision_hash)
+                elif candidate.prediction is None or any(value is not None for value in advice):
+                    raise ValueError(
+                        "numeric opportunities require actual predictions without advice substitutions"
+                    )
+        if self.advice_policy:
+            if (
+                not self.actual_decision_hashes
+                or tuple(sorted(set(self.actual_decision_hashes))) != self.actual_decision_hashes
+                or not observed <= set(self.actual_decision_hashes)
+            ):
+                raise ValueError(
+                    "actual advice decision hashes must cover all opportunity receipts"
+                )
+        elif self.actual_decision_hashes:
+            raise ValueError("numeric opportunities cannot claim model-free decision evidence")
+        return self
 
 
 def _callback_source(baseline, strategy_artifact, opportunity_artifact):
@@ -97,6 +160,21 @@ def _callback_source(baseline, strategy_artifact, opportunity_artifact):
     opportunities = CallbackOpportunities.model_validate_json(
         Path(opportunity_artifact["path"]).read_text()
     )
+    provenance = baseline.manifest.get("provenance", {})
+    if opportunities.advice_policy != provenance.get("advice_policy") or list(
+        opportunities.actual_decision_hashes
+    ) != provenance.get("actual_decision_hashes", []):
+        raise BacktestError("opportunity advice policy/decision hashes differ from actual baseline")
+    if opportunities.advice_policy:
+        if baseline.walk_forward_results or baseline.cross_sectional_ic or provenance.get("folds"):
+            raise BacktestError("model-free historical advice cannot claim numeric folds or IC")
+        original = provenance.get("original_review_snapshots", {})
+        if any(
+            original.get(c.decision_hash) != c.original_review_snapshot_hash
+            for row in opportunities.rows
+            for c in row.eligible
+        ):
+            raise BacktestError("advice original review snapshot differs from baseline provenance")
     ledger = PortfolioLedger(strategy_artifact.ledger_path, read_only=True)
     try:
         inputs = recorded_replay_inputs(ledger, baseline)

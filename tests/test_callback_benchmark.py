@@ -225,3 +225,74 @@ def test_off_cadence_reduction_keeps_control_identity_and_future_prices_do_not_c
             assert recorded_decisions(ledger, candidate)[0].target.weights == target
         finally:
             ledger.close()
+
+
+def test_explicit_historical_advice_opportunities_need_no_invented_model_or_prediction(tmp_path):
+    from pathlib import Path
+
+    from src.core.benchmark import CallbackOpportunities
+
+    args = callback_case(tmp_path / "inputs")
+    path = Path(args["provenance"]["opportunities_artifact"]["path"])
+    numeric = json.loads(path.read_text())
+    invalid = json.loads(path.read_text())
+    invalid["rows"][0]["eligible"][0]["prediction"] = None
+    with pytest.raises(ValueError, match="actual predictions"):
+        CallbackOpportunities.model_validate(invalid)
+    policy = "historical-advice-current-ledger-sizing-1"
+    hashes = {key: canonical_hash({"fixture_decision": key}) for key in ("A", "B")}
+    original = {
+        value: canonical_hash({"fixture_original_snapshot": key}) for key, value in hashes.items()
+    }
+    numeric.update(advice_policy=policy, actual_decision_hashes=sorted(hashes.values()))
+    for row in numeric["rows"]:
+        row.update(model_payload_hash=None, model_artifact_hash=None)
+        for candidate in row["eligible"]:
+            decision_hash = hashes[candidate["instrument_id"]]
+            candidate.update(
+                prediction=None,
+                decision_hash=decision_hash,
+                receipt_hash=canonical_hash({"fixture_receipt": decision_hash}),
+                consensus_action="BUY",
+                original_review_snapshot_hash=original[decision_hash],
+            )
+    parsed = CallbackOpportunities.model_validate(numeric)
+    assert all(c.prediction is None for r in parsed.rows for c in r.eligible)
+    path.write_text(json.dumps(numeric, sort_keys=True))
+    args["provenance"].update(
+        advice_policy=policy,
+        actual_decision_hashes=sorted(hashes.values()),
+        original_review_snapshots=original,
+    )
+    args["provenance"]["opportunities_artifact"]["sha256"] = file_hash(path)
+    args["decision_recipe_hash"] = canonical_hash(
+        {"source": file_hash(path), "recipe": "fixture-advice"}
+    )
+    ledger_path = tmp_path / "advice.sqlite3"
+    baseline = PortfolioReplay(ledger_path).run(**args)
+    comparison = BenchmarkRunner().compare_replay(
+        baseline,
+        inputs=args,
+        ledger_path=ledger_path,
+        output_dir=tmp_path / "comparison",
+        n_simulations=5,
+    )
+    verify_comparison(baseline, comparison, minimum_simulations=5)
+    assert (
+        baseline.trades
+        and baseline.walk_forward_results == []
+        and baseline.cross_sectional_ic == {}
+    )
+    changed = baseline.model_copy(
+        update={
+            "manifest": {
+                **baseline.manifest,
+                "provenance": {**baseline.manifest["provenance"], "original_review_snapshots": {}},
+            }
+        }
+    )
+    with pytest.raises(BacktestError, match="binding differs"):
+        verify_comparison(changed, comparison, minimum_simulations=5)
+    numeric["rows"][0]["model_payload_hash"] = "e" * 64
+    with pytest.raises(ValueError, match="cannot invent model"):
+        CallbackOpportunities.model_validate(numeric)
