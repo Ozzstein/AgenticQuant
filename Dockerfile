@@ -29,4 +29,4 @@ COPY --chown=appuser:appuser lean/ lean/
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH="/app/.venv/bin:$PATH"
 USER appuser
 EXPOSE 8501
-CMD ["python", "scripts/run_pipeline.py", "run", "--mode", "paper"]
+CMD ["python", "-m", "src.scheduler", "serve", "--lane", "operating"]

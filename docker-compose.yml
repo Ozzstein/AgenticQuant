@@ -20,12 +20,17 @@ services:
   scheduler:
     <<: *runtime
     restart: unless-stopped
-    command: ["python", "-m", "src.scheduler", "--loop"]
+    command: ["python", "-m", "src.scheduler", "serve", "--lane", "operating"]
+
+  research-scheduler:
+    <<: *runtime
+    restart: unless-stopped
+    command: ["python", "-m", "src.scheduler", "serve", "--lane", "research"]
 
   app:
     <<: *runtime
     profiles: ["manual"]
-    command: ["python", "scripts/run_pipeline.py", "run", "--mode", "paper"]
+    command: ["aiquant", "operations", "status"]
 
   dashboard:
     <<: *runtime

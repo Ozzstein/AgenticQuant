@@ -297,3 +297,26 @@ including real stores/parsers, metadata-plus-page budget exhaustion, receipt
 clock/source verification, and completed-run replay without another request.
 The separate 45-test derivative/context/direct-adapter/factor suite passed in
 1.25 seconds. HTTP/SDK boundary fixtures do not establish vendor acceptance.
+
+### Deployment entry-point audit — 2026-10-27
+
+The application Docker default and Compose scheduler now call the canonical
+`src.scheduler serve --lane operating` command. A separate research scheduler
+consumes the durable research lane; the manual app defaults to read-only status.
+The previous `--loop` and `run --mode paper` commands were retired and could not
+start the current services. README/deployment instructions now describe explicit
+manifests, actual services, immutable stores and the unresolved income/runtime
+gates, removing unsupported cost/performance and automatic-fallback claims.
+
+With Python sources pinned at `fd54c9f`, `uv build --offline
+--no-build-isolation --out-dir /tmp/quantagentlab-root-fd54c9f-dist` built both sdist
+and wheel. An isolated extracted-wheel CLI smoke check passed, including packaged
+`scripts` and all six JSON strategy specs. Compose YAML commands were checked
+against actual CLI help; lane separation/manual profile/loopback dashboard were
+asserted. This is not Docker execution. The existing root editable install still
+had an old `src`-only package mapping; it needs reinstalling after the active full
+suite, whereas the newly built wheel correctly contains `scripts`.
+
+The user confirmed no sufficient corporate-action/custodial income source has
+been selected. Fresh source-complete acceptance therefore remains blocked; the
+retained positive-cycle requirements are not replaced by mock completeness.

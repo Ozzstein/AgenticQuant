@@ -1,374 +1,158 @@
 # QuantAgentLab
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Code style: ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
+QuantAgentLab combines archived market evidence, US Qlib features, fitted models,
+a causal macro HMM, an evidence-grounded agent desk and a shared Decimal portfolio
+ledger for US equities and crypto. Research, paper operation and remote execution
+use explicit identities, source cutoffs and immutable receipts.
 
-## What It Is
+**The full system is still being built and is not an accepted release.** Offline
+models and protocol fixtures are exercised; authenticated providers, native
+Docker/LEAN execution, statistical acceptance and prospective trading remain
+unverified. Fresh complete paper cycles currently fail closed on insufficient
+income-source coverage. The [full build plan](docs/FULL_SYSTEM_BUILD_PLAN.md) and
+[requirements/evidence register](docs/BUILD_REQUIREMENTS.md) retain the complete
+scope and outstanding gates.
 
-**QuantAgentLab** is an open-source agentic AI investment platform that combines Microsoft Qlib's
-quantitative finance engine with LangGraph-orchestrated LLM intelligence. It covers US equities
-and crypto, running a daily pipeline that moves from raw market data all the way through ML-scored
-alpha signals, multi-agent debate, and portfolio construction to order execution — all without
-requiring manual intervention once configured.
+## System boundaries
 
-The platform is built on the principle that pure-quant and pure-LLM approaches each have blind
-spots that the other compensates for. Qlib's walk-forward backtester and Alpha158 feature library
-produce statistically rigorous rank signals; LangGraph agents then apply qualitative judgment
-(macro regime, earnings catalysts, sentiment, risk veto) to size and filter those signals before
-any capital is committed. The result is a system that is simultaneously auditable (every agent
-decision is logged in JSON) and adaptive (LLM reasoning can incorporate breaking news that a
-fixed-rule model cannot).
+- **Data:** raw bytes, normalized values, complete documents and exact spans are
+  archived in `EvidenceStore`. Availability and observation time remain separate.
+  US exchange sessions and UTC crypto sessions retain their actual timestamps.
+- **Quantitative execution:** versioned features, four actual model families,
+  train-only transformations, purged walk-forward folds and causal HMM state.
+  Six strategy specifications feed four allocation modes and five constrained
+  optimizers. A diagnostic result does not grant operational eligibility.
+- **Agent desk:** source-grounded specialist reports, two-round debate, strategist
+  derivation, qualitative risk veto and canonical BUY/HOLD/REDUCE/EXIT/ABSTAIN
+  semantics. Generative usage has durable reservations, actual/unknown settlement
+  and model/pricing identity. Missing evidence remains unavailable.
+- **Accounting:** one canonical ledger for cash, quantities, basis, fees,
+  receivables, targets and fills. Sleeve ownership derives from actual events.
+  Opening prints never require fabricated completed OHLC bars; source aliases
+  cannot consume the same liquidity twice.
+- **Research:** immutable candidates/trials and independent result reconstruction,
+  durable named and 1,000-random controls, cost reruns and untouched-holdout gates.
+  Native search inputs are frozen and exposure is recorded before execution.
+  Native outputs and descendants remain quarantined pending required proof.
+- **Operations:** source-bound cycle plans, durable stage recovery and separate
+  operating/research scheduler workers. The dashboard reads actual stores.
+  Notifications use an explicit durable outbox.
+- **Venues:** typed local paper, Alpaca, Binance, Kraken and LEAN adapters share the
+  canonical intent/risk/reconciliation boundary. Offline wire fixtures do not
+  establish authenticated venue or live-capital acceptance.
 
----
+## Reproducible local environment
 
-## Architecture
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║  PERIODIC  (weekly / monthly)                                ║
-║                                                              ║
-║   RD-Agent ──► discovers factors ──► data/factor_library/   ║
-║   RD-Agent ──► optimizes model   ──► config/best_model_config.yaml ║
-╚══════════════════════════════════════════════════════════════╝
-
-╔══════════════════════════════════════════════════════════════╗
-║  DAILY PIPELINE                                              ║
-║                                                              ║
-║  Market Data (equity + crypto)                               ║
-║    └─► Qlib Features (Alpha158 + RD-Agent factor library)    ║
-║          └─► ML Model (RD-Agent-optimized config if avail.)  ║
-║                └─► Predictions (ranked alpha scores)         ║
-║                      └─► Top-N candidates selected          ║
-║                            └─► LangGraph Agent Pipeline:    ║
-║                                  Market Context              ║
-║                                  → Macro Regime Detector     ║
-║                                    (risk_on/neutral/         ║
-║                                     risk_off/crisis)         ║
-║                                  → Parallel Analysts:        ║
-║                                    · Fundamental (CFA)       ║
-║                                    · Sentiment (alt-data)    ║
-║                                    · Technical (CMT)         ║
-║                                  → Risk Manager (veto)       ║
-║                                  → Debate Loop (N rounds)    ║
-║                                  → Portfolio Strategist      ║
-║                                  → AnalysisResult (Pydantic) ║
-║                            └─► Portfolio Optimizer           ║
-║                                  (risk parity / BL / HRP)   ║
-║                                  └─► Pre-Trade Risk Controls ║
-║                                        └─► Order Execution   ║
-║                                              (paper / LEAN)  ║
-║                                              └─► Reporting   ║
-║                                                    (Telegram ║
-║                                                    + Dashboard) ║
-╚══════════════════════════════════════════════════════════════╝
-```
-
----
-
-## Project Structure
-
-```
-QuantAgentLab/
-├── CLAUDE.md                    # AI assistant instructions
-├── plan.md                      # Phase-by-phase build plan
-├── pyproject.toml               # deps + aiquant CLI entry point
-├── Dockerfile / docker-compose.yml
-├── config/
-│   ├── settings.yaml            # Default config
-│   └── .env.example             # API key template
-├── src/
-│   ├── utils/
-│   │   ├── config.py            # AppConfig(BaseSettings) singleton
-│   │   ├── logger.py            # Loguru console + rotating file
-│   │   ├── exceptions.py        # AiQuantError hierarchy
-│   │   ├── schemas.py           # ALL shared Pydantic v2 models
-│   │   └── cli.py               # Typer CLI entry point
-│   ├── data/
-│   │   ├── market_data.py       # yfinance tools
-│   │   ├── fundamental_data.py  # FinnHub + SEC EDGAR tools
-│   │   ├── news_data.py         # news tools
-│   │   ├── crypto_data.py       # CoinGecko + CCXT tools
-│   │   └── unified_data.py      # unified equity+crypto feed
-│   ├── core/
-│   │   ├── data_pipeline.py     # Qlib init, features, fallback
-│   │   ├── crypto_pipeline.py   # CryptoPipeline OHLCV
-│   │   ├── factor_engine.py     # Alpha158 + custom factors
-│   │   ├── model_zoo.py         # LGB/CatBoost/XGB/Linear
-│   │   ├── backtester.py        # WalkForwardBacktester
-│   │   ├── benchmark.py         # SPY/BTC/60-40/EW benchmarks
-│   │   └── rd_agent_runner.py   # RD-Agent factor/model search (9 modes)
-│   ├── agents/
-│   │   ├── state.py             # TradingDeskState TypedDict
-│   │   ├── llm.py               # get_llm() factory
-│   │   ├── fundamental.py       # CFA analyst node
-│   │   ├── sentiment.py         # Alt-data analyst node
-│   │   ├── technical.py         # CMT analyst node
-│   │   ├── risk_manager.py      # CRO node (veto power)
-│   │   ├── strategist.py        # PM synthesis → AnalysisResult
-│   │   ├── graph.py             # build_trading_desk_graph()
-│   │   └── debate.py            # DebateManager multi-round
-│   ├── execution/
-│   │   ├── portfolio_optimizer.py
-│   │   ├── paper_trader.py
-│   │   ├── risk_controls.py
-│   │   ├── signal_translator.py
-│   │   └── lean_bridge.py
-│   ├── strategies/
-│   │   ├── qlib_ml.py
-│   │   ├── agent_enhanced.py
-│   │   └── allocator.py
-│   ├── monitoring/
-│   │   ├── telegram_bot.py
-│   │   ├── portfolio_monitor.py
-│   │   └── scheduler.py
-│   ├── dashboard.py             # Streamlit trading dashboard (portfolio, agents, factors)
-│   └── rd_agent_dashboard.py    # Streamlit RD-Agent research dashboard (KB, factor library)
-├── scripts/
-│   ├── run_backtest.py
-│   ├── run_agents.py
-│   ├── run_pipeline.py
-│   └── run_rd_agent.py          # RD-Agent CLI (9 commands)
-├── tests/                       # pytest suite
-├── notebooks/                   # Jupyter exploration notebooks
-└── docs/                        # Extended documentation
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- [conda](https://docs.conda.io/en/latest/miniconda.html) or `mamba`
-- API keys for Anthropic Claude (required), FinnHub (optional), Telegram (optional)
-
-### Quick Start
+The verified Python baseline is **3.11.16**, with **uv 0.12.18** and the committed
+`uv.lock`. Run from the repository root:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/youruser/QuantAgentLab
-cd QuantAgentLab
-
-# 2. Create the conda environment
-conda create -n aiquant python=3.11 -y
-conda activate aiquant
-
-# 3. Install all dependencies (including dev extras)
-pip install -e ".[dev]"
-
-# 4. Initialise directories and verify the setup
-aiquant setup
-
-# 5. Run your first multi-agent analysis
-aiquant analyze AAPL
+uv sync --locked --extra dev --extra dashboard --extra alpaca --extra qlib
+uv pip check
+uv run --locked --no-sync python scripts/check_environment.py
+uv run --locked --no-sync aiquant --help
 ```
 
-The `aiquant setup` command creates `logs/`, `outputs/`, and `data/` directories and validates
-that required config values are present.
-
----
-
-## Configuration Reference
-
-Copy `config/.env.example` to `config/.env` and fill in your keys. All values can also be
-supplied as environment variables with the `AIQUANT_` prefix.
-
-| Variable | Default | Required | Description |
-|---|---|---|---|
-| `AIQUANT_ANTHROPIC_API_KEY` | — | **Yes** | Claude API key (primary LLM) |
-| `AIQUANT_OPENAI_API_KEY` | — | No | OpenAI fallback LLM |
-| `AIQUANT_FINNHUB_KEY` | — | No | FinnHub market data (free tier) |
-| `AIQUANT_TELEGRAM_TOKEN` | — | No | Telegram bot token for alerts |
-| `AIQUANT_TELEGRAM_CHAT_ID` | — | No | Telegram chat/channel ID |
-| `AIQUANT_ALPACA_KEY` | — | No | Alpaca paper/live trading key |
-| `AIQUANT_ALPACA_SECRET` | — | No | Alpaca secret |
-| `AIQUANT_COINGECKO_API_KEY` | — | No | CoinGecko Pro key (rate limits) |
-| `AIQUANT_LLM_PROVIDER` | `anthropic` | No | `anthropic`, `openai`, or `ollama` |
-| `AIQUANT_LLM_MODEL` | `claude-sonnet-4-6` | No | Model name for chosen provider |
-| `AIQUANT_LLM_TEMPERATURE` | `0.1` | No | LLM temperature (lower = more deterministic) |
-| `AIQUANT_DEBATE_ROUNDS` | `2` | No | Agent debate iterations |
-| `AIQUANT_TOP_K_STOCKS` | `20` | No | Qlib candidates passed to agents |
-| `AIQUANT_PAPER_INITIAL_CASH` | `100000` | No | Paper trader starting cash (USD) |
-| `AIQUANT_MAX_POSITION_PCT` | `0.10` | No | Max single equity position |
-| `AIQUANT_MAX_CRYPTO_PCT` | `0.05` | No | Max single crypto position |
-| `AIQUANT_DRAWDOWN_LIMIT` | `0.15` | No | Portfolio circuit-breaker threshold |
-| `AIQUANT_DAILY_BUDGET_USD` | `2.0` | No | LLM cost cap per day |
-| `AIQUANT_LOG_LEVEL` | `INFO` | No | `DEBUG`, `INFO`, `WARNING` |
-| `AIQUANT_QLIB_PROVIDER_URI` | `~/.qlib/qlib_data/cn_data` | No | Qlib data directory |
-
----
-
-## CLI Reference
-
-### `aiquant` subcommands
+The environment check imports the native model/Qlib/calendar/provider packages
+and performs a Parquet round trip. It makes no provider-entitlement or performance
+claim. See [development instructions](docs/DEVELOPMENT.md) for environment details.
 
 ```bash
-aiquant setup                         # Initialise dirs, validate config
-aiquant analyze TICKER [--debate N]   # Full multi-agent analysis for one ticker
-aiquant backtest [--model MODEL]      # Walk-forward backtest
-aiquant trade status                  # Print current paper portfolio
-aiquant trade reset                   # Reset paper portfolio to initial cash
-aiquant pipeline run                  # Run daily pipeline once
-aiquant pipeline paper-loop           # Run daily pipeline on schedule
-aiquant monitor                       # Print portfolio health score
-aiquant optimize                      # Run RD-Agent factor/model search
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  uv run --locked --no-sync pytest tests/ --disable-socket --allow-unix-socket
+uv run --locked --no-sync ruff check src scripts
 ```
 
-### `scripts/` usage
+The full suite includes retained fresh-cycle acceptance cases that require a
+sufficient positive income/coverage source. These remain visible failures until
+that source exists; no fabricated completeness flag makes them eligible. Unix
+sockets support local asyncio/transport fixtures, while external TCP is disabled
+apart from explicitly scoped loopback tests.
+
+## Configuration
+
+Defaults are loaded from the typed configuration, followed by
+`config/settings.yaml`, private `config/.env`, then process environment. Nested
+`AIQUANT_SECTION__FIELD` overrides one field. See `src/utils/config.py`,
+`src/utils/config_loader.py` and `config/.env.example` for exact names.
+
+Use only credentials for the providers required by an approved job; offline
+inspection needs none. Store actual secrets privately, outside manifests and
+source control. Explicit provider/model/pricing and caps bind generative work.
+The native research gateway has a separate scoped bearer and retains its provider
+key exclusively in the gateway environment.
+
+`AIQUANT_OUTPUT_DIR` determines default durable store locations.
+`AIQUANT_PAPER_LEDGER_PATH`, `AIQUANT_PAPER_ACCOUNT_ID` and
+`AIQUANT_PAPER_BASE_CURRENCY` identify the paper book. Existing account economics
+cannot be changed by editing configuration. Historical input/source IDs and
+approved training identities remain immutable on reuse.
+
+## Canonical commands
+
+Commands consume versioned manifests, not a ticker or model label that silently
+selects replacement data. Use each command's `--help` for required paths:
 
 ```bash
-# Backtesting
-conda run -n aiquant python scripts/run_backtest.py run --model LightGBM --topk 30
-conda run -n aiquant python scripts/run_backtest.py run --with-rd-factors   # merge RD-Agent factors
-conda run -n aiquant python scripts/run_backtest.py compare --models LightGBM,CatBoost
-conda run -n aiquant python scripts/run_backtest.py validate --model LightGBM
+aiquant operations status
+aiquant analyze --help
+aiquant data --help
+aiquant decision --help
 
-# Agent analysis
-conda run -n aiquant python scripts/run_agents.py analyze AAPL
-conda run -n aiquant python scripts/run_agents.py batch --tickers AAPL,MSFT,GOOGL
-conda run -n aiquant python scripts/run_agents.py debate TSLA --rounds 3
+# Explicit chronological replay bundle
+aiquant backtest run --input replay.json --ledger replay.sqlite3 --output result.json
+aiquant backtest compare --input replay.json --result result.json --output comparisons
+aiquant backtest validate --result result.json --ledger replay.sqlite3 \
+  --costs comparisons/costs --benchmarks comparisons/benchmarks.json --output validation.json
 
-# Pipeline (idempotent — second run same day is a no-op)
-conda run -n aiquant python scripts/run_pipeline.py run
-conda run -n aiquant python scripts/run_pipeline.py paper-loop
-conda run -n aiquant python scripts/run_pipeline.py setup
+# Source preparation and the shared paper cycle
+aiquant operations refresh --input refresh.json --store operations.sqlite3 --evidence evidence.sqlite3
+aiquant pipeline build --input preparation.json --output cycle.json
+aiquant pipeline run --input cycle.json
+aiquant pipeline dispatch-pending --input cycle.json
 
-# RD-Agent research (factor/model/strategy discovery)
-conda run -n aiquant python scripts/run_rd_agent.py library-status
-conda run -n aiquant python scripts/run_rd_agent.py co-optimize --iterations 10
-conda run -n aiquant python scripts/run_rd_agent.py mine-factors --iterations 20 --min-ic 0.02
-conda run -n aiquant python scripts/run_rd_agent.py optimize-model --iterations 10
-conda run -n aiquant python scripts/run_rd_agent.py multi-trace --traces 3 --iterations 5
-conda run -n aiquant python scripts/run_rd_agent.py implement-paper ./papers/my_paper.txt
-conda run -n aiquant python scripts/run_rd_agent.py evolve-strategies --iterations 10
-conda run -n aiquant python scripts/run_rd_agent.py evolve-regime --iterations 10
-conda run -n aiquant python scripts/run_rd_agent.py copilot-factor "momentum with rising earnings"
-conda run -n aiquant python scripts/run_rd_agent.py copilot-strategy "mean reversion on earnings misses"
-conda run -n aiquant python scripts/run_rd_agent.py copilot-model --source ./papers/model.txt
-conda run -n aiquant python scripts/run_rd_agent.py ui --port 8080   # Streamlit research dashboard
+# Explicit durable schedules; separate worker processes
+python -m src.scheduler register --input schedule.json
+python -m src.scheduler serve --lane operating
+python -m src.scheduler serve --lane research
+
+# Existing research lifecycle, original-container recovery and LEAN bridge
+aiquant rd-agent --help
+aiquant rd-agent native-recover --help
+aiquant lean prepare --help
+aiquant lean check-runtime
 ```
 
----
+The installed commands and `scripts/run_backtest.py`, `run_agents.py`,
+`run_pipeline.py`, `run_rd_agent.py` and `run_operations.py` share their service
+implementations. `trade status` reads existing stores; `trade run --input ...`
+uses the same complete paper cycle. Retired `--broker`, `trade reset`, ticker-only
+pipeline and label-only backtest routes do not authorize execution.
 
-## How the Agents Work
+## Deployment and evidence
 
-The LangGraph agent graph is assembled in `src/agents/graph.py` via `build_trading_desk_graph()`.
-Every analysis begins with a shared `TradingDeskState` TypedDict that flows through the graph.
+[Deployment instructions](docs/DEPLOYMENT.md) describe the application image,
+shared durable volumes, separate scheduler processes, recovery and native runtime
+requirements. Compose binds the dashboard only to host loopback. Docker Desktop
+WSL integration and the LEAN runtime are unavailable in the current verification
+environment; image/runtime acceptance is outstanding.
 
-### Macro Regime Detector
+Implementation records include exact source pins, offline test commands and
+remaining limitations:
 
-Reads VIX level, yield-curve slope, and recent SPY return to classify the current environment
-as one of four regimes: `risk_on`, `neutral`, `risk_off`, or `crisis`. All downstream agents
-receive this classification and adjust their conviction thresholds accordingly.
+- [Data and quantitative models](docs/implementation/data-quant.md)
+- [Accounting, venues and LEAN](docs/implementation/accounting-backtesting.md)
+- [Agents, decision service and operating cycle](docs/implementation/jev-agents.md)
+- [Root operations](docs/implementation/operations.md)
+- [Research and native execution](docs/implementation/research.md)
+- [Income-source sufficiency assessment](docs/implementation/income-source-assessment.md)
 
-### Fundamental Analyst (CFA persona)
-
-Uses `get_financials`, `get_insider_trades`, `get_analyst_ratings`, and `get_sec_filings` tools
-to assess balance-sheet quality, earnings trajectory, and management credibility. Outputs a
-structured `AgentReport` with a verdict and supporting evidence.
-
-### Sentiment Analyst (alt-data persona)
-
-Combines `get_company_news`, `get_fear_greed_index`, and social-data proxies to gauge crowd
-positioning. Specifically watches for divergence between price action and sentiment — extreme
-pessimism in an uptrend is often a contrarian buy signal.
-
-### Technical Analyst (CMT persona)
-
-Computes RSI, MACD, Bollinger Bands, ATR, and OBV from `get_stock_history` data. Identifies
-support/resistance levels and trend phase. Acts as an independent signal that can confirm or
-reject the fundamental thesis.
-
-### Debate Loop
-
-`DebateManager` in `src/agents/debate.py` runs `N` configurable rounds (default 2) where each
-analyst can rebut the others' reports. This surfaces genuine disagreement rather than groupthink
-and often changes the final conviction score by ±0.1–0.2.
-
-### Risk Manager (CRO / veto power)
-
-Receives the consolidated analyst reports and the current portfolio state. Applies six pre-trade
-checks (see Risk Management section). If any hard limit is breached the Risk Manager emits a
-`VETO` that halts the position. No other node can override this veto.
-
-### Portfolio Strategist (PM synthesis)
-
-Aggregates all analyst reports, the debate transcript, and the risk verdict into a final
-`AnalysisResult` Pydantic model with `decision`, `confidence`, `target_price`, `stop_loss`,
-`position_size_pct`, `time_horizon`, and `reasoning` fields.
-
----
-
-## Risk Management Framework
-
-Risk controls are enforced at two layers: the Risk Manager agent (qualitative) and
-`src/execution/risk_controls.py` (quantitative, hard limits).
-
-| Limit | Default | Notes |
-|---|---|---|
-| Max single equity position | 10% | Hard limit; veto if exceeded |
-| Max single crypto position | 5% | Crypto is higher volatility |
-| Max sector concentration | 30% | GICS sector classification |
-| Total crypto allocation | 5% – 25% | Range; adjusts with macro regime |
-| Min cash buffer | 5% | Always keep 5% uninvested |
-| Drawdown circuit breaker | −15% | Halts all new trades until reset |
-| Daily turnover limit | 25% | Prevents over-trading |
-| Leverage | Long-only | No shorting, no margin |
-
-When the drawdown circuit breaker fires, the scheduler stops submitting new orders until an
-operator manually confirms the state via `aiquant trade reset` or the portfolio recovers above
-the threshold.
-
----
-
-## Success Criteria Checklist
-
-These are the target milestones for production readiness (TASK-07):
-
-- [ ] Walk-forward Sharpe ratio > 1.0 on held-out test period
-- [ ] Backtest validation suite returns zero FAIL verdicts
-- [ ] Out-of-sample return beats random stock picker at 95th percentile
-- [ ] Positive Sharpe in at least 2 of 4 macro regimes (risk_on, neutral, risk_off, crisis)
-- [ ] 3+ consecutive months of paper trading with full audit trail
-- [ ] Maximum portfolio drawdown remains below 15% during paper trading
-- [ ] Agent reasoning manually reviewed for 20+ unique tickers
-- [ ] 30+ consecutive daily pipeline runs without unhandled exceptions
-- [ ] All monitoring channels working (Telegram alerts, Streamlit dashboard, log rotation)
-- [ ] Total LLM API cost stays below €2/day average over rolling 30 days
-
----
-
-## Expansion Roadmap
-
-The following capabilities are planned but not yet implemented:
-
-- **Short-selling** — integrate borrowing cost model; add SHORT signal to AnalysisResult
-- **Options strategies** — use `get_options_data` tool already wired; implement delta-neutral sizing
-- **Live trading via Alpaca** — the LEAN bridge supports it; requires Alpaca account verification
-- **Additional data sources** — Quandl macro series, earnings call transcript NLP, satellite data
-- **Multi-asset allocation** — extend MetaAllocator to commodities and fixed income ETFs
-- **On-premise LLM** — Ollama provider is already wired; test with Llama-3 70B for cost reduction
-- **Web3 on-chain data** — DeFi protocol TVL, whale wallet tracking via Dune Analytics
-
----
-
-## Risk Disclaimer
-
-**This software is for educational and research purposes only. It is not financial advice and
-should not be used to make real investment decisions without independent professional guidance.**
-
-Algorithmic trading involves significant risk of capital loss. Past simulated performance does
-not guarantee future results. The authors and contributors accept no liability for financial
-losses incurred through use of this software. Always consult a licensed financial professional
-before deploying capital.
-
----
+A passed local test does not substitute for real source coverage, calibrated
+agent quality, held-out statistics or the prospective release requirements. No
+live-capital authorization is implied by this repository.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for full text.
-
-Copyright (c) 2024 QuantAgentLab Contributors
+MIT License — see [LICENSE](LICENSE).
