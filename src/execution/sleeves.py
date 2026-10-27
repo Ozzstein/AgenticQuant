@@ -99,6 +99,8 @@ class SleeveBook:
     def __init__(self, ledger: PortfolioLedger, account_id: str):
         self.ledger, self.account_id = ledger, account_id
         ledger.spec(account_id)
+        if ledger.db.execute("PRAGMA query_only").fetchone()[0]:
+            return
         # Executescript would commit an enclosing replay transaction. Individual
         # DDL statements preserve that transaction and its crash boundary.
         for sql in (
@@ -106,6 +108,7 @@ class SleeveBook:
             "CREATE TABLE IF NOT EXISTS sleeve_intents(account TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,id))",
             "CREATE TABLE IF NOT EXISTS sleeve_fees(account TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,id))",
             "CREATE TABLE IF NOT EXISTS sleeve_observations(account TEXT NOT NULL, sleeve TEXT NOT NULL, at TEXT NOT NULL, source_hash TEXT NOT NULL, nav TEXT NOT NULL, flow TEXT NOT NULL, PRIMARY KEY(account,sleeve,at,source_hash))",
+            "CREATE TABLE IF NOT EXISTS sleeve_snapshot_receipts(account TEXT NOT NULL, at TEXT NOT NULL, source_hash TEXT NOT NULL, payload TEXT NOT NULL, receipt_hash TEXT NOT NULL, PRIMARY KEY(account,at,source_hash))",
         ):
             ledger.db.execute(sql)
 
@@ -163,11 +166,15 @@ class SleeveBook:
             )
         return self
 
-    def _state(self):
-        rows = list(
-            self.ledger.db.execute(
-                "SELECT * FROM sleeve_events WHERE account=? ORDER BY rowid", (self.account_id,)
+    def _state(self, *, rows=None, contexts=None):
+        rows = (
+            list(
+                self.ledger.db.execute(
+                    "SELECT * FROM sleeve_events WHERE account=? ORDER BY rowid", (self.account_id,)
+                )
             )
+            if rows is None
+            else rows
         )
         if not rows or rows[0]["kind"] != "initial":
             raise LedgerError("sleeve capital has not been initialized")
@@ -191,7 +198,7 @@ class SleeveBook:
             "allocated": defaultdict(lambda: defaultdict(lambda: ZERO)),
             "rows": rows,
         }
-        contexts = self._source_context()
+        contexts = self._source_context() if contexts is None else contexts
         for row in rows[1:]:
             payload, at = json.loads(row["payload"]), datetime.fromisoformat(row["at"])
             if row["kind"] == "fill":
@@ -319,13 +326,15 @@ class SleeveBook:
                 (self.account_id, intent.intent_id, payload),
             )
 
-    def _source_context(self):
+    def _source_context(self, journals=None):
         contexts, basis, cash = {}, defaultdict(lambda: ZERO), ZERO
         held = defaultdict(lambda: ZERO)
         total_fees, total_realized, total_taxes = ZERO, ZERO, ZERO
-        for row in self.ledger.db.execute(
-            "SELECT * FROM journal WHERE account=? ORDER BY sequence", (self.account_id,)
-        ):
+        if journals is None:
+            journals = self.ledger.db.execute(
+                "SELECT * FROM journal WHERE account=? ORDER BY sequence", (self.account_id,)
+            )
+        for row in journals:
             if row["kind"] in ("dividend_entitlement", "dividend_payment"):
                 cash = exact_sum([cash, D(row["cash_delta"])])
             elif row["kind"] == "fill":
@@ -914,146 +923,153 @@ class SleeveBook:
             )
             return orders
 
+    def observation(self, at, *, source_hash=None) -> dict[str, SleeveSnapshot] | None:
+        """Read one exact historical full receipt, never project current balances."""
+        from src.execution.sleeve_observations import read_observation
+
+        return read_observation(self, _utc(at), source_hash=source_hash)
+
     def snapshot(self, at, max_price_age_seconds=345600, *, persist=True):
+        from src.execution.sleeve_observations import persist_observation
+
         at = _utc(at)
         with self.ledger.atomic():
             state = self.sync()
             canonical = self.ledger.snapshot(
                 self.account_id, at, max_price_age_seconds, persist=False
             )
-            names = sorted(state["cash"])
-            positions = {name: [] for name in names}
-            for held in canonical.positions:
-                key = held.instrument.instrument_id
-                owners = {
-                    name: state["quantities"][name][key]
-                    for name in names
-                    if state["quantities"][name][key]
-                }
-                values, basis = (
-                    partition(held.market_value, owners),
-                    partition(held.cost_basis, owners),
+            pending = self.ledger.pending(self.account_id)
+            history = list(
+                self.ledger.db.execute(
+                    "SELECT * FROM sleeve_observations WHERE account=? AND at<=? ORDER BY rowid",
+                    (self.account_id, at.isoformat()),
                 )
-                for name, qty in owners.items():
-                    positions[name].append(
-                        Holding(
-                            **{
-                                **held.model_dump(),
-                                "quantity": qty,
-                                "market_value": values[name],
-                                "cost_basis": basis[name],
-                                "opened_at": state["opened"][name][key],
-                            }
-                        )
-                    )
-            reserved = dict.fromkeys(names, ZERO)
-            for order in self.ledger.pending(self.account_id):
-                allocation = self._intent(order["intent"].intent_id)
-                remaining = {
-                    k: D(v) - state["allocated"][order["intent"].intent_id][k]
-                    for k, v in allocation["allocations"].items()
-                }
-                for name, amount in partition(order["reserved"], remaining).items():
-                    reserved[name] = exact_sum([reserved[name], amount])
-            nav = {
-                name: exact_sum(
-                    [
-                        state["cash"][name],
-                        *(p.market_value for p in positions[name]),
-                        *(amounts.get(name, ZERO) for amounts in state["receivables"].values()),
-                    ]
-                )
-                for name in names
-            }
-            rounding = exact_sum([canonical.nav, exact_sum(nav.values()).copy_negate()])
-            # Finite canonical Decimal valuation can differ from exact sums of
-            # its components. Assign that residual only to an economic owner;
-            # an empty sleeve cannot gain funding or acquire a negative NAV.
-            rounding_owner = None
-            if rounding:
-                candidates = [
-                    name
-                    for name in names
-                    if nav[name] > 0 and exact_sum([nav[name], rounding]) >= 0
-                ]
-                if not candidates:
-                    raise LedgerError("no funded sleeve can absorb canonical valuation residual")
-                rounding_owner = candidates[-1]
-                nav[rounding_owner] = exact_sum([nav[rounding_owner], rounding])
-            source = [
-                {
-                    "id": r["id"],
-                    "at": r["at"],
-                    "kind": r["kind"],
-                    "payload": json.loads(r["payload"]),
-                }
-                for r in state["rows"]
-            ]
-            source_hash = digest(
-                {"events": source, "canonical_snapshot": canonical.model_dump(mode="json")}
             )
-            output = {}
-            for name in names:
-                history = self.ledger.db.execute(
-                    "SELECT nav,flow FROM sleeve_observations WHERE account=? AND sleeve=? AND at<=?",
-                    (self.account_id, name, at.isoformat()),
-                )
-                high_water = max(
-                    [nav[name]]
-                    + [
-                        exact_sum([D(row[0]), state["flow"][name], D(row[1]).copy_negate()])
-                        for row in history
-                    ]
-                )
-                leaf = PortfolioSnapshot(
-                    account_id=self.account_id + "/sleeve/" + name,
-                    as_of=at,
-                    cash=state["cash"][name],
-                    reserved_cash=reserved[name],
-                    nav=nav[name],
-                    high_water_mark=high_water,
-                    realized_pnl=state["realized"][name],
-                    fees=state["fees"][name],
-                    turnover_today=state["turnover"][at.date().isoformat()][name],
-                    positions=tuple(positions[name]),
-                    receivables=tuple(
-                        DividendReceivable(
-                            entitlement=DividendEntitlement.model_validate(
-                                state["dividend_allocations"][action][name]
-                            ),
-                            outstanding=amounts[name],
-                        )
-                        for action, amounts in sorted(state["receivables"].items())
-                        if amounts.get(name, ZERO) > 0
-                    ),
-                    withholding_taxes=state["taxes"][name],
-                )
-                output[name] = SleeveSnapshot(
-                    portfolio=leaf,
-                    net_capital_flow=state["flow"][name],
-                    last_rebalanced_at=state["last"][name],
-                    source_hash=source_hash,
-                    source_event_ids=tuple(r["id"] for r in state["rows"]),
-                    valuation_rounding=rounding if name == rounding_owner else ZERO,
-                )
-                if persist:
-                    self.ledger.db.execute(
-                        "INSERT OR IGNORE INTO sleeve_observations VALUES (?,?,?,?,?,?)",
-                        (
-                            self.account_id,
-                            name,
-                            at.isoformat(),
-                            source_hash,
-                            str(nav[name]),
-                            str(state["flow"][name]),
-                        ),
-                    )
-            if (
-                exact_sum(s.portfolio.nav for s in output.values()) != canonical.nav
-                or exact_sum(s.portfolio.cash for s in output.values()) != canonical.cash
-            ):
-                raise LedgerError("sleeve NAV/cash reconciliation failed")
+            output = self._project_snapshot(at, state, canonical, pending, history)
+            if persist:
+                persist_observation(self, canonical, state, pending, history, output)
             return output
+
+    def _project_snapshot(self, at, state, canonical, pending, history):
+        """The same projection for current publication and frozen receipt checks."""
+        if any(datetime.fromisoformat(row["at"]) > at for row in state["rows"]):
+            raise LedgerError("sleeve observation cannot include future ownership events")
+        names = sorted(state["cash"])
+        positions = {name: [] for name in names}
+        for held in canonical.positions:
+            key = held.instrument.instrument_id
+            owners = {
+                name: state["quantities"][name][key]
+                for name in names
+                if state["quantities"][name][key]
+            }
+            values, basis = (
+                partition(held.market_value, owners),
+                partition(held.cost_basis, owners),
+            )
+            for name, qty in owners.items():
+                positions[name].append(
+                    Holding(
+                        **{
+                            **held.model_dump(),
+                            "quantity": qty,
+                            "market_value": values[name],
+                            "cost_basis": basis[name],
+                            "opened_at": state["opened"][name][key],
+                        }
+                    )
+                )
+        reserved = dict.fromkeys(names, ZERO)
+        for order in pending:
+            allocation = self._intent(order["intent"].intent_id)
+            remaining = {
+                k: D(v) - state["allocated"][order["intent"].intent_id][k]
+                for k, v in allocation["allocations"].items()
+            }
+            for name, amount in partition(order["reserved"], remaining).items():
+                reserved[name] = exact_sum([reserved[name], amount])
+        nav = {
+            name: exact_sum(
+                [
+                    state["cash"][name],
+                    *(p.market_value for p in positions[name]),
+                    *(amounts.get(name, ZERO) for amounts in state["receivables"].values()),
+                ]
+            )
+            for name in names
+        }
+        rounding = exact_sum([canonical.nav, exact_sum(nav.values()).copy_negate()])
+        # Finite canonical Decimal valuation can differ from exact sums of
+        # its components. Assign that residual only to an economic owner;
+        # an empty sleeve cannot gain funding or acquire a negative NAV.
+        rounding_owner = None
+        if rounding:
+            candidates = [
+                name for name in names if nav[name] > 0 and exact_sum([nav[name], rounding]) >= 0
+            ]
+            if not candidates:
+                raise LedgerError("no funded sleeve can absorb canonical valuation residual")
+            rounding_owner = candidates[-1]
+            nav[rounding_owner] = exact_sum([nav[rounding_owner], rounding])
+        source = [
+            {
+                "id": r["id"],
+                "at": r["at"],
+                "kind": r["kind"],
+                "payload": json.loads(r["payload"]),
+            }
+            for r in state["rows"]
+        ]
+        source_hash = digest(
+            {"events": source, "canonical_snapshot": canonical.model_dump(mode="json")}
+        )
+        output = {}
+        for name in names:
+            high_water = max(
+                [nav[name]]
+                + [
+                    exact_sum([D(row["nav"]), state["flow"][name], D(row["flow"]).copy_negate()])
+                    for row in history
+                    if row["sleeve"] == name
+                ]
+            )
+            leaf = PortfolioSnapshot(
+                account_id=self.account_id + "/sleeve/" + name,
+                as_of=at,
+                cash=state["cash"][name],
+                reserved_cash=reserved[name],
+                nav=nav[name],
+                high_water_mark=high_water,
+                realized_pnl=state["realized"][name],
+                fees=state["fees"][name],
+                turnover_today=state["turnover"][at.date().isoformat()][name],
+                positions=tuple(positions[name]),
+                receivables=tuple(
+                    DividendReceivable(
+                        entitlement=DividendEntitlement.model_validate(
+                            state["dividend_allocations"][action][name]
+                        ),
+                        outstanding=amounts[name],
+                    )
+                    for action, amounts in sorted(state["receivables"].items())
+                    if amounts.get(name, ZERO) > 0
+                ),
+                withholding_taxes=state["taxes"][name],
+            )
+            output[name] = SleeveSnapshot(
+                portfolio=leaf,
+                net_capital_flow=state["flow"][name],
+                last_rebalanced_at=state["last"][name],
+                source_hash=source_hash,
+                source_event_ids=tuple(r["id"] for r in state["rows"]),
+                valuation_rounding=rounding if name == rounding_owner else ZERO,
+            )
+        if (
+            exact_sum(s.portfolio.nav for s in output.values()) != canonical.nav
+            or exact_sum(s.portfolio.cash for s in output.values()) != canonical.cash
+        ):
+            raise LedgerError("sleeve NAV/cash reconciliation failed")
+        return output
 
     def performance_period(self, opening, ended_at, *, available_at=None):
         """Verified kwargs for AttributedPerformanceStore.record_nav.
