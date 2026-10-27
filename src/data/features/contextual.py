@@ -5,6 +5,7 @@ They do not grant permission to trade the source derivative instrument.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Literal
 
@@ -58,42 +59,58 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
     sources = pd.Series([() for _ in index], index=index, dtype=object)
     coverage, used = [], {}
     complete = pd.Series(True, index=index)
+    prefetched, normalized = {}, {}
+    target_rows = {instrument:tuple(key for key in index if key[1] == instrument) for instrument in set(index.get_level_values("instrument"))}
     for binding in bindings:
         if binding.source_market == "global" and binding.source_instrument_id is not None:
             raise ValueError("global binding cannot invent an instrument identity")
         if binding.source_market != "global" and not binding.source_instrument_id:
             raise ValueError("explicit source instrument required")
-        for date, instrument_id in index:
-            if instrument_id != binding.target_instrument_id:
-                continue
+        cache_key = (binding.kind, binding.source_instrument_id)
+        if cache_key not in prefetched:
+            query = store.query(as_of=context.as_of,kind=binding.kind,
+                                instrument_id=binding.source_instrument_id,current_revisions_only=False)
+            records = [item for item in query.records if allowed_evidence_ids is None or item.record.evidence_id in allowed_evidence_ids]
+            records.sort(key=lambda item:(max(item.record.available_at,item.record.requested_as_of or item.record.available_at),item.record.evidence_id))
+            ready = tuple(max(item.record.available_at,item.record.requested_as_of or item.record.available_at) for item in records)
+            prefetched[cache_key] = (ready,records)
+        ready_times, envelopes = prefetched[cache_key]
+        parsed = {}
+        for date, instrument_id in target_rows.get(binding.target_instrument_id, ()):
             key = (date, instrument_id)
-            query = store.query(as_of=date.to_pydatetime(), kind=binding.kind,
-                                instrument_id=binding.source_instrument_id, current_revisions_only=False)
-            pinned = [item for item in query.records if allowed_evidence_ids is None or item.record.evidence_id in allowed_evidence_ids]
+            pinned = envelopes[:bisect_right(ready_times,date.to_pydatetime())]
+            # Supersession is resolved after BOTH the frozen whitelist and the
+            # date-local availability cut, never at the final retrieval clock.
+            for item in pinned:
+                item.record.require_available(date.to_pydatetime())
             superseded = {item.supersedes_id for item in pinned if item.supersedes_id}
             candidates = []
             for envelope in pinned:
                 record = envelope.record
                 if record.evidence_id in superseded:
                     continue
-                payload = store.normalized(record.evidence_id, as_of=date.to_pydatetime())
+                if record.evidence_id not in normalized:
+                    normalized[record.evidence_id] = store.normalized(record.evidence_id,as_of=date.to_pydatetime())
+                payload = normalized[record.evidence_id]
                 if any(str(payload.get(field)) != value for field, value in binding.filters):
                     continue
                 if binding.source_market == "global" and record.instrument_ids:
                     continue
                 if binding.source_market == "perpetual" and payload.get("market_type") != "perpetual":
                     raise ValueError("derivative binding requires declared perpetual provenance")
-                try:
-                    observed = pd.Timestamp(_at(payload, binding.observation_date_path)) if binding.observation_date_path else pd.Timestamp(record.observed_at or record.available_at)
-                    # A date-only fiscal/observation label is an event date, never
-                    # a publication/availability assertion.
-                    if observed.tzinfo is None:
-                        observed = observed.tz_localize("UTC")
-                    number = float(_at(payload, binding.value_path))
-                except (KeyError, IndexError, TypeError, ValueError):
-                    raise ValueError(f"malformed numeric evidence for {binding.name}: {record.evidence_id}") from None
-                if not np.isfinite(number):
-                    raise ValueError(f"nonfinite numeric evidence: {record.evidence_id}")
+                if record.evidence_id not in parsed:
+                    try:
+                        observed = pd.Timestamp(_at(payload, binding.observation_date_path)) if binding.observation_date_path else pd.Timestamp(record.observed_at or record.available_at)
+                        # Event date is never a publication/availability assertion.
+                        if observed.tzinfo is None:
+                            observed = observed.tz_localize("UTC")
+                        number = float(_at(payload, binding.value_path))
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        raise ValueError(f"malformed numeric evidence for {binding.name}: {record.evidence_id}") from None
+                    if not np.isfinite(number):
+                        raise ValueError(f"nonfinite numeric evidence: {record.evidence_id}")
+                    parsed[record.evidence_id] = (observed,number)
+                observed,number = parsed[record.evidence_id]
                 if observed > date or (date-observed).total_seconds() > binding.max_age_seconds:
                     continue
                 candidates.append((observed, number, record))

@@ -190,3 +190,9 @@ Verification: combined authoritative-agent/numeric/paired-regime suite **8 passe
 Verification: exact DST/weekend and Thanksgiving early-close calendars; later receipt cutoffs; flow-adjusted compounding; 24 hourly cycles counted as one day; missing close/gap/return corruption rejected; zero-NAV refueling creates no synthetic returns; funding identities/cutoffs/reset constraints; existing executable strategies/allocation tests. No new dependencies or shared schema changes.
 
 Daily/funded-epoch checkpoint verification: **23 tests passed in 5.00s** with `--disable-socket`, pinned root `0caaba1f0b8f89ae74df36f0770bd8b493446d0b` shared imports, owned source from this worktree; Ruff and diff checks passed.
+
+### Frozen contextual-evidence materialization performance
+
+`materialize_evidence_fields` now queries each `(kind, source_instrument_id)` once at the explicit final cutoff, indexes envelopes by effective availability, and caches immutable normalized payload/scalar parsing only within that call. Every date still invokes `require_available`; whitelist filtering precedes date-local supersession; conflicting revisions and unknown coverage retain their prior behavior. No cross-run cache can hide newly appended evidence.
+
+Verification: **18 contextual/executable strategy tests passed in 3.37s** offline. The new invariant compares each prefetched historical row to an independently materialized date-specific cutoff, tests future revisions/conflicts/frozen whitelists/new appended revisions, and requires exactly one query for shared bindings and one normalized read per eligible evidence ID. This removes repeated SQLite/envelope/JSON parsing across the full date history without changing provenance identities.
