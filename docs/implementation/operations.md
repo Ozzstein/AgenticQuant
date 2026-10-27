@@ -58,3 +58,40 @@ contents. Receipt verification alone never authorizes a fill: `PaperVenue.settle
 separately requires durable acceptance before the open, original admitted risk
 metadata and chronological accounting. Already published NAV is not silently
 restated. Thirty-one source/venue/validation tests passed offline in 3.63 seconds.
+
+## Operating source dependencies
+
+`FetchTask(provider='operating', ...)` exposes the closed operations in
+`src.operations.operating_fetch.OPERATIONS`: Alpaca calendar/bars/reference/trades/
+corporate actions, Kraken and Binance bars/reference/trades/calendar,
+`current_universe`, and `economic_bundle`. These adapters own the measured archive
+clock inside their normalized economics and receive the underlying `EvidenceStore`.
+Wrapping them in `CaptureStore` would invalidate their exact source clocks.
+The existing worker deadline applies; the request cap is shared across all hosts
+used by one operation, including Alpaca plus FMP reference capture.
+
+`source_arguments` contains `FetchSourceRef(argument, task_id, kind, selection)`.
+Each reference must name an earlier task in the same immutable refresh plan.
+For example, `calendar_id` selects one `operating_calendar`, `bar_ids` selects all
+`bar` records, and `reference_ids` selects all `operating_reference` records from
+the declared task receipts. Scalar arguments require `selection='one'`; arrays
+require `'all'`. Missing, duplicate, ambiguous or changed sources fail. The stage
+receipt binds the original task, resolved task and every dependency envelope
+hash. Failed calls retain reservations and do not automatically repeat.
+
+The final `economic_bundle` operation derives exact source bindings and archives
+the availability audit before the refresh completion clock. It takes explicit
+instruments, market start and source IDs (or preceding task references). It does
+not invent missing actions, liquidity, metadata or coverage. Use
+`load_operating_sources(operations, evidence, refresh_run_id)` to recover the
+bindings from the authoritative completed manifest, stage receipt and transitive
+source proof for `PaperCycleService.prepare`. Completed refreshes replay their
+original receipts even after the original freshness window expires; each new
+fetch admission still enforces the actual request-age limit. Do not edit old
+immutable refresh plans to add dependencies; admit a new run identity.
+
+Verification: 33 offline refresh/operating adapter tests passed, followed by 20
+refresh tests covering the final reader and replay after freshness expiry.
+Provider wires in these tests are synthetic. Current ADV freshness, genuine
+opening-event composition and mixed-calendar operating acceptance remain separate
+checks; these receipt tests do not establish them or authenticated entitlements.

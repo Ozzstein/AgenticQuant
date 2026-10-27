@@ -29,9 +29,17 @@ from src.domain.common import (
 from src.operations.store import OperationError, OperationsStore, RunManifest, canonical, digest
 
 
+class FetchSourceRef(VersionedContract):
+    argument: Literal['calendar_id','calendar_ids','bar_ids','reference_id','reference_ids',
+                      'universe_ids','print_ids','action_ids','fx_evidence_id']
+    task_id: NonEmptyString
+    kind: NonEmptyString
+    selection: Literal['one','all'] = 'one'
+
+
 class FetchTask(VersionedContract):
     task_id: NonEmptyString
-    provider: Literal['fmp','fred','finnhub','sec','coingecko','alpaca','ccxt','yfinance','mcp']
+    provider: Literal['fmp','fred','finnhub','sec','coingecko','alpaca','ccxt','yfinance','mcp','operating']
     operation: NonEmptyString
     instrument: Instrument | None = None
     arguments_json: str = '{}'
@@ -40,12 +48,33 @@ class FetchTask(VersionedContract):
     max_http_requests: int = Field(default=30,ge=1,le=1000)
     mcp_manifest: ServerManifest | None = None
     bearer_env: str | None = None
+    source_arguments: tuple[FetchSourceRef,...] = ()
 
     @model_validator(mode='after')
     def closed_input(self):
         arguments=json.loads(self.arguments_json)
         if not isinstance(arguments,dict) or canonical(arguments).decode()!=self.arguments_json:
             raise ValueError('fetch arguments must use canonical object JSON')
+        if self.source_arguments and self.provider!='operating':
+            raise ValueError('source argument dependencies belong to closed operating tasks')
+        scalar_arguments={'calendar_id','reference_id','fx_evidence_id'}
+        scalar_seen=set()
+        references=set()
+        for ref in self.source_arguments:
+            if (ref.argument in scalar_arguments)!=(ref.selection=='one'):
+                raise ValueError('source selection must match scalar or array argument')
+            identity=(ref.argument,ref.task_id,ref.kind)
+            if identity in references or (ref.selection=='one' and ref.argument in scalar_seen):
+                raise ValueError('duplicate source argument dependency')
+            references.add(identity)
+            if ref.selection=='one':
+                scalar_seen.add(ref.argument)
+        if any(ref.argument in arguments for ref in self.source_arguments):
+            raise ValueError('source reference cannot override a literal argument')
+        if self.provider=='operating':
+            from src.operations.operating_fetch import OPERATIONS
+            if self.operation not in OPERATIONS or (set(arguments)|{r.argument for r in self.source_arguments})-set(OPERATIONS[self.operation]):
+                raise ValueError('operating operation/arguments are not permitted')
         if self.provider=='mcp':
             if self.mcp_manifest is None:
                 raise ValueError('MCP fetch needs an exact deployed manifest')
@@ -82,6 +111,13 @@ class RefreshPlan(VersionedContract):
             raise ValueError('refresh requires a current paper/research context and due schedule')
         if len({t.task_id for t in self.tasks})!=len(self.tasks):
             raise ValueError('unique refresh task IDs required')
+        seen=set()
+        for index, task in enumerate(self.tasks):
+            if any(ref.task_id not in seen for ref in task.source_arguments):
+                raise ValueError('source dependencies must name earlier tasks in the same immutable plan')
+            if task.provider=='operating' and task.operation=='economic_bundle' and index!=len(self.tasks)-1:
+                raise ValueError('economic bundle must be the final refresh capture')
+            seen.add(task.task_id)
         manifests={}
         for task in self.tasks:
             if task.mcp_manifest:
@@ -143,7 +179,11 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
             raise ProviderError(task.provider,'explicit_instrument_required')
         return task.instrument
     try:
-        if task.provider=='fmp':
+        if task.provider=='operating':
+            from src.operations.operating_fetch import fetch_operating
+            # This adapter owns its measured clock inside normalized economics.
+            result,counts=fetch_operating(task,context,store)
+        elif task.provider=='fmp':
             from src.data.adapters.fundamentals import FMPAdapter
             args=_arguments(task,('year','quarter','limit'))
             adapter=FMPAdapter(capture,os.getenv('FMP_API_KEY'),http=http('fmp','https://financialmodelingprep.com/stable'))
@@ -291,8 +331,42 @@ class RefreshService:
                 CREATE TABLE IF NOT EXISTS refresh_calls(run_id TEXT,task_id TEXT,day TEXT,task_hash TEXT,
                     reserved_usd TEXT,receipt_hash TEXT,PRIMARY KEY(run_id,task_id));''')
 
-    def _call(self,plan,task):
+    def _resolve(self,task,receipts):
+        if not task.source_arguments:
+            return task,[]
+        arguments=json.loads(task.arguments_json)
+        bindings=[]
+        for reference in task.source_arguments:
+            receipt=receipts[reference.task_id]
+            if receipt['status']!='available':
+                raise OperationError('required dependency source task is unavailable')
+            selected=[]
+            for source in receipt['sources']:
+                envelope=self.evidence.get(source['evidence_id'])
+                if envelope.content_hash()!=source['envelope_hash']:
+                    raise OperationError('dependency source identity changed')
+                if envelope.kind==reference.kind:
+                    selected.append(envelope.record.evidence_id)
+                    bindings.append({'argument':reference.argument,'source_task':reference.task_id,**source})
+            if not selected or (reference.selection=='one' and len(selected)!=1):
+                raise OperationError('dependency kind lacks exact required source coverage')
+            if reference.selection=='one':
+                if reference.argument in arguments:
+                    raise OperationError('duplicate scalar source dependency')
+                arguments[reference.argument]=selected[0]
+            else:
+                target=arguments.setdefault(reference.argument,[])
+                if set(target)&set(selected):
+                    raise OperationError('duplicate source identity in dependency array')
+                target.extend(selected)
+        resolved=FetchTask.model_validate({**task.model_dump(), 'source_arguments':(),
+                                          'arguments_json':canonical(arguments).decode()})
+        return resolved,bindings
+
+    def _call(self,plan,task,resolved=None,dependencies=()):
         now=datetime.now(timezone.utc)
+        if not 0 <= (now-plan.context.as_of).total_seconds() <= plan.max_age_seconds:
+            raise OperationError('refresh context is future or stale')
         day=now.date().isoformat()
         caps=canonical({'fetches':plan.max_fetches_per_day,'mcp_reserved_usd':str(plan.max_mcp_reserved_usd_per_day)}).decode()
         with self.operations.connection() as db:
@@ -306,7 +380,8 @@ class RefreshService:
                 raise OperationError('durable refresh request/MCP spend limit exhausted')
             db.execute('INSERT INTO refresh_calls VALUES (?,?,?,?,?,NULL)',
                        (plan.context.run_id,task.task_id,day,task.content_hash(),str(task.reserved_cost)))
-        result=self.fetcher(task,plan.context,self.evidence)
+        resolved=resolved or task
+        result=self.fetcher(resolved,plan.context,self.evidence)
         # Store actual envelope identities, not a provider's success boolean.
         sources=[]
         identities=result.get('evidence_ids',[])
@@ -330,7 +405,8 @@ class RefreshService:
             sources.append({'evidence_id':identity,'envelope_hash':envelope.content_hash()})
         receipt={**result,'sources':sources,'reserved_mcp_cost_usd':str(task.reserved_cost),
                  'cost_semantics':'MCP maximum reserved; direct subscription/entitlement costs not measured',
-                 'task_hash':task.content_hash()}
+                 'task_hash':task.content_hash(),'resolved_task_hash':resolved.content_hash(),
+                 'dependency_sources':list(dependencies)}
         key=self.operations.archive(receipt)
         with self.operations.connection() as db:
             db.execute('UPDATE refresh_calls SET receipt_hash=? WHERE run_id=? AND task_id=?',
@@ -343,16 +419,20 @@ class RefreshService:
         return receipt
 
     def run(self,plan:RefreshPlan)->dict:
-        now=datetime.now(timezone.utc)
-        if not 0 <= (now-plan.context.as_of).total_seconds() <= plan.max_age_seconds:
-            raise OperationError('refresh context is future or stale')
         stages=tuple('fetch:'+task.task_id for task in plan.tasks)+('report',)
         manifest=RunManifest(context=plan.context,kind='data',input_hash=plan.content_hash(),
                              scheduled_for=plan.scheduled_for,stages=stages)
         self.operations.admit(manifest,plan.model_dump(mode='json'))
         with self.operations.exclusive('refresh:'+plan.context.run_id):
-            receipts={task.task_id:self.operations.stage(plan.context.run_id,'fetch:'+task.task_id,
-                task.model_dump(mode='json'),lambda task=task:self._call(plan,task)) for task in plan.tasks}
+            receipts={}
+            for task in plan.tasks:
+                resolved,dependencies=self._resolve(task,receipts)
+                stage_input=task.model_dump(mode='json') if not dependencies else {
+                    'task':task.model_dump(mode='json'),'resolved_task':resolved.model_dump(mode='json'),
+                    'dependency_sources':dependencies}
+                receipts[task.task_id]=self.operations.stage(plan.context.run_id,'fetch:'+task.task_id,
+                    stage_input,lambda task=task,resolved=resolved,dependencies=dependencies:
+                    self._call(plan,task,resolved,dependencies))
             def report():
                 completed=datetime.now(timezone.utc)
                 return {'context':plan.context.model_copy(update={'as_of':completed}).model_dump(mode='json'),
