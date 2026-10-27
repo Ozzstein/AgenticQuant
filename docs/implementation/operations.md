@@ -347,6 +347,7 @@ The root editable package was reinstalled offline from the existing lock after
 the full audit; the installed `aiquant` entry point now imports packaged scripts
 without a PYTHONPATH override. No dependency versions changed. Root source Ruff
 and diff checks pass. These focused counts are not a whole-repository green claim.
+
 ### Dated dominance refresh and configured credentials
 
 The closed CoinGecko dispatch now exposes `current_dominance` (optional
@@ -374,3 +375,32 @@ HTTP transport. Evidence includes both native origins/header keys, exact cap
 ratios and clocks, request-budget exhaustion retaining raw evidence, immutable
 restart, configured FMP/Alpaca credentials and receipt redaction. No provider
 access or source sufficiency is claimed.
+
+### Verified registry monitoring
+
+`ResearchRegistry(path, read_only=True)` opens an existing canonical path with
+SQLite `mode=ro` and `query_only`, without schema creation, host-control
+reservation or initialization. Mutations reject explicitly. `read_snapshot()`
+keeps all nested readers on one database transaction, including concurrent writer
+admissions. Candidate and trial readers verify their immutable identity and
+admission snapshot. `library-status` uses this read-only mode.
+
+The dashboard/operating status uses `research.monitoring.research_snapshot`.
+Development outcomes pass the authoritative restricted reader; holdout outcomes
+are not exported and a changed trial-purpose projection cannot disclose them.
+Historical activation receipts are separated from current resolver eligibility;
+legacy native-origin activations remain blocked. Native rows verify admission,
+launch, original container and the full recovery chain before exporting only
+identity/state. They never export mount/token paths, inspection/gateway bodies,
+artifact inventories or result blobs. The last recorded absence remains uncertain
+and cannot imply completion. The monitor does not contact Docker or providers.
+
+On top of `a15f8e4`, 43 registry/monitor/dashboard/lifecycle tests passed in
+13.08s, including unchanged database bytes, query-only permissions, concurrent
+snapshot reads, current-directory independence, holdout/candidate/outcome
+tampering, old native activation and absent/corrupt native authority. The full
+native discovery/recovery/supervisor plus original portfolio/advice and numeric
+registered-experiment integration then passed 96 tests in 181.37s, including
+actual fits, paired regimes, callback ledgers and changed-cost accounts. The
+transport/source/refresh integration after the HTTP cap separately passed
+159 tests in 43.01s. Actual local authorities and synthetic transport only.

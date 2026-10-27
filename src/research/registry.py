@@ -13,6 +13,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import local
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -159,10 +160,16 @@ class MissingDevelopmentEvaluation(RegistryError):
 class ResearchRegistry:
     """Append-only artifacts and atomic active generations on one durable path."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
         from src.research.native_mounts import NativeMountAuthority, canonical_path
 
         self.path = canonical_path(path)
+        self.read_only = read_only
+        self._reads = local()
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(self.path)
+            return
         NativeMountAuthority().protect(self.path,Path(str(self.path)+'-wal'),Path(str(self.path)+'-shm'))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
@@ -193,14 +200,39 @@ class ResearchRegistry:
 
     @contextmanager
     def _connection(self):
-        db = sqlite3.connect(self.path, timeout=30)
+        snapshot = getattr(self._reads, 'snapshot', None)
+        if snapshot is not None:
+            yield snapshot
+            return
+        db = (sqlite3.connect(self.path.as_uri()+'?mode=ro', uri=True, timeout=30)
+              if self.read_only else sqlite3.connect(self.path, timeout=30))
         db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA query_only=ON" if self.read_only else "PRAGMA synchronous=FULL")
         try:
             with db:
                 yield db
         finally:
             db.close()
+
+    @contextmanager
+    def read_snapshot(self):
+        """Pin one read transaction for a complete verified monitoring view."""
+        if not self.read_only:
+            raise RegistryError('read snapshots require a read-only registry')
+        if getattr(self._reads, 'snapshot', None) is not None:
+            yield self
+            return
+        with self._connection() as db:
+            db.execute('BEGIN')
+            self._reads.snapshot = db
+            try:
+                yield self
+            finally:
+                del self._reads.snapshot
+
+    def _require_writable(self):
+        if self.read_only:
+            raise RegistryError('research registry is read-only')
 
     @staticmethod
     def _blob(db, payload: bytes) -> str:
@@ -217,6 +249,7 @@ class ResearchRegistry:
 
     def archive(self, payload: bytes) -> str:
         """Store immutable provenance/artifact bytes for later reference validation."""
+        self._require_writable()
         with self._connection() as db:
             return self._blob(db, payload)
 
@@ -224,6 +257,7 @@ class ResearchRegistry:
         return self.archive(canonical(value.model_dump(mode="json")))
 
     def quarantine(self, candidate: Candidate, payload: bytes) -> str:
+        self._require_writable()
         if content_hash(payload) != candidate.payload_hash:
             raise RegistryError("candidate payload hash mismatch")
         with self._connection() as db:
@@ -245,6 +279,7 @@ class ResearchRegistry:
         return candidate.content_hash()
 
     def register_holdout(self, holdout: Holdout) -> None:
+        self._require_writable()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT payload FROM holdouts WHERE id=?", (holdout.holdout_id,)).fetchone()
@@ -282,6 +317,7 @@ class ResearchRegistry:
         snapshot and enforces existing/future holdout protection transactionally.
         Repeating an admission is not execution recovery permission.
         """
+        self._require_writable()
         from src.domain.market import MarketSnapshot
         snapshot=MarketSnapshot.model_validate(bundle_manifest['snapshot'])
         if not snapshot.bars:
@@ -352,6 +388,7 @@ class ResearchRegistry:
 
     def record_native_result(self, result: dict) -> str:
         """Coordinator-only completion, bound to the original immutable admission."""
+        self._require_writable()
         exposure=self.discovery_exposure('native:'+result['run_id'])
         if (result.get('discovery_exposure_hash')!=exposure.content_hash()
                 or result.get('request_hash')!=exposure.request_hash
@@ -451,6 +488,7 @@ class ResearchRegistry:
         return value
 
     def record_native_launch(self, payload: dict) -> str:
+        self._require_writable()
         value = self._validate_native_launch(payload)
         return self._record_native_once('native_launches',value)
 
@@ -501,6 +539,7 @@ class ResearchRegistry:
         return value
 
     def record_native_container(self, payload: dict) -> str:
+        self._require_writable()
         value = self._validate_native_container(payload)
         return self._record_native_once('native_containers',value)
 
@@ -545,6 +584,7 @@ class ResearchRegistry:
         return value
 
     def append_native_recovery(self, payload: dict) -> str:
+        self._require_writable()
         from src.research.native_recovery import NativeRecoveryEvent
         value = self._validate_native_recovery(payload, recording=True)
         raw = canonical(value.model_dump(mode='json'))
@@ -606,6 +646,7 @@ class ResearchRegistry:
 
     def register_trial(self, trial: Trial) -> str:
         """Register before execution; failed and incomplete trials still count."""
+        self._require_writable()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT payload FROM trials WHERE id=?", (trial.trial_id,)).fetchone()
@@ -651,17 +692,26 @@ class ResearchRegistry:
 
     def trial(self, trial_id: str) -> Trial:
         with self._connection() as db:
-            row = db.execute("SELECT payload FROM trials WHERE id=?", (trial_id,)).fetchone()
+            row = db.execute("SELECT payload,candidate,family,holdout FROM trials WHERE id=?", (trial_id,)).fetchone()
         if row is None:
             raise RegistryError("unknown trial")
-        return Trial.model_validate_json(row[0])
+        value = Trial.model_validate_json(row[0])
+        snapshot = json.loads(self.blob(self.trial_snapshot(trial_id)))
+        if (value.trial_id != trial_id or (value.candidate_id,value.family_id,value.holdout_id) != row[1:]
+                or snapshot.get('trial') != value.model_dump(mode='json')
+                or snapshot.get('candidate_hash') != self.candidate(value.candidate_id).content_hash()):
+            raise RegistryError('trial differs from immutable admission')
+        return value
 
     def candidate(self, candidate_id: str) -> Candidate:
         with self._connection() as db:
-            row = db.execute("SELECT payload FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            row = db.execute("SELECT payload,hash FROM candidates WHERE id=?", (candidate_id,)).fetchone()
         if row is None:
             raise RegistryError("unknown candidate")
-        return Candidate.model_validate_json(row[0])
+        value = Candidate.model_validate_json(row[0])
+        if value.candidate_id != candidate_id or value.content_hash() != row[1]:
+            raise RegistryError('candidate identity differs')
+        return value
 
     def trial_snapshot(self, trial_id: str) -> str:
         with self._connection() as db:
@@ -680,6 +730,7 @@ class ResearchRegistry:
 
     def record_evaluation(self, evaluation: Evaluation) -> None:
         """Persist independently computed outcome, with exact referenced evidence."""
+        self._require_writable()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT hash FROM outcomes WHERE trial=?", (evaluation.trial_id,)).fetchone()
@@ -786,6 +837,7 @@ class ResearchRegistry:
 
     def activate(self, slot: str, trial_id: str, policy: PromotionPolicy, *, expected_generation: int,
                  at: datetime) -> Activation:
+        self._require_writable()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             candidate, evaluation = self._eligible(db, trial_id, policy)
@@ -815,6 +867,7 @@ class ResearchRegistry:
         return activation
 
     def rollback(self, slot: str, to_generation: int, *, expected_generation: int, at: datetime) -> Activation:
+        self._require_writable()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT payload FROM activations WHERE slot=? AND generation=?", (slot, to_generation)).fetchone()

@@ -87,9 +87,20 @@ def research_page(view):
         st.info('No development outcomes recorded.')
     st.subheader('Candidates in quarantine')
     st.dataframe(pd.DataFrame(view.get('candidates',[])),hide_index=True)
-    st.subheader('Versioned activations')
-    st.dataframe(pd.DataFrame(view.get('activations',[])),hide_index=True)
+    st.subheader('Current research eligibility')
+    st.dataframe(pd.DataFrame(view.get('active',[])),hide_index=True)
+    if view.get('blocked_activations'):
+        st.warning('Some historical activations cannot currently be used.')
+        st.dataframe(pd.DataFrame(view['blocked_activations']),hide_index=True)
+    with st.expander('Historical activation receipts'):
+        st.dataframe(pd.DataFrame(view.get('activations',[])),hide_index=True)
     st.caption('Research activation does not authorize live capital.')
+    st.subheader('Native discovery and recovery')
+    if view.get('native_runs'):
+        st.dataframe(pd.json_normalize(view['native_runs']),hide_index=True)
+    else:
+        st.info('No native discovery admissions recorded.')
+    st.caption('Recovery shows the last recorded inspection. Missing containers do not prove completion; native candidates remain quarantined.')
     with st.expander('Holdout reservations'):
         st.dataframe(pd.DataFrame(view.get('holdouts',[])),hide_index=True)
 

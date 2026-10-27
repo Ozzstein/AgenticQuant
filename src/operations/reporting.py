@@ -10,7 +10,8 @@ from pathlib import Path
 
 from src.execution.ledger import PortfolioLedger
 from src.operations.store import OperationsStore
-from src.research.registry import Activation, Evaluation
+from src.research.monitoring import research_snapshot
+from src.research.registry import ResearchRegistry
 
 
 @contextmanager
@@ -67,24 +68,9 @@ def budget_view(path: str | Path, *, day: str | None = None) -> dict:
 
 def research_view(path: str | Path) -> dict:
     if not Path(path).is_file():
-        return {'status':'missing','candidates':[],'activations':[],'development_outcomes':[], 'holdouts':[]}
-    with read_database(path) as db:
-        candidates = [json.loads(row[0]) for row in db.execute('SELECT payload FROM candidates ORDER BY rowid DESC LIMIT 200')]
-        activations = [Activation.model_validate_json(row[0]).model_dump(mode='json') for row in db.execute('SELECT payload FROM activations ORDER BY rowid DESC LIMIT 200')]
-        # Public monitoring shows holdout consumption/identity, never their
-        # measurements or development prompts. Research memos use the stricter
-        # registry development_evaluation API, not this display projection.
-        trials = {r['id']:json.loads(r['payload']) for r in db.execute('SELECT id,payload FROM trials')}
-        development = []
-        for row in db.execute('SELECT trial,payload FROM outcomes ORDER BY rowid DESC'):
-            if trials[row['trial']]['purpose'] == 'development':
-                development.append(Evaluation.model_validate_json(row['payload']).model_dump(mode='json'))
-            if len(development) >= 200:
-                break
-        holdouts = [{'holdout_id':r['id'],'consumed':bool(db.execute('SELECT 1 FROM trials WHERE holdout=?',(r['id'],)).fetchone())}
-                    for r in db.execute('SELECT id FROM holdouts')]
-    return {'status':'available','candidates':candidates,'activations':activations,'development_outcomes':development,
-            'holdouts':holdouts,'live_capital_authorized':False}
+        return {'status':'missing','candidates':[],'activations':[], 'active':[],
+                'blocked_activations':[], 'development_outcomes':[], 'holdouts':[], 'native_runs':[]}
+    return research_snapshot(ResearchRegistry(path, read_only=True))
 
 
 def evidence_view(path: str | Path) -> dict:

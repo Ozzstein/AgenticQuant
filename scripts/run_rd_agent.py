@@ -112,7 +112,9 @@ def rollback(registry: Path=typer.Option(...,exists=True),slot: str=typer.Option
 
 @app.command('library-status')
 def library_status(registry: Path=typer.Option(...,exists=True)):
-    typer.echo(json.dumps(ResearchRegistry(registry).status(),indent=2))
+    service=ResearchRegistry(registry,read_only=True)
+    with service.read_snapshot():
+        typer.echo(json.dumps(service.status(),indent=2))
 
 
 @app.command('native-recover')

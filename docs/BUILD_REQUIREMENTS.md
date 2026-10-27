@@ -14,11 +14,11 @@ enabled. This register supersedes the bootstrap table.
 | A1 environments | partial | Root `uv.lock`, isolated RD environment, actual native model/Qlib imports | Clean-host installs, Docker and every runtime |
 | A2 contracts/config | offline_verified | `src/domain/`, `src/utils/config.py`; identity, temporal, precedence and Decimal roundtrip tests | Deployment/secrets lifecycle |
 | A3 MCP | offline_verified | `data/evidence/mcp.py`; actual local HTTP SDK, exact manifests, generic-dispatch permission tests | Deployed server/schema pins, credentials, entitlements |
-| A4 application/CLI | partial | Canonical backtest/agents/research/operating services and scheduler aliases | Fresh source-complete success; remaining legacy intraday/integration migration |
-| A5 packaging/CI | partial | Dockerfiles, locked assets, health/preflight rejection | Actual clean-host builds, CI and service lifecycle; Docker unavailable here |
+| A4 application/CLI | partial | Canonical backtest/agents/research/operating services, scheduler aliases, retired-interface test migration and immutable replay output | Fresh source-complete success; complete rolling intraday operation |
+| A5 packaging/CI | partial | Offline wheel/sdist build, isolated installed CLI smoke, packaged specs and corrected service commands | Actual clean-host builds, CI and service lifecycle; Docker unavailable here |
 | B1 evidence | offline_verified | `data/evidence/`; immutable raw/full documents/revisions/spans and cutoff tests | Production retention and entitled history |
 | B2 US equity/Qlib | partial | `data/qlib_us.py`; actual US binary bundle/Alpha158/Ridge local execution | Historical universes, delistings, corporate actions and genuine benchmarks |
-| B3 crypto/context | partial | Native Binance/Kraken Futures funding and Binance OI capture, independently reparsed units/bytes, closed bounded refresh; 45 producer and 37 refresh/source tests | Dated dominance/binding composition, actual funding/OI/dominance/protocol and non-USD histories |
+| B3 crypto/context | partial | Native funding/OI, dated CoinGecko current/Pro dominance and exact BTC/perpetual contextual bindings; closed refresh preserves native clocks; streamed decoded-response cap | Actual funding/OI/dominance/protocol and non-USD histories, Pro/PIT entitlements and documented OI-history limits |
 | B4 vendor/MCP data | partial | FMP/FRED/ALFRED/Yahoo/Finnhub/SEC/CoinGecko/Alpaca parsing and provenance | Credentialed schemas/entitlements, transcripts and document coverage |
 | B5 actual prints/ADV | offline_verified | `adapters/operating.py`, `opening_identity.py`, `binance_reference.py`; raw IDs/ns, aliases, actual reference/absence/window evidence, 20-session VWAP ADV; frozen Testnet/mainnet reference refresh | Authenticated feeds and remaining native constraints |
 | B6 source preparation | offline_verified | `data/operating_plan.py`; completed task receipts, dated seven-series macro inputs, immutable training prefix and contextual whitelist | Approved actual source recipes/historical breadth and rolling unattended preparation |
@@ -34,27 +34,27 @@ enabled. This register supersedes the bootstrap table.
 | D2 six strategies | offline_verified | Six immutable specs, actual four-model and model-free consensus execution | Fresh source-complete cycle and real statistical eligibility |
 | D3 four selectors | offline_verified | Actual attributed selection, exact holdings/netting, per-sleeve signal/data identities | Sufficient prospective performance history |
 | D4 attribution | offline_verified | `SleeveBook` and `AttributedPerformanceStore`; actual fill/flow ownership, funded epochs and exact daily chains | Long prospective reconciliation and all venues |
-| E1 full desk | partial | Seven report paths, two challenge rounds, exact citations, HMM/portfolio boundary, specialist/graph tests | Confirmed H later-desk portfolio snapshot clock gap under repair; authenticated providers/tools and measured quality |
+| E1 full desk | partial | Seven report paths, two challenge rounds, exact citations, HMM/portfolio boundary; actual later-clock ledger and sleeve review snapshot persisted before CRO | Authenticated providers/tools and measured quality |
 | E2 actions/veto | offline_verified | Canonical actions, derived consensus, hard veto, HOLD/ABSTAIN ownership and REDUCE/EXIT invariants | Prospective contribution comparisons |
-| E3 cost/history | partial | Durable budget reservation, actual/uncertain usage, immutable source/request/report receipts | Confirmed legacy memory projection integrity gap under repair; authenticated usage/pricing and operational latency |
-| J1-J4/J6 Jev | partial | Pinned direct HTTP service, cache/replay/questions, classifications/claims/relevance/debate tests; shadow default | Source/store-backed evaluated-policy authority and zero-class-support gate under repair; authenticated Jev and labeled calibration |
+| E3 cost/history | partial | Durable budget reservation, actual/uncertain usage, immutable request/report receipts; model-visible memory reexports certified recursive history and fails without authority | Authenticated usage/pricing and operational latency |
+| J1-J4/J6 Jev | partial | Pinned HTTP/cache/replay; source/store-backed frozen cohorts, exact response/usage/label proof and evaluated-policy resolver; zero-support classes cannot pass; shadow default | Operational experiment composition in progress; authenticated Jev, baselines, labeled calibration and robustness/efficacy |
 | J5 text features | partial | Exact source/question/model/transformation and generation-time availability | Actual feature evaluation and prospective benefit |
 | J7 auxiliary macro | pending | Conditional only; HMM authoritative | Demonstrated incremental value |
 | F1 five optimizers | offline_verified | Actual LW covariance, deterministic HRP, BL views, feasible constrained fallback and exact target conversion | Real histories and all venue fee/lot interactions |
 | F2 durable execution | offline_verified | Exclusive owner, pre-I/O claim, partial/ambiguous receipt recovery, opening capacity identity | Authenticated lifecycle and unsupported historical reconciliation |
 | F3 Alpaca | external_unverified | Typed bounded REST/activity adapter, actual FILL/FEE parsing and account/order reconciliation; synthetic HTTP tests | Actual paper account, bracket/trailing and full lifecycle |
 | F4 crypto venues | partial | Typed Binance/Kraken spot adapters, native gross settlement, actual inventory-fee ledger/sleeves, bounded CCXT signing and native predicates; frozen source factory/refresh composition; 119 root source/refresh checks passed | Advanced orders and authenticated/testnet acceptance |
-| F5 LEAN | partial | Actual algorithm/port drains canonical exclusive outbox, native live fills override estimates; exact per-intent frozen Binance sources; 163 plus 65 focused root tests | Cross-runtime native recovery, advanced orders/expiry and actual LEAN/.NET/Docker acceptance |
+| F5 LEAN | partial | Actual algorithm/port drains canonical exclusive outbox, native fills override estimates; per-intent frozen Binance sources; original native ticket/execution recovery across runtime restart | Advanced orders/expiry and actual LEAN/.NET/Docker acceptance |
 | F6 income ledger | offline_verified | Sourced terms/receivables, original sleeve owners, actual posted/local-paper distributions, taxes and publication fences | Sufficient source authority; mergers/spinoffs/due-bills/foreign conventions blocked |
 | G1 registry/lifecycle | offline_verified | Immutable candidates/trials, development-only views, independent validation and activation/rollback; full mount exposure, opaque-source restrictions and native lineage quarantine | Real statistical acceptance and native internal multiplicity/implementation audit |
 | G2 custom factor/model/crypto | offline_verified | Actual fit/artifact/ledger execution and independent reconstruction | Actual data, every variant and multiple-testing/holdout gates |
-| G3 strategy/regime/advice | offline_verified | Actual callback economics, same-trial paired HMM, authoritative archived advice receipts | Real prospective receipts, complete controls and statistical gates |
+| G3 strategy/regime/advice | offline_verified | Actual callback economics, same-trial paired HMM; archived advice verifies exact original base ledger and immutable historical full-sleeve observations | Real prospective receipts, complete controls and statistical gates |
 | G4 research copilot | offline_verified | Full-document chunk coverage, exact claims, deep memos and durable generation/budget receipts | Authenticated research quality and actual papers |
 | G5 native RD | partial | Pinned supervisor/overlay, bounded gateway/watchdog, frozen data/documents and authenticated lineage; immutable create/bind/start/recovery authority and CLI, 139 focused root tests | Actual Docker/all seven workflows, source-specific document scope and candidate import |
 | H1 operating cycle | partial | Shared six-strategy models/HMM/desk/optimizer/ledger, actual mixed-calendar recovery verified before income guard | Fresh positive acceptance now blocked by insufficient income source; retained tests fail visibly |
 | H2 scheduler/entry points | partial | Same application services, frozen jobs, independent operating/research workers, durable recovery | Rolling unattended refresh/build and full intraday production operation |
 | H3 dashboard/alerts | partial | Read-only actual stores/ledger/usage; durable SMTP/Telegram outbox and uncertainty tests | Authenticated delivery, resource monitoring, backup/restore and deployment |
-| I1 full integration | partial | Exact root/lane test evidence linked below | Current full suite, positive source/cycle requirements and legacy test migrations |
+| I1 full integration | partial | Full pinned audit and exact subsequent root/lane tests linked below; 14 retired-interface failures migrated | Subsequent full audit and positive source/cycle requirements |
 | I2 external release | external_unverified | Explicit unavailable/blocked states | Clean host/Docker, provider/venue/native runs and labeled agent calibration |
 | I3 prospective release | pending | Thresholds retained in full plan | Three-month paper/required run count, quant-only/veto/full-agent comparison and release decision |
 
@@ -68,8 +68,17 @@ the exact DTCC SR2025 schemas reviewed and the still-missing account, deduction,
 delivery and complete-window authorities. No positive parser is admitted from
 generic ISO fields or those insufficient component formats.
 
-Current income-guard audit at root pin `335d8c2`: retained 38-case H suite reported
-18 passed, 2 failed and 18 setup errors. All unsuccessful cases depend on the old
-fresh-success fixture's absent sourced income policy/coverage. Seven targeted new
-chronology/native-source rejection cases passed. Root source/refresh integration
-separately passed 36 tests in 5.48s. No positive fixture bypass is authorized.
+Full pinned audit at `fd54c9f`: 1,886 tests, **1,851 passed, 17 failed, 18 setup
+errors**, zero skips, in 1,139.76s. Fourteen failures were retired CLI/integration
+contracts; their replacements and related replay tests subsequently passed
+62 cases in 21.91s. The other three failures and 18 setup errors require fresh
+positive income-complete cycles. They remain enabled and blocked. The operator
+confirmed that no sufficient source has been selected; there is no positive
+fixture bypass.
+
+Subsequent integration evidence: 378 tests passed in 48.36s for current desk,
+certified memory/evaluated policies, LEAN/sleeves and B3 producers; 19 original
+portfolio/advice tests passed in 36.93s after G sleeve integration; 87 refresh and
+credential tests passed in 10.83s; 159 transport/source/refresh tests passed in
+43.01s after the streamed HTTP cap. These overlapping checks are not a full-suite
+green claim. See the linked implementation notes for exact pins and commands.
