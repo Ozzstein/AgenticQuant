@@ -271,8 +271,15 @@ def _run_regimes(store, inputs, dataset, variant, fitted_at, inference_times, wo
     raw, kwargs = prefix(fitted_at)
     detector.fit(raw, inputs.context.model_copy(update={'as_of':fitted_at}), **kwargs)
     detector.save(work_dir/'hmm.joblib')
-    if any(pd.Timestamp(at) not in data.signals.index for at in inference_times):
-        raise RegistryError('inference date is not an observed macro session')
+    observation_times = []
+    for at in inference_times:
+        eligible = data.signals.index[data.signals.index <= at]
+        if eligible.empty or eligible[-1] <= fitted_at:
+            raise RegistryError('no observed out-of-sample macro session at inference cutoff')
+        observed_at = eligible[-1]
+        if (pd.Timestamp(at)-observed_at).total_seconds() > dataset.max_source_age_seconds:
+            raise RegistryError('latest actual macro session is stale at inference cutoff')
+        observation_times.append(observed_at)
     # One forward pass persists every causal intermediate state. Repeated full
     # prefixes would re-verify O(n²) identical frozen observations unnecessarily.
     raw, kwargs = prefix(inference_times[-1])
@@ -280,7 +287,11 @@ def _run_regimes(store, inputs, dataset, variant, fitted_at, inference_times, wo
     with detector._db() as db:
         rows = db.execute('SELECT timestamp,result FROM regime_events WHERE model_hash=?', (detector.model_hash,)).fetchall()
     observed = {pd.Timestamp(at):CausalRegimeResult.model_validate_json(value) for at,value in rows}
-    return detector, tuple(observed[pd.Timestamp(at)] for at in inference_times)
+    # A later decision clock may consume the latest known session. Reusing a
+    # session never adds an emission or advances the minimum-duration counter.
+    return detector, tuple(observed[source_at].model_copy(update={
+        'context':inputs.context.model_copy(update={'as_of':at})})
+        for at,source_at in zip(inference_times,observation_times,strict=True))
 
 
 def build_regime_artifact(registry: ResearchRegistry, store: EvidenceStore, inputs: ResearchInputs, *,

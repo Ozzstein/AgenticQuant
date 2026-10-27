@@ -262,3 +262,21 @@ def test_macro_omitted_session_fails_explicitly(experiment):
     missing = artifact.dataset.model_copy(update={'raw':artifact.dataset.raw[:220]+artifact.dataset.raw[221:]})
     with pytest.raises(RegistryError,match='missing or nonexchange sessions'):
         materialize_macro_dataset(missing,store)
+
+
+
+def test_regime_later_decision_clocks_reuse_exact_causal_session(experiment,tmp_path):
+    _,store,registry,plan,artifact,_ = experiment
+    at = artifact.inference_times[0]
+    times = (at,at+timedelta(minutes=15),at+timedelta(minutes=30))
+    delayed = build_regime_artifact(registry,store,plan.inputs,dataset=artifact.dataset,variant=artifact.variant,
+        fitted_at=artifact.fitted_at,inference_times=times,work_dir=tmp_path/'late')
+    assert delayed.model_hash==artifact.model_hash and delayed.model_payload_hash==artifact.model_payload_hash
+    assert [o.context.as_of for o in delayed.observations]==list(times)
+    states = [o.model_dump(exclude={'context'}) for o in delayed.observations]
+    assert states[0]==states[1]==states[2]==artifact.observations[0].model_dump(exclude={'context'})
+    assert recompute_regime_artifact(registry,store,delayed,plan.inputs,work_dir=tmp_path/'verify')==delayed.observations
+    strict = artifact.dataset.model_copy(update={'max_source_age_seconds':60})
+    with pytest.raises(RegistryError,match='macro session is stale'):
+        build_regime_artifact(registry,store,plan.inputs,dataset=strict,variant=artifact.variant,
+            fitted_at=artifact.fitted_at,inference_times=(times[1],),work_dir=tmp_path/'stale')

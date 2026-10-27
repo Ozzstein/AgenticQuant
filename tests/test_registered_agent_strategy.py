@@ -130,7 +130,7 @@ def agent_experiment(experiment,tmp_path_factory):  # noqa: F811
                 reference = archive_agent_decision(registry,store,decision_hash=decision.content_hash(),signal_at=at,authorities=authorities)
                 references.append(reference)
     spec = baseline_specs()['agent_consensus'].model_copy(update={'name':'trial-observed-advice','origin':'research_candidate',
-        'max_signal_age_seconds':7*86400})
+        'max_signal_age_seconds':7*86400,'top_k':1})
     plan = StrategyExperimentPlan(inputs=numeric.inputs,strategy=spec,agent_decisions=tuple(references),
         regime_artifact_hash=numeric.regime_artifact_hash,provenance=numeric.provenance)
     candidate = Candidate(candidate_id='observed-advice',kind='strategy',origin='custom',payload_hash=spec.content_hash(),
@@ -170,6 +170,17 @@ def test_archived_advice_real_replay_and_cost_holdings(agent_experiment,tmp_path
     assert len(costs)==3 and all(c.trades for c in costs)
     assert all(c.account_id.startswith('backtest:cost-') for c in costs)
     assert len({tuple(c.equity_curve) for c in costs}) > 1
+    from src.core.benchmark import verify_comparison
+    comparison = BenchmarkRunner().compare_replay(result,inputs=executed.replay_kwargs,
+        ledger_path=executed.ledger_path,output_dir=tmp_path/'comparisons',n_simulations=3,seed=7)
+    assert len(comparison.random_artifacts)==3 and comparison.strategy_artifact is not None
+    assert comparison.opportunity_artifact and not comparison.signal_artifact
+    from src.utils.exceptions import BacktestError
+    with pytest.raises(BacktestError,match="missing durable random replay artifacts"):
+        verify_comparison(result,comparison)  # Three diagnostic draws cannot meet the 1000-run gate.
+    assert "SPY" in comparison.unavailable
+    with pytest.raises(BacktestError,match="missing durable callback named benchmark SPY"):
+        verify_comparison(result,comparison,minimum_simulations=3)  # Synthetic archive lacks SPY/BTC coverage.
     assert registry.active('strategy:'+plan.strategy.name) is None
 
 
