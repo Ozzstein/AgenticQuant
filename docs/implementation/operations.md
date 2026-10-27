@@ -273,3 +273,27 @@ arguments. They use actual adapter parsing over synthetic provider wires, a
 seven-unit partial fill, a v1/v2 alias after published NAV, restart, exact retained
 remaining quantity, and price/hash substitution failures before mapping writes.
 No authenticated provider acceptance is implied.
+
+## Native perpetual history refresh
+
+Closed `provider="ccxt"` tasks support `funding` for explicit Binance or
+Kraken Futures perpetual instruments, and `open_interest` for Binance. Kraken
+Spot is not a derivative source. Arguments are exactly `since`, `end` (required
+timezone-aware ISO instants), optional `timeframe`, `limit`, and `max_pages`.
+Unknown endpoints/parameters, spot symbols, unsupported periods, and future end
+cutoffs are rejected before network work. The total request cap includes SDK
+contract loading and every native history page; page count is additionally capped
+by that budget. The existing worker still enforces the overall wall deadline.
+
+The native adapter receives the underlying EvidenceStore because it stamps its
+own measured post-response clocks and immutable source links. Refreshed context
+advances beyond these actual receipts. Exact native decimal scalars and contract
+units independently reparse through `verify_derivative_record`; no assumption of
+eight-hour funding or historical point-in-time availability is introduced.
+Coverage remains explicitly uncertified, including Binance's limited OI history.
+
+Coordinator verification: 37 offline refresh/source tests passed in 4.75 seconds,
+including real stores/parsers, metadata-plus-page budget exhaustion, receipt
+clock/source verification, and completed-run replay without another request.
+The separate 45-test derivative/context/direct-adapter/factor suite passed in
+1.25 seconds. HTTP/SDK boundary fixtures do not establish vendor acceptance.

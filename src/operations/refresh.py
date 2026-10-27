@@ -25,6 +25,7 @@ from src.domain.common import (
     RunContext,
     UtcTimestamp,
     VersionedContract,
+    _utc,
 )
 from src.operations.store import OperationError, OperationsStore, RunManifest, canonical, digest
 
@@ -82,6 +83,8 @@ class FetchTask(VersionedContract):
                 or arguments['average_minutes']<0
             ):
                 raise ValueError('Binance reference needs explicit instrument, native network and integer window')
+        if self.provider=='ccxt' and self.operation in ('funding','open_interest'):
+            _derivative_arguments(self,arguments)
         if self.provider=='mcp':
             if self.mcp_manifest is None:
                 raise ValueError('MCP fetch needs an exact deployed manifest')
@@ -169,6 +172,34 @@ def _arguments(task,allowed,required=()):
     return value
 
 
+def _derivative_arguments(task,arguments):
+    """Validate the closed native history request before any SDK/network work."""
+    allowed={'since','end','timeframe','limit','max_pages'}
+    maximum=1000 if task.operation=='funding' else 500
+    if (set(arguments)-allowed or not {'since','end'}<=set(arguments)
+        or task.instrument is None or task.instrument.asset_class!='crypto'
+        or ':' not in task.instrument.symbol
+        or task.instrument.venue not in ('binance','krakenfutures')
+        or (task.instrument.venue=='krakenfutures' and task.operation!='funding')):
+        raise ValueError('explicit supported perpetual instrument and closed history window required')
+    result=dict(arguments)
+    for field in ('since','end'):
+        if not isinstance(result[field],str):
+            raise ValueError('derivative history needs timezone-aware ISO timestamps')
+        result[field]=_utc(datetime.fromisoformat(result[field]))
+    if result['since']>=result['end']:
+        raise ValueError('derivative history interval must be positive')
+    for field,upper in (('limit',maximum),('max_pages',1000)):
+        if field in result and (type(result[field]) is not int or not 1<=result[field]<=upper):
+            raise ValueError('derivative history pagination limit invalid')
+    if 'timeframe' in result:
+        from src.data.adapters.crypto_context import OI_PERIODS
+        if result['timeframe'] not in OI_PERIODS:
+            raise ValueError('unsupported derivative sampling period')
+    result['max_pages']=min(result.get('max_pages',task.max_http_requests),task.max_http_requests)
+    return result
+
+
 def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
     """Closed dispatch; neither models nor MCP servers choose endpoints/methods."""
     capture=CaptureStore(store)
@@ -248,8 +279,14 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
             import ccxt
 
             from src.data.adapters.market import CCXTAdapter
-            if instrument().venue not in ('binance','kraken'):
+            allowed_venues=('binance','kraken') if task.operation=='bars' else ('binance','krakenfutures')
+            if instrument().venue not in allowed_venues:
                 raise ProviderError('ccxt','unsupported_explicit_exchange')
+            args=None
+            if task.operation!='bars':
+                args=_derivative_arguments(task,json.loads(task.arguments_json))
+                if args['end']>context.as_of:
+                    raise ProviderError('ccxt','history_end_after_request_cutoff')
             exchange=getattr(ccxt,instrument().venue)({'enableRateLimit':True,'timeout':min(20000,task.deadline_seconds*1000)})
             wire_fetch=exchange.fetch
             wire_count=[0]
@@ -259,7 +296,9 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
                 wire_count[0]+=1
                 return wire_fetch(url,method,headers,body)
             exchange.fetch=bounded_fetch
-            adapter=CCXTAdapter(capture,exchange)
+            # Native derivative records contain their own measured receipt and
+            # source links. Re-clocking would change those authoritative IDs.
+            adapter=CCXTAdapter(capture if task.operation=='bars' else store,exchange)
             if task.operation=='bars':
                 args=_arguments(task,('start','end','timeframe','market_type','max_pages'),('start','end'))
                 for key in ('start','end'):
@@ -267,9 +306,7 @@ def _fetch(task:FetchTask,context:RunContext,store:EvidenceStore)->dict:
                 args['max_pages']=min(args.get('max_pages',task.max_http_requests),task.max_http_requests)
                 result=adapter.bars(instrument(),context,ingested_at=now,**args)
             else:
-                args=_arguments(task,('since','limit'),('since',))
-                args['since']=datetime.fromisoformat(args['since'])
-                result=adapter.derivatives(instrument(),context,ingested_at=now,capability=task.operation,**args)
+                result=adapter.derivatives(instrument(),context,capability=task.operation,**args)
             counts=wire_count[0]
         elif task.provider=='mcp':
             async def remote():
