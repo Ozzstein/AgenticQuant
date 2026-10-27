@@ -319,6 +319,10 @@ class DefinitiveRejection(ValueError):
     """The venue authoritatively rejected this submission without accepting it."""
 
 
+class SubmissionNotAttempted(DefinitiveRejection):
+    """A verified local preflight denied the order before any submit HTTP call."""
+
+
 class VenueExecution:
     """One exclusive account owner, aggregate risk, and durable submission outbox.
 

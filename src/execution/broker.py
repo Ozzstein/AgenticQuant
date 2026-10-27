@@ -219,6 +219,76 @@ def create_typed_paper_execution(
         raise
 
 
+def create_typed_binance_execution(
+    *,
+    ledger_path,
+    account,
+    broker_account_id,
+    api_key,
+    api_secret,
+    markets,
+    rules,
+    notional_reference=None,
+    fee_valuation=None,
+    fill_policy=None,
+    risk_policy=None,
+    allow_live=False,
+    max_balance_age_seconds=30,
+    client=None,
+    clock=None,
+    operation_timeout_seconds=30,
+    max_requests_per_operation=128,
+    maximum_response_bytes=8 * 1024 * 1024,
+):
+    """Actual Binance Spot/testnet adapter bound to one durable execution owner.
+
+    No network calls at construction. Capture native state before choosing the
+    cutoff; provide authenticated native reference/valuation resolvers. The
+    account's base currency must be the actual quote cash (e.g. USDT is not USD).
+    """
+    from src.execution.binance_venue import BinanceVenue
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import VenueExecution
+
+    ledger = PortfolioLedger(ledger_path)
+    adapter = None
+    try:
+        ledger.create_account(account)
+        adapter = BinanceVenue(
+            ledger,
+            account.account_id,
+            broker_account_id=broker_account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            markets=markets,
+            rules=rules,
+            notional_reference=notional_reference,
+            fee_valuation=fee_valuation,
+            allow_live=allow_live,
+            client=client,
+            clock=clock,
+            operation_timeout_seconds=operation_timeout_seconds,
+            max_requests_per_operation=max_requests_per_operation,
+            maximum_response_bytes=maximum_response_bytes,
+        )
+        return VenueExecution(
+            ledger,
+            account.account_id,
+            {adapter.venue: adapter},
+            {key: adapter.venue for key in rules},
+            owner="direct",
+            fill_policy=fill_policy,
+            risk_policy=risk_policy,
+            allow_live=allow_live,
+            max_balance_age_seconds=max_balance_age_seconds,
+        )
+    except Exception:
+        if adapter is not None:
+            adapter.close()
+        ledger.close()
+        raise
+
+
 def create_typed_alpaca_execution(
     *,
     ledger_path,
