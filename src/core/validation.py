@@ -17,6 +17,7 @@ from src.core.backtester import (
     performance_metrics,
     recorded_replay_inputs,
     require_matching_inputs,
+    verify_decision_trace,
 )
 from src.execution.ledger import PortfolioLedger
 from src.utils.exceptions import BacktestError
@@ -151,7 +152,9 @@ class ValidationSuite:
             try:
                 ledger = PortfolioLedger(ledger_path, read_only=True)
                 ledger.reconcile(result.account_id)
-                require_matching_inputs(result, recorded_replay_inputs(ledger, result))
+                inputs = recorded_replay_inputs(ledger, result)
+                require_matching_inputs(result, inputs)
+                verify_decision_trace(ledger, result, inputs)
                 require(
                     ledger.history(result.account_id) == snapshots, "persisted snapshots differ"
                 )

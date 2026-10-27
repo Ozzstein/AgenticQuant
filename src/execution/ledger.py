@@ -456,6 +456,7 @@ class PortfolioLedger:
                         fx_rate=mark.fx_rate,
                         marked_at=mark.as_of,
                         market_value=D(h["quantity"]) * mark.price * mark.fx_rate,
+                        opened_at=self.position_opened_at(account, h["instrument"]),
                     )
                 )
             nav = D(row["cash"]) + sum((p.market_value for p in positions), ZERO)
@@ -496,6 +497,37 @@ class PortfolioLedger:
                     (account, at.isoformat(), snap.model_dump_json()),
                 )
             return snap
+
+    def position_opened_at(self, account: str, instrument_id: str) -> datetime | None:
+        """Derive holding age from actual economics visible in this transaction.
+
+        A split preserves age, a full exit resets it, and adding to a position
+        does not pretend it is newly opened. No separate connection can see
+        the same-step uncommitted fill used by a replay decision callback.
+        """
+        quantity, opened_at = ZERO, None
+        for row in self.db.execute(
+            "SELECT kind,payload FROM journal WHERE account=? ORDER BY sequence", (account,)
+        ):
+            if row["kind"] == "fill":
+                fill = Fill.model_validate_json(row["payload"])
+                intent = self.order(account, fill.intent_id)["intent"]
+                if intent.instrument.instrument_id != instrument_id:
+                    continue
+                if intent.side == "buy":
+                    if quantity == 0:
+                        opened_at = fill.executed_at
+                    quantity += fill.quantity
+                else:
+                    quantity -= fill.quantity
+            elif row["kind"] in ("split", "delist"):
+                action = CorporateAction.model_validate_json(row["payload"])
+                if action.instrument.instrument_id != instrument_id:
+                    continue
+                quantity = quantity * action.value if action.kind == "split" else ZERO
+            if quantity == 0:
+                opened_at = None
+        return opened_at
 
     def corporate_action(self, account: str, action: CorporateAction):
         with self.atomic():

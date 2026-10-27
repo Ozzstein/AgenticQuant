@@ -464,3 +464,24 @@ def test_full_liquidation_consumes_exact_basis_before_reentry(tmp_path):
             ledger = PortfolioLedger(path)
     assert D(ledger._account(order.account_id)["realized"]) == expected_realized
     ledger.close()
+
+
+def test_actual_position_open_time_survives_additions_and_restart_resets_after_flat(tmp_path):
+    path = tmp_path / "position-age.sqlite3"
+    ledger = account(path)
+    first_open = None
+    for index, (side, qty) in enumerate(
+        (("buy", "5"), ("buy", "5"), ("sell", "4"), ("sell", "6"), ("buy", "2"))
+    ):
+        order = intent(name=f"age-{index}", side=side, qty=qty, at=T + timedelta(days=index))
+        ledger.submit(order)
+        execution = fill(order, name=f"age-fill-{index}")
+        ledger.apply_fill(execution)
+        if index == 0:
+            first_open = execution.executed_at
+        expected = None if index == 3 else execution.executed_at if index == 4 else first_open
+        ledger.close()
+        ledger = PortfolioLedger(path)
+        assert ledger.position_opened_at(order.account_id, A.instrument_id) == expected
+        assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()

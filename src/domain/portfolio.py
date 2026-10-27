@@ -148,6 +148,9 @@ class Holding(VersionedContract):
     price: Positive
     fx_rate: Positive
     marked_at: UtcTimestamp
+    # Actual first fill since the last flat position, never a target timestamp.
+    # None denotes unknown age in an older externally supplied snapshot.
+    opened_at: UtcTimestamp | None = None
 
 
 class PortfolioSnapshot(VersionedContract):

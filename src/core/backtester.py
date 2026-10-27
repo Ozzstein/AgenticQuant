@@ -15,13 +15,13 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from src.domain.common import RunContext, Sha256
+from src.domain.common import RunContext, Sha256, UtcTimestamp, VersionedContract, _utc
 from src.domain.portfolio import (
     AccountSpec,
     CorporateAction,
@@ -41,6 +41,26 @@ from src.execution.simulator import PaperExecution
 from src.utils.exceptions import BacktestError
 
 D = Decimal
+
+DecisionProvider = Callable[[datetime, PortfolioSnapshot], PortfolioTarget | None]
+
+
+class ReplayDecision(VersionedContract):
+    """Actual callback input/output, including deliberate abstentions."""
+
+    at: UtcTimestamp
+    recipe_hash: Sha256
+    snapshot: PortfolioSnapshot
+    snapshot_hash: Sha256
+    target: PortfolioTarget | None
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if self.snapshot.as_of != self.at or self.snapshot.content_hash() != self.snapshot_hash:
+            raise ValueError("decision snapshot clock/hash mismatch")
+        if self.target is not None and self.target.decision_at != self.at:
+            raise ValueError("generated target must use the actual decision clock")
+        return self
 
 
 class ReplayMetrics(BaseModel):
@@ -208,7 +228,7 @@ def recorded_replay_inputs(ledger: PortfolioLedger, result: ReplayResult) -> dic
         ]
 
     manifest = result.manifest
-    return {
+    inputs = {
         "context": RunContext.model_validate(manifest["context"]),
         "account": ledger.spec(result.account_id),
         "bars": records("open:", ExecutionBar),
@@ -225,6 +245,96 @@ def recorded_replay_inputs(ledger: PortfolioLedger, result: ReplayResult) -> dic
         "valuation_times": [datetime.fromisoformat(t) for t in manifest["valuation_times"]],
         "provenance": manifest.get("provenance", {}),
     }
+    if "decision_recipe_hash" in manifest:
+        inputs.update(
+            decision_recipe_hash=manifest["decision_recipe_hash"],
+            decision_times=[datetime.fromisoformat(t) for t in manifest["decision_times"]],
+        )
+    return inputs
+
+
+def replay_request_manifest(manifest: dict) -> dict:
+    """Frozen recipe before outputs exist; completion cannot change its inputs."""
+    request = dict(manifest)
+    if "decision_recipe_hash" in request:
+        request.pop("decision_records_hash", None)
+        request["targets_hash"] = canonical_hash([])
+    return request
+
+
+def recorded_decisions(ledger: PortfolioLedger, result: ReplayResult) -> list[ReplayDecision]:
+    records = [
+        ReplayDecision.model_validate_json(row[0])
+        for row in ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id LIKE 'provider-decision:%' ORDER BY id",
+            (result.account_id,),
+        )
+    ]
+    if "decision_recipe_hash" not in result.manifest:
+        if records:
+            raise BacktestError("callback evidence on a precomputed replay")
+        return []
+    if (
+        [r.at.isoformat() for r in records] != result.manifest["decision_times"]
+        or any(r.recipe_hash != result.manifest["decision_recipe_hash"] for r in records)
+        or canonical_hash([r.model_dump(mode="json") for r in records])
+        != result.manifest.get("decision_records_hash")
+    ):
+        raise BacktestError("decision trace differs from frozen schedule/recipe/output binding")
+    request = ledger.db.execute(
+        "SELECT payload FROM events WHERE account=? AND id='replay-request'", (result.account_id,)
+    ).fetchone()
+    if request is None or json.loads(request[0]) != replay_request_manifest(result.manifest):
+        raise BacktestError("generated run differs from its immutable original request")
+    return records
+
+
+def verify_decision_trace(ledger: PortfolioLedger, result: ReplayResult, inputs: dict) -> None:
+    records = recorded_decisions(ledger, result)
+    if "decision_recipe_hash" not in result.manifest:
+        return
+    if [r.target for r in records if r.target is not None] != inputs["targets"]:
+        raise BacktestError("generated target events differ from recorded callback outputs")
+    iterator = iter(records)
+
+    def checked_provider(at, snapshot):
+        record = next(iterator)
+        if record.at != at or record.snapshot != snapshot:
+            raise BacktestError("callback snapshot differs from actual causal replay state")
+        return record.target
+
+    reproduced = PortfolioReplay(":memory:").run(
+        **{**inputs, "targets": None, "decision_provider": checked_provider}
+    )
+    if reproduced.model_dump(mode="json") != result.model_dump(mode="json"):
+        raise BacktestError("recorded decision trace does not reproduce exact replay economics")
+
+
+def reconstruct_decision_inputs(
+    result: ReplayResult,
+    original_replay_kwargs: dict,
+    *,
+    ledger_path: str | Path,
+    decision_provider: DecisionProvider,
+) -> dict:
+    """Rebind the verified recipe for new cost/holdings-dependent evaluations.
+
+    The caller supplies the actual recipe implementation; code/model artifact
+    authorization remains the research registry's responsibility. Reusing old
+    targets at different costs would not evaluate the holdings-aware strategy.
+    """
+    if "decision_recipe_hash" not in result.manifest or not callable(decision_provider):
+        raise BacktestError("a generated replay and actual decision provider are required")
+    ledger = PortfolioLedger(ledger_path, read_only=True)
+    try:
+        inputs = recorded_replay_inputs(ledger, result)
+        require_matching_inputs(result, inputs)
+        verify_decision_trace(ledger, result, inputs)
+    finally:
+        ledger.close()
+    supplied = {**original_replay_kwargs, "decision_provider": decision_provider}
+    require_matching_inputs(result, supplied)
+    return {**supplied, "signals": None, "targets": None}
 
 
 def require_matching_inputs(result: ReplayResult, inputs: dict) -> None:
@@ -264,6 +374,13 @@ def require_matching_inputs(result: ReplayResult, inputs: dict) -> None:
     if times is None:
         times = sorted({b.closed_at for b in inputs["bars"]})
     expected["valuation_times"] = [t.isoformat() for t in times]
+    if "decision_recipe_hash" in result.manifest:
+        expected["decision_recipe_hash"] = inputs.get("decision_recipe_hash")
+        expected["decision_times"] = [t.isoformat() for t in inputs.get("decision_times") or []]
+        # A live recipe's outputs depend on actual holdings. Its input contract
+        # freezes the recipe/schedule; durable trace verification binds outputs.
+        if callable(inputs.get("decision_provider")):
+            expected.pop("targets_hash")
     changed = [key for key, value in expected.items() if result.manifest.get(key) != value]
     if changed:
         raise BacktestError("replay inputs differ from frozen manifest: " + ", ".join(changed))
@@ -327,6 +444,9 @@ class PortfolioReplay:
         valuation_calendar: str = "declared-equity-sessions",
         valuation_times: list[datetime] | None = None,
         provenance: dict | None = None,
+        decision_provider: DecisionProvider | None = None,
+        decision_times: list[datetime] | None = None,
+        decision_recipe_hash: str | None = None,
     ) -> ReplayResult:
         if (
             context.mode != "backtest"
@@ -338,12 +458,25 @@ class PortfolioReplay:
             not bars
             or not metadata
             or not universes
-            or (not signals and not targets)
-            or (signals and targets)
+            or sum((bool(signals), bool(targets), decision_provider is not None)) != 1
         ):
             raise BacktestError(
-                "actual bars, risk metadata, documented universe eligibility and exactly one signal/target stream are required"
+                "actual bars, risk metadata, documented universe eligibility and exactly one signal/target/provider stream are required"
             )
+        generated = decision_provider is not None
+        if generated:
+            if not callable(decision_provider) or not decision_times:
+                raise BacktestError("decision provider requires an explicit nonempty UTC schedule")
+            decision_recipe_hash = TypeAdapter(Sha256).validate_python(decision_recipe_hash)
+            decision_times = [_utc(t) for t in decision_times]
+            if decision_times != sorted(set(decision_times)) or any(
+                t < account.opened_at or t > context.as_of for t in decision_times
+            ):
+                raise BacktestError(
+                    "decision schedule must be unique, increasing and within run bounds"
+                )
+        elif decision_times is not None or decision_recipe_hash is not None:
+            raise BacktestError("decision schedule/recipe requires the actual decision provider")
         if topk < 1 or samples_per_year <= 0:
             raise BacktestError("topk and annualization must be positive")
         signals, targets, actions = signals or [], targets or [], actions or []
@@ -428,7 +561,8 @@ class PortfolioReplay:
                     for b in per_instrument[s.instrument.instrument_id]
                 ):
                     raise BacktestError("signal has no subsequent eligible observed open")
-        for t in targets:
+
+        def require_target(t):
             if t.data_snapshot_id not in context.data_snapshot_ids:
                 raise BacktestError("target data snapshot provenance mismatch")
             available_members = eligible(t.decision_at, t.universe_version)
@@ -437,6 +571,9 @@ class PortfolioReplay:
                     raise BacktestError("target instrument outside documented eligible universe")
                 if identities.get(w.instrument.instrument_id) != w.instrument:
                     raise BacktestError("target instrument is absent from execution data")
+
+        for t in targets:
+            require_target(t)
         manifest = {
             "context": context.model_dump(mode="json"),
             "account": account.model_dump(mode="json"),
@@ -458,7 +595,13 @@ class PortfolioReplay:
             "actions_hash": canonical_hash([a.model_dump(mode="json") for a in actions]),
             "provenance": provenance or {},
         }
+        if generated:
+            manifest.update(
+                decision_recipe_hash=decision_recipe_hash,
+                decision_times=[at.isoformat() for at in decision_times],
+            )
         manifest_hash = canonical_hash(manifest)
+        request_manifest, request_hash = dict(manifest), manifest_hash
         # Finished evidence is immutable, including SQLite file bytes. An
         # idempotent rerun must not rewrite run rows or invalidate artifact hashes.
         if self.ledger_path != ":memory:" and Path(self.ledger_path).is_file():
@@ -470,7 +613,7 @@ class PortfolioReplay:
                 ).fetchone()
                 if previous:
                     payload = json.loads(previous[0])
-                    if payload["manifest_hash"] != manifest_hash:
+                    if canonical_hash(replay_request_manifest(payload["manifest"])) != request_hash:
                         raise BacktestError("run inputs changed; use a new isolated account/run")
                     if payload.get("status") in ("complete", "incomplete") and payload.get(
                         "result"
@@ -500,7 +643,11 @@ class PortfolioReplay:
                 "SELECT payload FROM runs WHERE account=? AND id=?",
                 (account.account_id, context.run_id),
             ).fetchone()
-            if prior and json.loads(prior[0])["manifest_hash"] != manifest_hash:
+            if (
+                prior
+                and canonical_hash(replay_request_manifest(json.loads(prior[0])["manifest"]))
+                != request_hash
+            ):
                 raise BacktestError("run inputs changed; use a new isolated account/run")
             other = ledger.db.execute(
                 "SELECT id FROM runs WHERE account=? AND id<>?",
@@ -508,12 +655,21 @@ class PortfolioReplay:
             ).fetchone()
             if other:
                 raise BacktestError("historical accounts are exclusive to one reproducible run")
-            ledger.save_run(
-                account.account_id,
-                context.run_id,
-                {"status": "running", "manifest_hash": manifest_hash, "manifest": manifest},
-            )
+            # Generated outputs cannot be committed before they exist. Freeze
+            # the full request separately, then write the final run once. This
+            # preserves save_run's immutable-manifest rule without exceptions.
+            if not generated:
+                ledger.save_run(
+                    account.account_id,
+                    context.run_id,
+                    {"status": "running", "manifest_hash": manifest_hash, "manifest": manifest},
+                )
             with ledger.atomic():
+                ledger.record_event(
+                    account.account_id,
+                    "replay-request",
+                    json.dumps(request_manifest, sort_keys=True),
+                )
                 for kind, records in (
                     ("signal", signals),
                     ("target", targets),
@@ -542,6 +698,8 @@ class PortfolioReplay:
                 timeline[at]["signals"] = group
             for at, target in target_groups.items():
                 timeline[at]["target"] = target
+            for at in decision_times or []:
+                timeline[at]["provider"] = True
             for at, event in sorted(timeline.items()):
                 if at < account.opened_at or at > context.as_of:
                     raise BacktestError("event outside account/run clock")
@@ -575,6 +733,35 @@ class PortfolioReplay:
                         )
                     for b in event["opens"]:
                         engine.open_bar(b, meta)
+                    if event["provider"]:
+                        snapshot = ledger.snapshot(
+                            account.account_id, at, risk.max_price_age_seconds, persist=False
+                        )
+                        target = decision_provider(at, snapshot)
+                        if target is not None:
+                            # model_copy can bypass Pydantic validation; validate
+                            # the boundary rather than trusting the callback.
+                            target = PortfolioTarget.model_validate(target.model_dump())
+                            require_target(target)
+                        record = ReplayDecision(
+                            at=at,
+                            recipe_hash=decision_recipe_hash,
+                            snapshot=snapshot,
+                            snapshot_hash=snapshot.content_hash(),
+                            target=target,
+                        )
+                        ledger.record_event(
+                            account.account_id,
+                            "provider-decision:" + at.isoformat(),
+                            record.model_dump_json(),
+                        )
+                        if target is not None:
+                            ledger.record_event(
+                                account.account_id,
+                                "input:target:" + target.content_hash(),
+                                target.model_dump_json(),
+                            )
+                            event["target"] = target
                     if event["signals"] or event["target"]:
                         target = event["target"] or self._rank_target(event["signals"], topk, risk)
                         self._rebalance(engine, target, meta, identities, per_instrument)
@@ -632,6 +819,24 @@ class PortfolioReplay:
                     (account.account_id,),
                 )
             ]
+            if generated:
+                records = [
+                    ReplayDecision.model_validate_json(row[0])
+                    for row in ledger.db.execute(
+                        "SELECT payload FROM events WHERE account=? AND id LIKE 'provider-decision:%' ORDER BY id",
+                        (account.account_id,),
+                    )
+                ]
+                manifest = {
+                    **request_manifest,
+                    "targets_hash": canonical_hash(
+                        [r.target.model_dump(mode="json") for r in records if r.target is not None]
+                    ),
+                    "decision_records_hash": canonical_hash(
+                        [r.model_dump(mode="json") for r in records]
+                    ),
+                }
+                manifest_hash = canonical_hash(manifest)
             result = ReplayResult(
                 status="complete",
                 run_id=context.run_id,
@@ -663,6 +868,19 @@ class PortfolioReplay:
             )
             return result
         except Exception as exc:
+            if (
+                generated
+                and ledger.db.execute(
+                    "SELECT id FROM accounts WHERE id=?", (account.account_id,)
+                ).fetchone()
+            ):
+                failure = {"request_hash": request_hash, "error": str(exc), "status": "failed"}
+                with ledger.atomic():
+                    ledger.record_event(
+                        account.account_id,
+                        "run-failure:" + canonical_hash(failure),
+                        json.dumps(failure, sort_keys=True),
+                    )
             if (
                 "manifest_hash" in locals()
                 and ledger.db.execute(
