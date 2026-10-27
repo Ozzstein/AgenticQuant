@@ -86,6 +86,11 @@ def verify_market_snapshot(store: EvidenceStore, snapshot: MarketSnapshot) -> No
 
 def verify_provenance(registry: ResearchRegistry, store: EvidenceStore, inputs: ResearchInputs,
                       references: dict[str, str]) -> dict[str, str]:
+    return _verify_provenance(registry,store,inputs,references)
+
+
+def _verify_provenance(registry,store,inputs,references,*,paper_execution_receipts=None):
+    """Shared content checks; public historical verification never enables late receipts."""
     names = {"universe_history": "universe_history_id", "availability_audit": "availability_audit_id",
              "calendar": "calendar_artifact_id", "corporate_actions": "corporate_actions_id",
              "execution_bars": "execution_bars_id", "opening_liquidity": "opening_liquidity_id",
@@ -100,6 +105,8 @@ def verify_provenance(registry: ResearchRegistry, store: EvidenceStore, inputs: 
             raise RegistryError(f"{kind} contents do not match the frozen research inputs")
         source_values = []
         for source in artifact.sources:
+            if paper_execution_receipts is not None and source.available_at > inputs.context.as_of:
+                raise RegistryError('paper source binding is after the actual cycle cutoff')
             record = store.get(source.evidence_id, as_of=source.available_at).record
             raw = store.raw(source.evidence_id)
             if content_hash(raw) != record.raw_hash:
@@ -118,7 +125,9 @@ def verify_provenance(registry: ResearchRegistry, store: EvidenceStore, inputs: 
                 if kind == "calendar" and source.available_at > datetime.fromisoformat(value["session_open"].replace("Z", "+00:00")):
                     raise RegistryError("session calendar source was unavailable at the session open")
                 if kind == "opening_liquidity" and source.available_at > datetime.fromisoformat(value["opened_at"].replace("Z", "+00:00")):
-                    raise RegistryError("opening liquidity or FX was unavailable at the observed open")
+                    receipt=(paper_execution_receipts or {}).get(value['event_id'])
+                    if receipt is None or receipt.evidence_id!=source.evidence_id or receipt.available_at!=source.available_at:
+                        raise RegistryError("opening liquidity or FX was unavailable at the observed open")
                 if kind == "instrument_metadata" and source.available_at > datetime.fromisoformat(value["as_of"].replace("Z", "+00:00")):
                     raise RegistryError("instrument metadata was unavailable at its declared cutoff")
         checked[names[kind]] = key

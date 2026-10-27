@@ -47,3 +47,14 @@ No notification or credentialed provider call was made during implementation.
 Offline tests cover real SQLite/restart receipts, actual FMP adapter parsing with
 an HTTP boundary fixture, measured availability, durable caps, generic MCP
 permissions, actual process termination and missing credential redaction.
+
+Operational opening prints use `verify_paper_provenance(..., receipts=inputs.receipts,
+rule_sources=plan.rule_sources)`. Exact source envelopes bind actual archive
+observation/availability clocks and opening quantities. Only this paper-only path
+permits an execution receipt after the occurred opening print. The historical
+research verifier still rejects that late source. Calendar, universe and metadata
+gates retain their original causal cutoffs. Venue rules also require exact source
+contents. Receipt verification alone never authorizes a fill: `PaperVenue.settle_open`
+separately requires durable acceptance before the open, original admitted risk
+metadata and chronological accounting. Already published NAV is not silently
+restated. Thirty-one source/venue/validation tests passed offline in 3.63 seconds.
