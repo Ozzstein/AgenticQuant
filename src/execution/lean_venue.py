@@ -398,6 +398,8 @@ class LeanVenue:
             return binding
         try:
             rules.require_order(intent, now)
+            if intent.order_type not in ("market", "limit", "stop"):
+                raise LedgerError("LEAN trailing order support is not yet implemented")
             if intent.fx_rate != 1 or intent.tif not in ("GTC", "DAY"):
                 raise LedgerError("LEAN requires supported exact cash currency/time-in-force")
             if intent.expires_at is not None and intent.tif != "DAY":
@@ -781,6 +783,8 @@ class LeanVenue:
 
     @staticmethod
     def _validate_ticket_intent(intent, payload):
+        if intent.order_type not in ("market", "limit", "stop"):
+            raise LedgerError("LEAN trailing order support is not yet implemented")
         signed = intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
         if (
             payload["instrument_id"] != intent.instrument.instrument_id

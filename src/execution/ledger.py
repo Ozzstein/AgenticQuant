@@ -1013,6 +1013,9 @@ class PortfolioLedger:
         )
         if not valid:
             raise LedgerError("ledger reconciliation failed")
+        from src.execution.stops import verify_stop_history
+
+        verify_stop_history(self, account)
         result = {
             "reconciled": True,
             "cash": str(cash),

@@ -9,7 +9,7 @@ from decimal import Decimal as D
 import httpx
 import pytest
 
-from src.domain.portfolio import AccountSpec, FillPolicy, PriceMark
+from src.domain.portfolio import AccountSpec, FillPolicy, OrderIntent, PriceMark
 from src.execution.alpaca_venue import AlpacaVenue
 from src.execution.broker import create_typed_alpaca_execution
 from src.execution.ledger import LedgerError
@@ -186,6 +186,94 @@ def admit(wire, engine, adapter, order):
     engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
     wire.now = order.eligible_at
     return engine.dispatch(order.intent_id, as_of=wire.now)
+
+
+def trailing_setup(tmp_path, wire=None, *, trail_percent="10", trail_price=None):
+    wire, engine, adapter, order = setup(tmp_path, wire)
+    adapter._rules[A.instrument_id] = adapter._rules[A.instrument_id].model_copy(
+        update={"order_types": ("market", "limit", "stop", "trailing_stop")}
+    )
+    order = OrderIntent.model_validate(
+        {
+            **order.model_dump(),
+            "order_type": "trailing_stop",
+            "trail_percent": trail_percent,
+            "trail_price": trail_price,
+        }
+    )
+    return wire, engine, adapter, order
+
+
+@pytest.mark.parametrize("offset", [False, True])
+def test_native_trailing_exact_wire_partial_restart_uses_only_actual_activities(tmp_path, offset):
+    terms = {"trail_price": "8.00", "trail_percent": None} if offset else {"trail_percent": "10"}
+    wire, engine, adapter, order = trailing_setup(tmp_path, **terms)
+    assert admit(wire, engine, adapter, order)["state"] == "new"
+    sent = json.loads(next(body for method, _, _, body in wire.calls if method == "POST"))
+    assert sent["type"] == "trailing_stop" and sent["order_class"] == "simple"
+    assert sent["trail_price" if offset else "trail_percent"] == ("8.00" if offset else "10")
+    assert "hwm" not in sent and "stop_price" not in sent
+    assert ("trail_percent" if offset else "trail_price") not in sent
+    # Native low-water and derived stop are real report fields, not fixed intent prices.
+    wire.order.update(hwm="80", stop_price="88", filled_qty="4", status="partially_filled")
+    wire.now = T + timedelta(seconds=3)
+    assert engine.reconcile_all(as_of=wire.now)[0]["state"] == "reconciliation_required"
+    assert not engine.ledger.fills(order.account_id)
+    wire.add_fill("trailing-actual-1", "4", "90", 2)
+    assert engine.reconcile_all(as_of=wire.now)[0]["state"] == "partial"
+    wire.cash, wire.positions = "99640", [{"symbol": "A", "side": "long", "qty": "4"}]
+    adapter.capture()
+    assert engine.reconcile_balances(as_of=wire.now)["reconciled"]
+    engine.ledger.close()
+    wire, engine, adapter, same = trailing_setup(tmp_path, wire, **terms)
+    assert same == order
+    wire.now = T + timedelta(seconds=5)
+    # Once elected, actual native fills remain authoritative even on a rebound.
+    wire.add_fill("trailing-actual-2", "6", "70", 4)
+    wire.order.update(filled_qty="10", status="filled")
+    assert engine.reconcile_all(as_of=wire.now)[0]["state"] == "filled"
+    engine.reconcile_all(as_of=wire.now)
+    wire.cash, wire.positions = "99220", [{"symbol": "A", "side": "long", "qty": "10"}]
+    adapter.capture()
+    assert engine.reconcile_balances(as_of=wire.now)["reconciled"]
+    assert [f.price for f in engine.ledger.fills(order.account_id)] == [D(90), D(70)]
+    engine.ledger.mark(order.account_id, [PriceMark(instrument=A, price=70, as_of=wire.now)])
+    assert engine.ledger.snapshot(order.account_id, wire.now, 0).nav == 99920
+    assert engine.ledger.reconcile(order.account_id)["reconciled"]
+    assert sum(method == "POST" for method, *_ in wire.calls) == 1
+    assert not engine.ledger.db.execute(
+        "SELECT 1 FROM events WHERE id LIKE 'paper-stop:%'"
+    ).fetchone()
+    engine.ledger.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"trail_percent": "9"},
+        {"trail_price": "10"},
+        {"type": "market"},
+        {"hwm": "NaN"},
+        {"stop_price": "0"},
+        {"order_class": "bracket"},
+    ],
+)
+def test_native_trailing_changed_terms_or_invalid_observation_never_synthesize_fills(
+    tmp_path, changes
+):
+    wire, engine, adapter, order = trailing_setup(tmp_path)
+    wire.timeout = True
+    assert admit(wire, engine, adapter, order)["state"] == "ambiguous"
+    wire.order.update(hwm="100", stop_price="110")
+    wire.order.update(changes)
+    wire.now += timedelta(seconds=1)
+    with pytest.raises(LedgerError):
+        adapter.lookup(order, engine.state(order.intent_id)["client_id"], None, wire.now)
+    assert not engine.ledger.fills(order.account_id)
+    assert engine.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+    assert engine.dispatch(order.intent_id, as_of=wire.now)["state"] == "ambiguous"
+    assert sum(method == "POST" for method, *_ in wire.calls) == 1
+    engine.ledger.close()
 
 
 def test_exact_fill_activities_partial_cash_fee_losing_nav_and_restart(tmp_path):

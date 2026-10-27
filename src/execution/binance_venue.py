@@ -193,6 +193,8 @@ class BinanceVenue(CCXTSpotVenue):
         return source.price
 
     def _check_order(self, intent, as_of):
+        if intent.order_type not in ("market", "limit", "stop"):
+            raise LedgerError("native Binance trailing order support is not yet implemented")
         market = self._market(intent.instrument)
         capture, _ = self._capture(as_of)
         symbol = self._symbol(capture, intent.instrument.instrument_id)

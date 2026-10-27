@@ -257,6 +257,8 @@ class KrakenVenue(CCXTSpotVenue):
         return self._rules[instrument.instrument_id]
 
     def _check_order(self, intent, as_of):
+        if intent.order_type not in ("market", "limit", "stop"):
+            raise LedgerError("native Kraken trailing order support is not yet implemented")
         capture, _ = self._capture(as_of)
         pair = self._pair(capture, intent.instrument.instrument_id)
         if pair["status"] != "online" and not (

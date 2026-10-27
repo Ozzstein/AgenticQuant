@@ -305,6 +305,20 @@ def admit(wire, engine, adapter, order):
     return engine.dispatch(order.intent_id, as_of=wire.now)
 
 
+def test_unimplemented_trailing_type_rejects_before_add_order_and_releases_cash(tmp_path):
+    wire, execution, adapter, order = setup(tmp_path)
+    adapter._rules[BTC.instrument_id] = adapter._rules[BTC.instrument_id].model_copy(
+        update={"order_types": ("market", "trailing_stop")}
+    )
+    order = order.model_copy(update={"order_type": "trailing_stop", "trail_percent": D(10)})
+    result = admit(wire, execution, adapter, order)
+    assert result["state"] == "rejected" and "trailing" in result["detail"]
+    assert not any("AddOrder" in path for _, path, *_ in wire.calls)
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    assert not execution.ledger.fills(order.account_id)
+    execution.ledger.close()
+
+
 def test_actual_partial_base_fee_restart_and_loss_use_posted_ledger_assets(tmp_path):
     wire, engine, adapter, order = setup(tmp_path)
     assert admit(wire, engine, adapter, order)["state"] == "new"

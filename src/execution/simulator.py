@@ -34,6 +34,7 @@ class PaperExecution:
         self.risk_policy = risk_policy or RiskPolicy()
 
     def submit(self, intent: OrderIntent, metadata: dict[str, InstrumentRisk]):
+        intent = OrderIntent.model_validate(intent.model_dump())
         if intent.account_id != self.account_id:
             raise LedgerError("execution account mismatch")
         with self.ledger.atomic():
@@ -183,11 +184,12 @@ class PaperExecution:
                         if order.side == "buy"
                         else price >= order.limit_price
                     )
-                elif order.order_type == "stop":
+                elif order.order_type in ("stop", "trailing_stop"):
+                    from src.execution.stops import observe_stop
+
                     marketable = (
-                        event.price >= order.stop_price
-                        if order.side == "buy"
-                        else event.price <= order.stop_price
+                        event.tradable
+                        and observe_stop(self.ledger, order, event).elected_event_id is not None
                     )
                 meta = order_metadata.get(event.instrument.instrument_id)
                 if meta is None:
@@ -257,7 +259,9 @@ class PaperExecution:
                     else:
                         capacity -= qty
                         fills.append(fill)
-                if order.tif in ("IOC", "FOK"):
+                if order.tif in ("IOC", "FOK") and (
+                    order.order_type not in ("stop", "trailing_stop") or marketable
+                ):
                     self.ledger.cancel(
                         self.account_id,
                         order.intent_id,
@@ -265,6 +269,12 @@ class PaperExecution:
                         "unfilled immediate quantity",
                     )
             return fills
+
+    def stop_state(self, intent_id: str):
+        """Verified immutable local stop observation, including original election."""
+        from src.execution.stops import read_stop_state
+
+        return read_stop_state(self.ledger, self.account_id, intent_id)
 
     def close_bar(self, bar: ExecutionBar):
         bar = ExecutionBar.model_validate(bar.model_dump())

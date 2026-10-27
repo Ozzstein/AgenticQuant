@@ -84,9 +84,11 @@ class OrderIntent(VersionedContract):
     fx_rate: Positive = Decimal(1)
     estimated_fee: NonNegative = Decimal(0)
     strategy_id: NonEmptyString
-    order_type: Literal["market", "limit", "stop"] = "market"
+    order_type: Literal["market", "limit", "stop", "trailing_stop"] = "market"
     limit_price: Positive | None = None
     stop_price: Positive | None = None
+    trail_price: Positive | None = None
+    trail_percent: Annotated[Decimal, Field(gt=0, lt=100)] | None = None
     tif: Literal["GTC", "DAY", "IOC", "FOK"] = "GTC"
     expires_at: UtcTimestamp | None = None
 
@@ -98,11 +100,29 @@ class OrderIntent(VersionedContract):
             raise ValueError("limit order needs limit_price")
         if self.order_type == "stop" and self.stop_price is None:
             raise ValueError("stop order needs stop_price")
+        if self.order_type == "trailing_stop":
+            if (self.trail_price is None) == (self.trail_percent is None):
+                raise ValueError("trailing stop needs exactly one trail_price or trail_percent")
+            if self.limit_price is not None or self.stop_price is not None:
+                raise ValueError("trailing stop derives its threshold; no fixed price allowed")
+            if self.tif not in ("GTC", "DAY"):
+                raise ValueError("trailing stop requires GTC or explicit DAY expiry")
+        elif self.trail_price is not None or self.trail_percent is not None:
+            raise ValueError("trailing terms require a trailing stop order")
         if self.tif == "DAY" and self.expires_at is None:
             raise ValueError("DAY order needs explicit calendar session expiry")
         if self.expires_at is not None and self.expires_at < self.eligible_at:
             raise ValueError("expiry precedes eligibility")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        # Preserve every existing immutable intent/artifact hash.
+        for key in ("trail_price", "trail_percent"):
+            if getattr(self, key) is None:
+                result.pop(key, None)
+        return result
 
 
 class FillSettlement(VersionedContract):

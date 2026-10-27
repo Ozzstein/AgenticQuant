@@ -130,7 +130,10 @@ class VenueRules(VersionedContract):
     market_quantity_step: Positive | None = None
     market_minimum_quantity: Positive | None = None
     market_maximum_quantity: Positive | None = None
-    order_types: tuple[Literal["market", "limit", "stop"], ...] = ("market", "limit")
+    order_types: tuple[Literal["market", "limit", "stop", "trailing_stop"], ...] = (
+        "market",
+        "limit",
+    )
     time_in_force: tuple[Literal["GTC", "DAY", "IOC", "FOK"], ...] = ("GTC",)
     market_type: Literal["equity", "spot"]
     active: bool
@@ -196,6 +199,8 @@ class VenueRules(VersionedContract):
                 or (self.maximum_price is not None and price > self.maximum_price)
             ):
                 raise LedgerError("venue tick increment or price range violated")
+        if intent.trail_price is not None and intent.trail_price % self.price_tick:
+            raise LedgerError("venue trailing offset tick increment violated")
         market = intent.order_type == "market"
         if market and (
             (self.market_quantity_step is not None and intent.quantity % self.market_quantity_step)
@@ -514,6 +519,7 @@ class VenueExecution:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, "quantagentlab:" + account_id + "\0" + intent_id))
 
     def prepare(self, intent: OrderIntent, metadata: dict[str, InstrumentRisk], *, as_of: datetime):
+        intent = OrderIntent.model_validate(intent.model_dump())
         as_of = _utc(as_of)
         if intent.account_id != self.account_id or intent.decision_at != as_of:
             raise LedgerError("intent must use this account and explicit current decision clock")

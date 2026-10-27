@@ -221,6 +221,20 @@ def admit(runtime, execution, adapter, order):
     return execution.dispatch(order.intent_id, as_of=runtime.at)
 
 
+def test_unimplemented_trailing_type_cannot_fall_through_to_fixed_stop_runtime(tmp_path):
+    runtime, execution, adapter, order = setup(tmp_path)
+    adapter._rules[A.instrument_id] = adapter._rules[A.instrument_id].model_copy(
+        update={"order_types": ("market", "trailing_stop")}
+    )
+    order = order.model_copy(update={"order_type": "trailing_stop", "trail_percent": D(10)})
+    result = admit(runtime, execution, adapter, order)
+    assert result["state"] == "rejected" and "trailing" in result["detail"]
+    assert not runtime.calls
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    assert not execution.ledger.fills(order.account_id)
+    execution.ledger.close()
+
+
 @pytest.mark.parametrize("instrument", [A, B])
 def test_native_partial_receipts_restart_duplicate_and_losing_nav(tmp_path, instrument):
     runtime, execution, adapter, order = setup(tmp_path, instrument=instrument)

@@ -255,6 +255,8 @@ class LeanAlgorithmPort:
         }
 
     def preflight(self, intent):
+        if intent.order_type not in ("market", "limit", "stop"):
+            raise LedgerError("LEAN trailing order support is not yet implemented")
         security = self.algorithm.Securities[self.symbols[intent.instrument.instrument_id]]
         if not security.IsTradable or not security.HasData or self.algorithm.IsWarmingUp:
             raise LedgerError("LEAN security is not currently ready/tradable")
@@ -269,6 +271,8 @@ class LeanAlgorithmPort:
                 self._native_decimal(price)
 
     def submit(self, intent, client_id):
+        if intent.order_type not in ("market", "limit", "stop"):
+            raise LedgerError("LEAN trailing order support is not yet implemented")
         properties = self._properties()
         properties.TimeInForce = self._gtc()
         if intent.tif == "DAY":

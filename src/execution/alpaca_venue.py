@@ -27,7 +27,13 @@ from pydantic import SecretStr
 from src.domain.common import _utc
 from src.domain.portfolio import AccountFee, Fill, OrderIntent
 from src.execution.ledger import LedgerError, PortfolioLedger
-from src.execution.venue import DefinitiveRejection, VenueBalances, VenueOrderReport, VenueRules
+from src.execution.venue import (
+    DefinitiveRejection,
+    SubmissionNotAttempted,
+    VenueBalances,
+    VenueOrderReport,
+    VenueRules,
+)
 
 
 def _json(value):
@@ -520,10 +526,21 @@ class AlpacaVenue:
             or order.get("time_in_force", "").upper() != intent.tif
         ):
             raise LedgerError("remote acknowledgement differs from exact intended order")
-        for key in ("limit_price", "stop_price"):
+        price_keys = (
+            ("limit_price", "trail_price", "trail_percent")
+            if intent.order_type == "trailing_stop"
+            else ("limit_price", "stop_price", "trail_price", "trail_percent")
+        )
+        for key in price_keys:
             actual = order.get(key)
             if (None if actual is None else _decimal(actual)) != getattr(intent, key):
                 raise LedgerError("remote acknowledgement price differs from intended order")
+        if intent.order_type == "trailing_stop":
+            # These are native observations, not caller-supplied fixed stop prices.
+            # Retain exact wire values; never generate fills from a HWM/threshold.
+            for key in ("hwm", "stop_price"):
+                if order.get(key) is not None and _decimal(order[key]) <= 0:
+                    raise LedgerError("native trailing observation must be positive or null")
         cumulative = _decimal(order["filled_qty"])
         fills = []
         if cumulative:
@@ -599,6 +616,12 @@ class AlpacaVenue:
         if intent.account_id != self.account_id or intent.fx_rate != 1:
             raise LedgerError("Alpaca exact account/USD FX required")
         rules.require_order(intent, as_of)
+        if intent.order_type == "trailing_stop" and (
+            intent.quantity % 1 or intent.tif not in ("GTC", "DAY")
+        ):
+            raise SubmissionNotAttempted(
+                "Alpaca trailing path requires whole shares and GTC/DAY before submission"
+            )
         self._require_claim(intent, client_order_id, rules, as_of)
         payload = {
             "symbol": rules.symbol,
@@ -610,7 +633,7 @@ class AlpacaVenue:
             "extended_hours": False,
             "order_class": "simple",
         }
-        for key in ("limit_price", "stop_price"):
+        for key in ("limit_price", "stop_price", "trail_price", "trail_percent"):
             if getattr(intent, key) is not None:
                 payload[key] = str(getattr(intent, key))
         order, observed, reference = self._request(
