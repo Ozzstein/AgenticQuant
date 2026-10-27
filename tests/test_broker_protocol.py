@@ -53,7 +53,7 @@ class TestBaseBrokerProtocol:
         assert "total_return" in result
 
     def test_compute_broker_metrics_empty(self) -> None:
-        """compute_broker_metrics returns all-zero dict when inputs are empty."""
+        """compute_broker_metrics keeps metrics undefined when inputs are empty."""
         result = compute_broker_metrics(nav_history=[], trade_log=[])
 
         expected_keys = {
@@ -73,14 +73,14 @@ class TestBaseBrokerProtocol:
             f"Unexpected keys in metrics: {set(result.keys()) ^ expected_keys}"
         )
         for key, value in result.items():
-            assert value == 0.0, f"Expected 0.0 for '{key}' but got {value}"
+            assert value is None, f"Expected None for '{key}' but got {value}"
 
     def test_compute_broker_metrics_single_entry(self) -> None:
-        """compute_broker_metrics returns zeros when only one NAV entry exists."""
+        """compute_broker_metrics keeps metrics undefined with one NAV entry."""
         ts = datetime(2024, 1, 1)
         result = compute_broker_metrics(nav_history=[(ts, 100_000.0)], trade_log=[])
         for key, value in result.items():
-            assert value == 0.0, f"Expected 0.0 for '{key}' with single entry but got {value}"
+            assert value is None, f"Expected None for '{key}' with single entry but got {value}"
 
     def test_compute_broker_metrics_positive_return(self) -> None:
         """compute_broker_metrics correctly computes total_return for simple growth."""
@@ -115,14 +115,14 @@ class TestBaseBrokerProtocol:
         from src.execution.broker import compute_broker_metrics
 
         trader = PaperTrader(initial_cash=100_000.0)
-        base = datetime(2024, 1, 1)
-        for i in range(5):
-            trader._nav_history.append((base + timedelta(days=i), 100_000.0 + i * 200.0))
+        trader.snapshot({})
 
         expected = compute_broker_metrics(trader._nav_history, trader._trade_log)
         actual = trader.get_metrics()
 
-        assert actual == expected, "PaperTrader.get_metrics() must delegate to compute_broker_metrics"
+        assert actual == expected, (
+            "PaperTrader.get_metrics() must delegate to compute_broker_metrics"
+        )
 
 
 class TestAlpacaConfig:
@@ -166,6 +166,7 @@ class TestAlpacaConfig:
         """AppConfig loads alpaca section from settings.yaml with enabled=False."""
         # get_config() reads settings.yaml which sets alpaca.enabled: false
         from src.utils.config import get_config
+
         app_cfg = get_config()
         assert app_cfg.alpaca.enabled is False
         assert app_cfg.alpaca.paper is True
@@ -208,6 +209,7 @@ class TestBrokerFactory:
                 def _side_effect(cfg=None):
                     if cfg is None:
                         from src.utils.config import get_config
+
                         cfg = get_config()
                     if cfg.alpaca.enabled:
                         return mock_trader_class(cfg.alpaca)
@@ -312,6 +314,7 @@ class TestCcxtConfig:
 
     def test_ccxt_config_defaults(self) -> None:
         from src.utils.config import CcxtConfig
+
         cfg = CcxtConfig()
         assert cfg.enabled is False
         assert cfg.exchange == "binance"
@@ -324,6 +327,7 @@ class TestCcxtConfig:
 
     def test_ccxt_config_in_app_config(self) -> None:
         from src.utils.config import AppConfig, CcxtConfig
+
         app = AppConfig()
         assert isinstance(app.ccxt, CcxtConfig)
         assert app.ccxt.enabled is False
@@ -332,6 +336,7 @@ class TestCcxtConfig:
         monkeypatch.setenv("AIQUANT_CCXT__API_KEY", "test-key-123")
         monkeypatch.setenv("AIQUANT_CCXT__EXCHANGE", "kraken")
         from src.utils.config import AppConfig
+
         app = AppConfig()
         assert app.ccxt.api_key == "test-key-123"
         assert app.ccxt.exchange == "kraken"
@@ -344,6 +349,7 @@ class TestCcxtConfig:
             CcxtOrderError,
             ExecutionError,
         )
+
         assert issubclass(CcxtError, ExecutionError)
         assert issubclass(CcxtError, AiQuantError)
         assert issubclass(CcxtConnectionError, CcxtError)
@@ -353,6 +359,7 @@ class TestCcxtConfig:
         # settings.yaml sets ccxt.max_retries: 5 (differs from class default of 3)
         # so this test verifies YAML is actually loaded, not just defaults
         from src.utils.config import get_config, reset_config
+
         reset_config()
         try:
             cfg = get_config()
@@ -371,6 +378,7 @@ class TestCcxtFactory:
         from src.execution.broker import create_broker
         from src.execution.ccxt_trader import CcxtTrader
         from src.utils.config import AppConfig, CcxtConfig
+
         config = AppConfig(ccxt=CcxtConfig(enabled=True, api_key="k", api_secret="s", paper=True))
         trader = create_broker(config)
         assert isinstance(trader, CcxtTrader)
@@ -380,6 +388,7 @@ class TestCcxtFactory:
         from src.execution.broker import create_broker
         from src.execution.ccxt_trader import CcxtTrader
         from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+
         config = AppConfig(
             ccxt=CcxtConfig(enabled=True, paper=True),
             alpaca=AlpacaConfig(enabled=True, paper=True),
@@ -394,6 +403,7 @@ class TestCcxtFactory:
 
         from src.execution.broker import create_broker
         from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+
         mock_alpaca_module = MagicMock()
         mock_alpaca_class = MagicMock()
         mock_alpaca_module.AlpacaTrader = mock_alpaca_class
@@ -409,6 +419,7 @@ class TestCcxtFactory:
         from src.execution.broker import create_broker
         from src.execution.paper_trader import PaperTrader
         from src.utils.config import AlpacaConfig, AppConfig, CcxtConfig
+
         config = AppConfig(ccxt=CcxtConfig(enabled=False), alpaca=AlpacaConfig(enabled=False))
         broker = create_broker(config)
         assert isinstance(broker, PaperTrader)
@@ -420,6 +431,7 @@ class TestCcxtFactory:
         from typer.testing import CliRunner
 
         from src.utils.cli import app
+
         runner = CliRunner()
         mock_trader = MagicMock()
         mock_trader.portfolio.nav = 100_000.0
@@ -429,3 +441,43 @@ class TestCcxtFactory:
             result = runner.invoke(app, ["trade", "status", "--broker", "ccxt"])
         assert result.exit_code == 0
         assert "NAV" in result.output or "100" in result.output
+
+
+def test_broker_and_replay_metrics_share_exact_return_conventions():
+    from src.core.backtester import performance_metrics
+
+    initial = datetime(2024, 1, 1)
+    history = [(initial + timedelta(days=i), nav) for i, nav in enumerate([10000, 11000, 8800])]
+    paper = compute_broker_metrics(history, [])
+    replay = performance_metrics([10000, 11000, 8800], 252)
+    for broker_key, replay_key in [
+        ("total_return", "total_return"),
+        ("annualized_return", "annual_return"),
+        ("sharpe", "sharpe_ratio"),
+        ("sortino", "sortino_ratio"),
+        ("max_drawdown", "max_drawdown"),
+        ("calmar", "calmar_ratio"),
+        ("volatility", "volatility"),
+    ]:
+        assert paper[broker_key] == getattr(replay, replay_key)
+    assert paper["max_drawdown"] == pytest.approx(-0.2)
+
+
+def test_intraday_monitoring_does_not_create_fake_daily_samples():
+    initial = datetime(2024, 1, 1)
+    daily = [
+        (initial, 10000),
+        (initial + timedelta(days=1), 11000),
+        (initial + timedelta(days=2), 8800),
+    ]
+    intraday = [
+        daily[0],
+        (initial + timedelta(hours=12), 10500),
+        daily[1],
+        (initial + timedelta(days=1, hours=12), 9000),
+        daily[2],
+    ]
+    # Added observations on the initial day create one real first-day return;
+    # additional observations on an existing later day replace that day's close.
+    canonical = [daily[0], intraday[1], intraday[3], daily[2]]
+    assert compute_broker_metrics(intraday, []) == compute_broker_metrics(canonical, [])

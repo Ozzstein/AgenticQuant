@@ -1,4 +1,5 @@
 """Tests for PaperTrader paper trading engine."""
+
 from __future__ import annotations
 
 import math
@@ -108,7 +109,7 @@ def test_nav_conservation(trader: PaperTrader) -> None:
 
 
 def test_metrics_after_multiple_trades(trader: PaperTrader) -> None:
-    """11 snapshots with alternating prices produce valid finite metric values."""
+    """Intraday snapshots preserve undefined daily and trade statistics."""
     expected_keys = {
         "total_return",
         "annualized_return",
@@ -137,8 +138,10 @@ def test_metrics_after_multiple_trades(trader: PaperTrader) -> None:
 
     assert set(metrics.keys()) == expected_keys
     for key, value in metrics.items():
-        assert isinstance(value, float), f"{key} is not float: {value!r}"
-        assert math.isfinite(value), f"{key} is not finite: {value}"
+        assert value is None or isinstance(value, float), f"{key} is not nullable float: {value!r}"
+        assert value is None or math.isfinite(value), f"{key} is not finite: {value}"
+    assert metrics["sharpe"] is None  # one observed daily return, no invented samples
+    assert metrics["profit_factor"] is None  # no realized sell trades
 
 
 def test_insufficient_cash(trader: PaperTrader) -> None:

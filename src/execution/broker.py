@@ -69,102 +69,73 @@ class BaseBroker(Protocol):
 def compute_broker_metrics(
     nav_history: list[tuple[datetime, float]],
     trade_log: list[dict],
+    *,
+    samples_per_year: int = 252,
 ) -> dict:
-    """Compute portfolio performance metrics from NAV history and trade log.
+    """Use the canonical replay metrics with zero cash return.
 
-    This utility function encapsulates the shared metric logic so that both
-    ``PaperTrader`` and future broker implementations (e.g. ``AlpacaTrader``)
-    can compute identical statistics without duplicating code.
-
-    Metrics are calculated using daily NAV observations.  A risk-free rate of
-    4% per annum is assumed for Sharpe / Sortino calculations.
-
-    Args:
-        nav_history: Ordered list of ``(timestamp, nav)`` tuples.  Must contain
-            at least two entries for any non-zero metric to be returned.
-        trade_log: List of trade log dicts.  Each sell-side entry is expected to
-            carry a ``"pnl"`` key with the realised P&L for that trade and a
-            ``"side"`` key equal to ``OrderSide.SELL.value``.
-
-    Returns:
-        Dictionary with keys:
-            ``total_return``, ``annualized_return``, ``sharpe``, ``sortino``,
-            ``max_drawdown``, ``calmar``, ``volatility``, ``win_rate``,
-            ``avg_win``, ``avg_loss``, ``profit_factor``.
-        All values are floats.  Returns zeros for every key when fewer than
-        two NAV snapshots are available.
+    Keep initial capital and the final observed NAV per UTC date. Repeated
+    intraday monitoring calls cannot increase the annualization sample count.
+    Missing/undefined metrics are None, including profit factor without losses.
+    Legacy naive timestamps retain their recorded date; typed ledger clocks are UTC.
     """
-    zeros: dict = {
-        "total_return": 0.0,
-        "annualized_return": 0.0,
-        "sharpe": 0.0,
-        "sortino": 0.0,
-        "max_drawdown": 0.0,
-        "calmar": 0.0,
-        "volatility": 0.0,
-        "win_rate": 0.0,
-        "avg_win": 0.0,
-        "avg_loss": 0.0,
-        "profit_factor": 0.0,
-    }
-    if len(nav_history) < 2:
-        return zeros
+    from datetime import timezone
 
-    navs = np.array([nav for _, nav in nav_history], dtype=float)
-    returns = np.diff(navs) / navs[:-1]
+    from src.core.backtester import performance_metrics
 
-    total_return = float((navs[-1] - navs[0]) / navs[0])
-    n = max(len(returns), 1)
-    annualized_return = float((1.0 + total_return) ** (252.0 / n) - 1.0)
-
-    vol = float(np.std(returns, ddof=1) * np.sqrt(252)) if len(returns) > 1 else 0.0
-    rf = 0.04
-    sharpe = float((annualized_return - rf) / vol) if vol != 0.0 else 0.0
-
-    downside = returns[returns < 0]
-    if len(downside) > 1:
-        downside_vol = float(np.std(downside, ddof=1) * np.sqrt(252))
-    elif len(downside) == 1:
-        downside_vol = float(abs(downside[0]) * np.sqrt(252))
-    else:
-        downside_vol = 0.0
-    sortino = float((annualized_return - rf) / downside_vol) if downside_vol != 0.0 else 0.0
-
-    # Max drawdown
-    running_max = np.maximum.accumulate(navs)
-    drawdowns = (navs - running_max) / running_max
-    max_drawdown = float(np.min(drawdowns))
-
-    calmar = float(annualized_return / abs(max_drawdown)) if max_drawdown != 0.0 else 0.0
-
-    # Trade-level stats (sell trades only)
-    sell_pnls = [t["pnl"] for t in trade_log if t.get("side") == OrderSide.SELL.value]
-
-    if sell_pnls:
-        wins = [p for p in sell_pnls if p > 0]
-        losses = [p for p in sell_pnls if p <= 0]
-        win_rate = float(len(wins) / len(sell_pnls))
-        avg_win = float(np.mean(wins)) if wins else 0.0
-        avg_loss = float(np.mean(losses)) if losses else 0.0
-        gross_profit = sum(wins)
-        gross_loss = abs(sum(losses))
-        profit_factor = float(gross_profit / gross_loss) if gross_loss != 0.0 else 0.0
-    else:
-        win_rate = avg_win = avg_loss = profit_factor = 0.0
-
-    return {
-        "total_return": total_return,
-        "annualized_return": annualized_return,
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "max_drawdown": max_drawdown,
-        "calmar": calmar,
-        "volatility": vol,
-        "win_rate": win_rate,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "profit_factor": profit_factor,
-    }
+    names = (
+        "total_return",
+        "annualized_return",
+        "sharpe",
+        "sortino",
+        "max_drawdown",
+        "calmar",
+        "volatility",
+        "win_rate",
+        "avg_win",
+        "avg_loss",
+        "profit_factor",
+    )
+    result = dict.fromkeys(names)
+    if samples_per_year <= 0:
+        raise ValueError("positive declared annualization required")
+    if nav_history:
+        initial_at, initial_nav = nav_history[0]
+        sampled = {}
+        last_at = initial_at
+        for at, nav in nav_history[1:]:
+            if at < last_at:
+                raise ValueError("NAV observations must be chronological")
+            if at == initial_at and nav == initial_nav:
+                continue
+            if at == last_at:
+                raise ValueError("conflicting duplicate NAV timestamp")
+            last_at = at
+            day = at.astimezone(timezone.utc).date() if at.tzinfo is not None else at.date()
+            sampled[day] = nav
+        if sampled:
+            metrics = performance_metrics([initial_nav, *sampled.values()], samples_per_year)
+            result.update(
+                total_return=metrics.total_return,
+                annualized_return=metrics.annual_return,
+                sharpe=metrics.sharpe_ratio,
+                sortino=metrics.sortino_ratio,
+                max_drawdown=metrics.max_drawdown,
+                calmar=metrics.calmar_ratio,
+                volatility=metrics.volatility,
+            )
+    pnls = [float(t["pnl"]) for t in trade_log if t.get("side") == OrderSide.SELL.value]
+    if pnls:
+        if not np.isfinite(pnls).all():
+            raise ValueError("finite realized P&L required")
+        wins, losses = [p for p in pnls if p > 0], [p for p in pnls if p < 0]
+        result.update(
+            win_rate=len(wins) / len(pnls),
+            avg_win=sum(wins) / len(wins) if wins else None,
+            avg_loss=sum(losses) / len(losses) if losses else None,
+            profit_factor=sum(wins) / abs(sum(losses)) if losses else None,
+        )
+    return result
 
 
 def create_broker(config: AppConfig | None = None) -> BaseBroker:
@@ -192,6 +163,7 @@ def create_broker(config: AppConfig | None = None) -> BaseBroker:
 
     if config.ccxt.enabled:
         from src.execution.ccxt_trader import CcxtTrader
+
         return CcxtTrader(config.ccxt)
 
     if config.alpaca.enabled:
@@ -199,15 +171,17 @@ def create_broker(config: AppConfig | None = None) -> BaseBroker:
             from src.execution.alpaca_trader import AlpacaTrader
         except ImportError as exc:
             raise ImportError(
-                "alpaca-py is required for Alpaca trading. "
-                "Install with: pip install -e '.[alpaca]'"
+                "alpaca-py is required for Alpaca trading. Install with: pip install -e '.[alpaca]'"
             ) from exc
         return AlpacaTrader(config.alpaca)
 
     initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
     return PaperTrader(
-        initial_cash=initial_cash, slippage_bps=5, commission_per_share=0.005,
-        ledger_path=getattr(config, "paper_ledger_path", None) or str(Path(config.output_dir) / "paper-ledger.sqlite3"),
+        initial_cash=initial_cash,
+        slippage_bps=5,
+        commission_per_share=0.005,
+        ledger_path=getattr(config, "paper_ledger_path", None)
+        or str(Path(config.output_dir) / "paper-ledger.sqlite3"),
         account_id=getattr(config, "paper_account_id", "paper:default"),
         base_currency=getattr(config, "paper_base_currency", "USD"),
     )

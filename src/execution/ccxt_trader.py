@@ -159,7 +159,7 @@ class CcxtTrader:
             Dict with keys: total_return, annualized_return, sharpe, sortino,
             max_drawdown, calmar, volatility, win_rate, avg_win, avg_loss, profit_factor.
         """
-        return compute_broker_metrics(self._nav_history, self._trade_log)
+        return compute_broker_metrics(self._nav_history, self._trade_log, samples_per_year=365)
 
     # ------------------------------------------------------------------
     # Extended API (not in BaseBroker protocol)

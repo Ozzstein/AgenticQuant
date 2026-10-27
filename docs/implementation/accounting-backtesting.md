@@ -99,3 +99,15 @@ Acceptance cases now include the exact +10% then −20% date-local selection dia
 - Actual Alpaca, Binance/Kraken CCXT and LEAN connection/order/reconciliation evidence, venue ownership, ambiguous timeout recovery, exchange tick/minimum rules and typed contingent-order lifecycle remain mandatory F follow-on. The quote facade's durable protective orders are not proof of all typed venue capabilities.
 - Multi-currency cash wallets, full strategy-sleeve cost ownership and economic attribution, intrabar advanced order policy and execution after funding-dependent target sells require further full-plan integration. Current behavior is explicit base-currency conversion, executing-strategy attribution and conservative open-only fills; no pending sale is treated as settled cash.
 - Qlib/RD-Agent real experiment evidence, registry/holdout integrity, calibration/multiple-testing acceptance, complete operating recovery and prospective three-month observation remain required. Legacy invalid reports cannot become approved artifacts.
+
+## Canonical broker-metrics follow-up
+
+`compute_broker_metrics` now delegates every portfolio-return metric to the same `performance_metrics` implementation as replay. The former hard-coded 4% risk-free assumption and CAGR/volatility Sharpe are removed. Initial capital and the final observed NAV per UTC date determine the daily path; repeated intraday monitoring does not manufacture daily samples. Missing/undefined metrics return `None`. Trade win/loss/profit-factor measures retain realized-trade semantics and remain undefined without the required outcomes. `PaperTrader.get_metrics(samples_per_year=252)` accepts an explicit sampling convention; typed crypto/mixed callers should specify 365. CCXT's facade declares 365; equity defaults remain 252.
+
+Executed after this change, offline and with lane-specific output paths:
+
+```
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-accounting-metrics/outputs AIQUANT_LOG_DIR=/tmp/quantagent-accounting-metrics/logs /tmp/quantagentlab-review-venv/bin/python -m pytest -q tests/test_paper_trader.py tests/test_paper_advanced.py tests/test_broker_protocol.py tests/test_alpaca_trader.py tests/test_ccxt_trader.py tests/test_durable_accounting.py tests/test_core_backtest.py tests/test_validation.py --disable-socket --basetemp=/tmp/quantagent-accounting-metrics-pytest
+```
+
+Result: **115 passed in 3.73s**, including exact broker/replay metric parity, intraday sampling, nullable metrics, paper durability, replay and validation tamper cases. Existing broker adapter tests use test doubles; this is not actual Alpaca/CCXT connection evidence. Changed-file Ruff passes. Coordinator confirmed integration of the first two accounting commits and canonical `aiquant backtest` command routing; remaining F implementation is continuing under the user's follow-up instruction.
