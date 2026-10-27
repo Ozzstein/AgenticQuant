@@ -344,8 +344,8 @@ def __getattr__(name):
         @model_validator(mode='after')
         def fixed_baseline(self):
             baseline = baseline_specs().get(self.strategy.name)
-            if baseline is None or self.strategy != baseline:
-                raise ValueError('regime trials require an exact fixed code baseline strategy')
+            if baseline is None or self.strategy != baseline or self.strategy.model_name is None:
+                raise ValueError('regime trials require an exact fixed fitted-model code baseline strategy')
             return self
 
         def candidate_payload(self):

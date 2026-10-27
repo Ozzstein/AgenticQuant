@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from types import MappingProxyType
+from typing import Callable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -30,7 +31,7 @@ from src.core.walk_forward import cross_sectional_ic, frame_hash
 from src.data.evidence.store import EvidenceStore, canonical_bytes, digest
 from src.data.features.contextual import NumericEvidenceBinding, materialize_evidence_fields
 from src.data.features.dataset import FeatureDataset, feature_dataset
-from src.domain.common import Sha256, VersionedContract
+from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
 from src.domain.market import FeatureSpec
 from src.research.regime_experiments import (
     CausalRegimeArtifact,
@@ -41,6 +42,35 @@ from src.research.regime_experiments import (
 from src.strategies.runner import evaluate_strategy, rebalance_due
 from src.strategies.specification import StrategySpec
 
+HISTORICAL_ADVICE_POLICY = 'historical-advice-current-ledger-sizing-1'
+
+
+class FrozenAgentDecision(VersionedContract):
+    signal_at: UtcTimestamp
+    instrument_id: NonEmptyString
+    decision_hash: Sha256
+    receipt_hash: Sha256
+
+
+@dataclass(frozen=True)
+class AgentHistoryAuthorities:
+    history_store: object
+    decision_store: object
+    budget_store_path: str | Path
+    portfolio_ledgers: Mapping[str, str | Path]
+
+    def __post_init__(self):
+        object.__setattr__(self, "portfolio_ledgers", MappingProxyType(dict(self.portfolio_ledgers)))
+
+
+def archive_agent_decision(registry, store, *, decision_hash, signal_at,
+                           authorities: AgentHistoryAuthorities) -> FrozenAgentDecision:
+    """Archive an exported desk observation; execution also verifies portfolio/HMM authorities."""
+    receipt = authorities.history_store.export(decision_hash,as_of=signal_at,evidence_store=store,
+        decision_store=authorities.decision_store,budget_store_path=authorities.budget_store_path)
+    return FrozenAgentDecision(signal_at=signal_at,instrument_id=receipt.decision.instrument.instrument_id,
+        decision_hash=registry.archive_contract(receipt.decision),receipt_hash=registry.archive_contract(receipt))
+
 
 class StrategyExperimentPlan(VersionedContract):
     inputs: ResearchInputs
@@ -49,6 +79,7 @@ class StrategyExperimentPlan(VersionedContract):
     numeric_bindings: tuple[NumericEvidenceBinding, ...] = ()
     numeric_sources: tuple[FrozenEvidence, ...] = ()
     model_parameters: tuple[tuple[str, int | float | str | bool | None], ...] = ()
+    agent_decisions: tuple[FrozenAgentDecision, ...] = ()
     regime_artifact_hash: Sha256
     provenance: tuple[tuple[str, str], ...]
 
@@ -59,7 +90,12 @@ class StrategyExperimentPlan(VersionedContract):
         if len(dict(self.model_parameters)) != len(self.model_parameters) or len(dict(self.provenance)) != len(self.provenance):
             raise ValueError('duplicate model parameter/provenance key')
         if self.strategy.model_name is None:
-            raise ValueError('model-free research requires archived agent decision evaluation; numeric trial cannot invent votes')
+            if not self.agent_decisions or self.model_parameters:
+                raise ValueError('model-free research requires archived agent decisions and no numeric model parameters')
+        elif self.agent_decisions:
+            raise ValueError('numeric strategy cannot substitute agent decision artifacts')
+        if len({(v.signal_at,v.instrument_id) for v in self.agent_decisions}) != len(self.agent_decisions):
+            raise ValueError('duplicate historical agent decision at signal cutoff')
         return self
 
     @property
@@ -74,6 +110,69 @@ class StrategyExperimentPlan(VersionedContract):
         config = AppConfig(_env_file=None).model_copy(update={
             'qlib':QlibConfig(model_name=self.strategy.model_name,model_params=dict(self.model_parameters))})
         return ModelWrapper(self.strategy.model_name, config)
+
+
+
+def _verify_agent_decisions(registry, store, plan, *, authorities: AgentHistoryAuthorities,
+                            observations) -> dict:
+    """Read original source/model/budget/history/portfolio authorities; never call an LLM."""
+    from src.agents.contracts import HMMContext, PortfolioReviewContext, hmm_context_from_result
+    from src.agents.history import DeskHistoryReceipt, DeskHistoryStore
+    from src.decision.store import DecisionStore
+    from src.domain.portfolio import PortfolioSnapshot
+    from src.execution.ledger import PortfolioLedger
+
+    if not isinstance(authorities.history_store,DeskHistoryStore) or not isinstance(authorities.decision_store,DecisionStore):
+        raise RegistryError('actual authoritative desk and decision stores required')
+    identities = {b.instrument.instrument_id:b.instrument for b in plan.inputs.bars}
+    regimes = {o.context.as_of:hmm_context_from_result(o) for o in observations}
+    verified, portfolios = {}, {}
+    for reference in plan.agent_decisions:
+        archived = DeskHistoryReceipt.model_validate_json(registry.blob(reference.receipt_hash))
+        receipt = authorities.history_store.export(reference.decision_hash,as_of=reference.signal_at,
+            evidence_store=store,decision_store=authorities.decision_store,budget_store_path=authorities.budget_store_path)
+        if archived != receipt or canonical_bytes(receipt.model_dump(mode='json')) != registry.blob(reference.receipt_hash):
+            raise RegistryError('archived agent receipt differs from authoritative history')
+        decision = receipt.decision
+        if canonical_bytes(decision.model_dump(mode='json')) != registry.blob(reference.decision_hash):
+            raise RegistryError('archived agent decision differs from authoritative history')
+        if identities.get(reference.instrument_id) != decision.instrument or reference.signal_at > plan.inputs.context.as_of:
+            raise RegistryError('historical advice instrument or signal clock differs')
+        if not 0 <= (reference.signal_at-decision.context.as_of).total_seconds() <= plan.strategy.max_signal_age_seconds:
+            raise RegistryError('historical advice observation is future or stale')
+        original = json.loads(receipt.inputs_json)
+        hmm = HMMContext.model_validate(original['hmm_context'])
+        if regimes.get(hmm.as_of) != hmm or hmm.as_of > decision.context.as_of:
+            raise RegistryError('original advice HMM context is not independently reproduced')
+        review = PortfolioReviewContext.model_validate(original['portfolio_context'])
+        snapshot = PortfolioSnapshot.model_validate_json(review.portfolio_json)
+        if not review.available or snapshot.account_id != decision.context.account_id or not snapshot.as_of == review.as_of <= decision.context.as_of:
+            raise RegistryError('original advice portfolio context identity or cutoff differs')
+        if snapshot.content_hash() != review.snapshot_id:
+            raise RegistryError('original advice portfolio snapshot hash differs')
+        path = authorities.portfolio_ledgers.get(snapshot.account_id)
+        if path is None:
+            raise RegistryError('original advice portfolio authority is missing')
+        cache_key = (snapshot.account_id,review.snapshot_id)
+        if cache_key not in portfolios:
+            ledger = PortfolioLedger(path,read_only=True)
+            try:
+                ledger.reconcile(snapshot.account_id)
+                recorded = [s for s in ledger.history(snapshot.account_id) if s.as_of == snapshot.as_of]
+                if recorded != [snapshot]:
+                    raise RegistryError('original advice portfolio differs from persisted authoritative snapshot')
+            finally:
+                ledger.close()
+            portfolios[cache_key] = snapshot
+        verified[(pd.Timestamp(reference.signal_at),reference.instrument_id)] = receipt
+    return verified
+
+
+
+def recompute_agent_decisions(registry, store, plan, *, authorities: AgentHistoryAuthorities, work_dir):
+    artifact = CausalRegimeArtifact.model_validate_json(registry.blob(plan.regime_artifact_hash))
+    observations = recompute_regime_artifact(registry,store,artifact,plan.inputs,work_dir=work_dir)
+    return _verify_agent_decisions(registry,store,plan,authorities=authorities,observations=observations)
 
 
 def materialize_strategy_plan(plan: StrategyExperimentPlan, store: EvidenceStore, *,
@@ -116,6 +215,7 @@ class ExecutedExperiment:
     decision_provider: Callable
     replay_kwargs: dict
     comparisons: tuple[tuple[str, ExecutedExperiment], ...] = ()
+    actual_decision_hashes: tuple[str, ...] = ()
 
 
 def _fit_folds(plan, data, trial, artifact_dir):
@@ -165,7 +265,7 @@ def _fit_folds(plan, data, trial, artifact_dir):
     return models, records, pd.concat(all_predictions).sort_index(), any(not f["complete_window"] for f in folds)
 
 
-def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_path, artifact_dir, comparison=False):
+def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_path, artifact_dir, comparison=False, authorities=None):
     trial = registry.trial(trial_id)
     candidate = registry.candidate(trial.candidate_id)
     plan = plan_type.model_validate_json(registry.blob(trial.inputs_hash))
@@ -192,8 +292,29 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
     data = materialize_strategy_plan(plan,store)
     if data.snapshot_hash not in inputs.context.data_snapshot_ids:
         raise RegistryError('research context must bind the exact materialized feature data snapshot')
-    models, folds, predictions, incomplete = _fit_folds(plan,data,trial,artifact_dir)
-    schedule = tuple(sorted(models))
+    model_free = plan.strategy.model_name is None
+    advice = {}
+    if model_free:
+        if authorities is None:
+            raise RegistryError('historical agent decision authorities required')
+        advice = _verify_agent_decisions(registry,store,plan,authorities=authorities,observations=observations)
+        last_open = max(b.opened_at for b in inputs.bars)
+        schedule = tuple(sorted({pd.Timestamp(b.closed_at) for b in inputs.bars
+            if trial.evaluation_start <= b.closed_at < min(trial.evaluation_end,last_open)}))
+        if not schedule:
+            raise RegistryError('no executable historical agent decision times')
+        models, folds, predictions, incomplete = {}, [], pd.Series(dtype=float), False
+        expected = set()
+        for at in schedule:
+            universe = max((u for u in inputs.universes if u.universe_version == inputs.universe_version
+                            and u.effective_at <= at and u.available_at <= at),key=lambda u:(u.effective_at,u.available_at))
+            classes = {b.instrument.instrument_id:b.instrument.asset_class for b in inputs.bars}
+            expected.update((at,key) for key in universe.instrument_ids if classes[key] in plan.strategy.asset_classes)
+        if set(advice) != expected:
+            raise RegistryError('historical agent decisions must exactly cover the eligible decision schedule')
+    else:
+        models, folds, predictions, incomplete = _fit_folds(plan,data,trial,artifact_dir)
+        schedule = tuple(sorted(models))
     regimes = {pd.Timestamp(o.context.as_of):o for o in observations}
     if set(schedule)-regimes.keys():
         raise RegistryError('actual causal regime observation missing at strategy decision cutoff')
@@ -204,33 +325,43 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         previous_rebalance[at] = last
         if rebalance_due(plan.strategy,at,last):
             last = at
+    if model_free:
+        from src.agents.consensus import consensus_recommendation
     opportunity_rows = []
     for at in schedule:
         universe = max((u for u in inputs.universes if u.universe_version == inputs.universe_version
                         and u.effective_at <= at and u.available_at <= at),
                        key=lambda u:(u.effective_at,u.available_at))
-        frame = data.features.xs(at,level='datetime')
+        frame = data.features.loc[data.features.index.get_level_values('datetime') == at].droplevel('datetime')
         eligible = sorted(key for key in universe.instrument_ids if key in frame.index
             and identities[key].asset_class in plan.strategy.asset_classes and frame.loc[key,'adv_20'] >= plan.strategy.min_adv)
+        if model_free:
+            eligible = [key for key in eligible if consensus_recommendation(advice[(at,key)].decision).action.value not in ('ABSTAIN','VETO')]
         opportunity_rows.append({'at':at.isoformat(),'universe_hash':universe.content_hash(),
-            'universe_version':universe.universe_version,'model_payload_hash':models[at].artifact.payload_hash,
-            'model_artifact_hash':models[at].artifact.content_hash(),'regime_observation_hash':regimes[at].content_hash(),
+            'universe_version':universe.universe_version,'model_payload_hash':None if model_free else models[at].artifact.payload_hash,
+            'model_artifact_hash':None if model_free else models[at].artifact.content_hash(),'regime_observation_hash':regimes[at].content_hash(),
             'rebalance_due':rebalance_due(plan.strategy,at,previous_rebalance[at]),
-            'eligible':[{'instrument_id':key,'prediction':float(predictions.loc[(at,key)])} for key in eligible],
+            'eligible':[({'instrument_id':key,'prediction':None,
+                'decision_hash':advice[(at,key)].decision_hash,'receipt_hash':advice[(at,key)].content_hash(),
+                'consensus_action':consensus_recommendation(advice[(at,key)].decision).action.value,
+                'original_review_snapshot_hash':json.loads(advice[(at,key)].inputs_json)['portfolio_context']['snapshot_id']} if model_free
+                else {'instrument_id':key,'prediction':float(predictions.loc[(at,key)])}) for key in eligible],
             'trace_link':{'account_id':inputs.account.account_id,'run_id':inputs.context.run_id,'at':at.isoformat()}})
     opportunities = {'schema_version':'1.0','implementation':'registered-strategy-opportunities-1',
         'inputs_hash':inputs.content_hash(),'plan_hash':plan.content_hash(),'feature_data_hash':frame_hash(data.features),
         'feature_spec_hash':data.feature_spec_hash,'cadence':plan.strategy.cadence,
+        'advice_policy':HISTORICAL_ADVICE_POLICY if model_free else None,
+        'actual_decision_hashes':sorted({r.decision_hash for r in advice.values()}),
         'decision_times':[at.isoformat() for at in schedule],'rows':opportunity_rows}
     opportunity_path = (artifact_dir/'opportunities.json').resolve()
     opportunity_bytes = canonical_bytes(opportunities)
     write_immutable(opportunity_path,opportunity_bytes.decode())
     recipe = digest(canonical_bytes({'trial':trial.content_hash(),'plan':plan.content_hash(),
-        'models':[fold.model_version for fold in folds], 'opportunities_hash':digest(opportunity_bytes), 'comparison':comparison, 'implementation':'registered-strategy-ledger-1'}))
+        'models':[fold.model_version for fold in folds], 'agent_decisions':[v.model_dump(mode='json') for v in plan.agent_decisions], 'opportunities_hash':digest(opportunity_bytes), 'comparison':comparison, 'implementation':'registered-strategy-ledger-1'}))
 
     def decision_provider(at, snapshot):
         date = pd.Timestamp(at)
-        if date not in models:
+        if date not in schedule:
             raise RegistryError('callback date outside frozen decision schedule')
         if snapshot.as_of != at or snapshot.nav <= 0:
             raise RegistryError('actual positive NAV at callback cutoff required')
@@ -256,9 +387,13 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         if observation.status != 'available':
             return None  # Missing regime blocks new decisions, never implies liquidation.
         callback_context = inputs.context.model_copy(update={'as_of':at,'account_id':snapshot.account_id})
+        consensus = None
+        if model_free:
+            from src.agents.consensus import consensus_recommendation
+            consensus = {key:consensus_recommendation(receipt.decision) for (time,key),receipt in advice.items() if time == date}
         output = evaluate_strategy(plan.strategy,data,callback_context,
             universe=universe,instruments=tuple(identities.values()),holdings=holdings,signal_at=at,
-            regime=observation,model=models[date],holding_sessions=pd.Series(ages,dtype=float),
+            regime=observation,model=models.get(date),consensus=consensus,holding_sessions=pd.Series(ages,dtype=float),
             last_rebalanced_at=previous_rebalance[date],research_registry=registry if kind == 'strategy' else None,
             trial_id=trial_id if kind == 'strategy' else None)
         # Pure callback: actual fill-time ages/holdings come from the supplied ledger snapshot.
@@ -273,7 +408,7 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
 
     refs = dict(plan.provenance)
     correlation = None
-    if plan.reference_features:
+    if plan.reference_features and not model_free:
         references = materialize_strategy_plan(plan,store,specs=plan.reference_features)
         values = [data.features.loc[predictions.index,col].corr(references.features[ref],method='spearman')
                   for col in data.features for ref in references.features]
@@ -284,6 +419,9 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         'features_hash':frame_hash(data.features),'labels_hash':frame_hash(data.labels),
         'feature_availability_hash':frame_hash(data.feature_available_at),'label_end_hash':frame_hash(data.label_available_at),
         'strategy_hash':plan.strategy.content_hash(),'max_existing_factor_correlation':correlation,
+        'advice_policy':HISTORICAL_ADVICE_POLICY if model_free else None,
+        'actual_decision_hashes':sorted({r.decision_hash for r in advice.values()}),
+        'original_review_snapshots':{r.decision_hash:json.loads(r.inputs_json)['portfolio_context']['snapshot_id'] for r in advice.values()},
         'folds':[fold.model_dump(mode='json') for fold in folds],'walk_months':inputs.walk_months,
         'universe_version':inputs.universe_version,'mode':'expanding',
         'trial_registry':{'artifact_id':registry.trial_snapshot(trial_id),
@@ -302,7 +440,7 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         if observed and preceding:
             fold.oos_sharpe = performance_metrics([float(preceding[-1].nav),*[float(s.nav) for s in observed]],inputs.samples_per_year).sharpe_ratio
     result = result.model_copy(update={'walk_forward_results':folds,
-        'cross_sectional_ic':cross_sectional_ic(predictions,data.labels.loc[predictions.index]),
+        'cross_sectional_ic':{} if model_free else cross_sectional_ic(predictions,data.labels.loc[predictions.index]),
         'status':'incomplete' if incomplete else result.status,
         'diagnostics':[*result.diagnostics,*(['final OOS window is incomplete; promotion prohibited'] if incomplete else [])]})
     from src.execution.ledger import PortfolioLedger
@@ -318,11 +456,20 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
     write_immutable(artifact_dir/'replay.json',result.model_dump_json(indent=2))
     artifacts = tuple((str(path.relative_to(artifact_dir)),path.read_bytes()) for path in sorted(artifact_dir.glob('fold-*')))
     artifacts += (('opportunities.json',opportunity_bytes),)
+    for receipt in {r.decision_hash:r for r in advice.values()}.values():
+        artifacts += ((f'decisions/{receipt.decision_hash}.json',canonical_bytes(receipt.decision.model_dump(mode='json'))),
+                      (f'receipts/{receipt.content_hash()}.json',canonical_bytes(receipt.model_dump(mode='json'))))
+    for name, payload in artifacts:
+        if name.startswith(('decisions/', 'receipts/')):
+            path = artifact_dir/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_immutable(path,payload.decode())
     return ExecutedExperiment(result,Path(ledger_path),artifact_dir,artifacts,trial.inputs_hash,
-                              candidate.content_hash(),decision_provider,kwargs)
+                              candidate.content_hash(),decision_provider,kwargs,actual_decision_hashes=tuple(sorted({r.decision_hash for r in advice.values()})))
 
 
 def execute_registered_strategy(registry: ResearchRegistry, trial_id: str, *, store: EvidenceStore,
-                                ledger_path: str | Path, artifact_dir: str | Path) -> ExecutedExperiment:
+                                ledger_path: str | Path, artifact_dir: str | Path,
+                                authorities: AgentHistoryAuthorities | None = None) -> ExecutedExperiment:
     return _execute_registered(registry,trial_id,plan_type=StrategyExperimentPlan,kind='strategy',store=store,
-                               ledger_path=ledger_path,artifact_dir=artifact_dir)
+                               ledger_path=ledger_path,artifact_dir=artifact_dir,authorities=authorities)
