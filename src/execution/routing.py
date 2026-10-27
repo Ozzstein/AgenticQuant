@@ -181,6 +181,17 @@ def target_from_blended_frame(frame, context, instruments, *, target_id, current
         raise LedgerError("all actual sleeves, decisions and provenance must be represented")
     if not frame.index.is_unique or current_snapshot.nav <= 0:
         raise LedgerError("unique instrument rows and positive actual NAV required")
+    signal_ats = attrs.get("signal_ats")
+    if signal_ats is not None:
+        if not isinstance(signal_ats, dict) or set(signal_ats) != names:
+            raise LedgerError("exact per-sleeve signal clock map required")
+        times = [pd.Timestamp(value) for value in signal_ats.values()]
+        if any(t.tzinfo is None or not t <= context.as_of for t in times) or pd.Timestamp(
+            attrs["signal_at"]
+        ) != max(times):
+            raise LedgerError(
+                "aggregate signal clock must be the latest actual causal sleeve signal"
+            )
     identity_maps = {"market_snapshot_hash", "data_snapshot_hashes", "model_training_data_hashes"}
     has_identity_maps = bool(identity_maps & attrs.keys())
     if has_identity_maps:
@@ -212,7 +223,11 @@ def target_from_blended_frame(frame, context, instruments, *, target_id, current
             or provenance.get("model_hash") != attrs["model_artifact_hashes"][name]
         ):
             raise LedgerError("per-sleeve output differs from bound provenance")
-        if any(provenance.get(k) != attrs[k] for k in ("context", "signal_at", "universe_version")):
+        if any(
+            provenance.get(k) != attrs[k] for k in ("context", "universe_version")
+        ) or provenance.get("signal_at") != (
+            signal_ats[name] if signal_ats is not None else attrs["signal_at"]
+        ):
             raise LedgerError("per-sleeve causal evidence mismatch")
         if has_identity_maps:
             if (

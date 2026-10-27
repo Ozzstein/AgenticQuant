@@ -661,6 +661,39 @@ def test_actual_decision_may_follow_signal_close_but_never_precede_it(
                     adapt()
         frame.attrs = saved
         assert adapt() == original
+    if blended:
+        saved, original_beta = deepcopy(frame.attrs), dict(beta.attrs)
+        beta.attrs["signal_at"] = (T + timedelta(minutes=5)).isoformat()
+        # Original row clocks remain attached to their originating sleeve.
+        beta.attrs["feature_observed_ats"] = {A.instrument_id: T.isoformat()}
+        beta.attrs["feature_available_ats"] = {
+            A.instrument_id: (T + timedelta(minutes=2)).isoformat()
+        }
+        frame.attrs["sleeve_provenance"]["beta"] = dict(beta.attrs)
+        frame.attrs["signal_ats"] = {
+            name: value.attrs["signal_at"] for name, value in outputs.items()
+        }
+        frame.attrs["signal_at"] = beta.attrs["signal_at"]
+        mixed = adapt()
+        assert mixed.decision_at == decision
+        assert mixed.sleeve_sources["beta"] != original.sleeve_sources["beta"]
+        assert mixed.sleeve_sources["alpha"] == original.sleeve_sources["alpha"]
+        valid = deepcopy(frame.attrs)
+        for change in (
+            {"signal_ats": {"alpha": T.isoformat()}},
+            {"signal_ats": {"alpha": beta.attrs["signal_at"], "beta": T.isoformat()}},
+            {"signal_at": (T + timedelta(minutes=6)).isoformat()},
+            {"signal_ats": {"alpha": T.isoformat(), "beta": T.replace(tzinfo=None).isoformat()}},
+        ):
+            frame.attrs = {**deepcopy(valid), **change}
+            with pytest.raises(LedgerError, match="signal|causal evidence"):
+                adapt()
+        frame.attrs = deepcopy(valid)
+        del frame.attrs["signal_ats"]
+        with pytest.raises(LedgerError, match="causal evidence"):
+            adapt()
+        beta.attrs, frame.attrs = original_beta, saved
+        assert adapt() == original
     for invalid in (decision + timedelta(seconds=1), decision.replace(tzinfo=None)):
         frame.attrs["signal_at"] = invalid.isoformat()
         with pytest.raises(LedgerError, match="causal context"):
