@@ -18,7 +18,7 @@ from src.domain.common import (
     VersionedContract,
     _utc,
 )
-from src.domain.portfolio import Fill, FillSettlement, InventoryFee, PriceMark
+from src.domain.portfolio import Fill, FillSettlement, InventoryFee, PriceMark, exact_decimal_sum
 from src.execution.ccxt_transport import CCXTTransport, canonical, decimal, digest
 from src.execution.ledger import LedgerError
 from src.execution.venue import SubmissionNotAttempted, VenueRules
@@ -294,6 +294,7 @@ class CCXTSpotVenue:
         executed_at,
         observed_at,
         evidence_id,
+        asset_charges=None,
     ):
         quantity, price, cost, charge = map(decimal, (quantity, price, cost, fee_quantity))
         if min(quantity, price, cost) <= 0 or charge < 0:
@@ -315,6 +316,16 @@ class CCXTSpotVenue:
             "fee_quantity": str(charge),
             "executed_at": executed_at.isoformat(),
         }
+        charges = [(fee_asset, charge)]
+        if asset_charges is not None:
+            if charge:
+                raise LedgerError("provide either individual or multi-asset native fee terms")
+            charges = sorted((asset, decimal(value)) for asset, value in asset_charges)
+            if len({asset for asset, _ in charges}) != len(charges) or any(
+                value < 0 for _, value in charges
+            ):
+                raise LedgerError("native fee assets must be unique and nonnegative")
+            economics["asset_charges"] = [(asset, str(value)) for asset, value in charges]
         retained = self.ledger.db.execute(
             "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, trade_key)
         ).fetchone()
@@ -333,10 +344,12 @@ class CCXTSpotVenue:
             # lookup clock. This also rechecks the exact fee valuation proof.
             evidence_id, source_hash = original["source_id"], original["source_hash"]
             observed_at = datetime.fromisoformat(original_source["observed_at"])
-        fees, cash_fee = (), D(0)
-        if charge:
+        fees, cash_fee = [], D(0)
+        for fee_asset, charge in charges:
+            if not charge:
+                continue
             if fee_asset == self.cash_asset:
-                cash_fee = charge
+                cash_fee = exact_decimal_sum([cash_fee, charge])
             else:
                 fee_market = next(
                     (value for value in self.markets.values() if value.base_asset == fee_asset),
@@ -369,7 +382,7 @@ class CCXTSpotVenue:
                     or not 0 <= (executed_at - valuation.mark.as_of).total_seconds() <= 30
                 ):
                     raise LedgerError("native fee valuation identity/availability/age differs")
-                fees = (
+                fees.append(
                     InventoryFee(
                         instrument=fee_market.instrument,
                         quantity=charge,
@@ -381,7 +394,7 @@ class CCXTSpotVenue:
                         source_hash=source_hash,
                         valuation_source_id=valuation.source_id,
                         valuation_source_hash=valuation.source_hash,
-                    ),
+                    )
                 )
         actual = Fill(
             fill_id=self.venue + ":" + str(native_id),
@@ -395,7 +408,7 @@ class CCXTSpotVenue:
             settlement=FillSettlement(
                 gross_quote=cost, source_id=evidence_id, source_hash=source_hash
             ),
-            inventory_fees=fees,
+            inventory_fees=tuple(fees),
         )
         if retained:
             if actual != Fill.model_validate(original["fill"]):

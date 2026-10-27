@@ -289,6 +289,72 @@ def create_typed_binance_execution(
         raise
 
 
+def create_typed_kraken_execution(
+    *,
+    ledger_path,
+    account,
+    broker_account_id,
+    api_key,
+    api_secret,
+    markets,
+    rules,
+    fee_valuation=None,
+    fill_policy=None,
+    risk_policy=None,
+    allow_live=False,
+    max_balance_age_seconds=30,
+    client=None,
+    clock=None,
+    operation_timeout_seconds=30,
+    max_requests_per_operation=128,
+    maximum_response_bytes=8 * 1024 * 1024,
+):
+    """Native Kraken spot with actual trade/ledger proof; no paper endpoint.
+
+    This constructs no network request. Actual live dispatch is independently
+    authorized; synthetic transports are exclusively offline test fixtures.
+    """
+    from src.execution.kraken_venue import KrakenVenue
+    from src.execution.ledger import PortfolioLedger
+    from src.execution.venue import VenueExecution
+
+    ledger, adapter = PortfolioLedger(ledger_path), None
+    try:
+        ledger.create_account(account)
+        adapter = KrakenVenue(
+            ledger,
+            account.account_id,
+            broker_account_id=broker_account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            markets=markets,
+            rules=rules,
+            fee_valuation=fee_valuation,
+            allow_live=allow_live,
+            client=client,
+            clock=clock,
+            operation_timeout_seconds=operation_timeout_seconds,
+            max_requests_per_operation=max_requests_per_operation,
+            maximum_response_bytes=maximum_response_bytes,
+        )
+        return VenueExecution(
+            ledger,
+            account.account_id,
+            {adapter.venue: adapter},
+            {key: adapter.venue for key in rules},
+            owner="direct",
+            fill_policy=fill_policy,
+            risk_policy=risk_policy,
+            allow_live=allow_live,
+            max_balance_age_seconds=max_balance_age_seconds,
+        )
+    except Exception:
+        if adapter is not None:
+            adapter.close()
+        ledger.close()
+        raise
+
+
 def create_typed_alpaca_execution(
     *,
     ledger_path,
