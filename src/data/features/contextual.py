@@ -36,6 +36,8 @@ class EvidenceFields:
     source_ids: pd.Series
     coverage: tuple[tuple[str, str, str, str], ...]
     snapshot_hash: str
+    observed_at: pd.DataFrame | None = None
+    availability_policy: str = "decision-time-vintage-1"
 
 
 def _at(value, path):
@@ -46,7 +48,11 @@ def _at(value, path):
 
 def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, context: RunContext,
                                 bindings: tuple[NumericEvidenceBinding, ...], *,
-                                allowed_evidence_ids: frozenset[str] | None = None) -> EvidenceFields:
+                                allowed_evidence_ids: frozenset[str] | None = None,
+                                availability_policy: str = "decision-time-vintage-1") -> EvidenceFields:
+    if availability_policy not in ("decision-time-vintage-1", "captured-vintage-at-fit-1"):
+        raise ValueError("unknown explicit contextual availability policy")
+    captured = availability_policy == "captured-vintage-at-fit-1"
     if index.names != ["datetime", "instrument"] or not index.is_unique:
         raise ValueError("unique datetime/instrument identity required")
     dates = index.get_level_values("datetime")
@@ -55,6 +61,7 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
     if not bindings or len({(b.name, b.target_instrument_id) for b in bindings}) != len(bindings):
         raise ValueError("unique explicit target/name bindings required")
     values = pd.DataFrame(np.nan, index=index, columns=sorted({b.name for b in bindings}))
+    observed_values = pd.DataFrame(pd.NaT,index=index,columns=values.columns,dtype='datetime64[ns, UTC]')
     availability = pd.Series(pd.NaT, index=index, dtype="datetime64[ns, UTC]")
     sources = pd.Series([() for _ in index], index=index, dtype=object)
     coverage, used = [], {}
@@ -78,19 +85,24 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
         parsed = {}
         for date, instrument_id in target_rows.get(binding.target_instrument_id, ()):
             key = (date, instrument_id)
-            pinned = envelopes[:bisect_right(ready_times,date.to_pydatetime())]
+            cutoff = context.as_of if captured else date.to_pydatetime()
+            pinned = envelopes[:bisect_right(ready_times,cutoff)]
             # Supersession is resolved after BOTH the frozen whitelist and the
             # date-local availability cut, never at the final retrieval clock.
             for item in pinned:
-                item.record.require_available(date.to_pydatetime())
+                item.record.require_available(cutoff)
             superseded = {item.supersedes_id for item in pinned if item.supersedes_id}
             candidates = []
             for envelope in pinned:
                 record = envelope.record
                 if record.evidence_id in superseded:
                     continue
+                if captured and not binding.observation_date_path and max(record.available_at,record.requested_as_of or record.available_at)>date:
+                    # A current PE/funding observation cannot acquire historical
+                    # dates merely because current fitting was authorized.
+                    continue
                 if record.evidence_id not in normalized:
-                    normalized[record.evidence_id] = store.normalized(record.evidence_id,as_of=date.to_pydatetime())
+                    normalized[record.evidence_id] = store.normalized(record.evidence_id,as_of=cutoff)
                 payload = normalized[record.evidence_id]
                 if any(str(payload.get(field)) != value for field, value in binding.filters):
                     continue
@@ -125,6 +137,7 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
                 coverage.append((date.isoformat(), instrument_id, binding.name, "conflicting"))
                 continue
             values.loc[key, binding.name] = selected[0][1]
+            observed_values.loc[key,binding.name] = latest
             ready = max(max(c[2].available_at, c[2].requested_as_of or c[2].available_at) for c in selected)
             availability.loc[key] = max(availability.loc[key], ready) if pd.notna(availability.loc[key]) else ready
             selected_ids = tuple(c[2].evidence_id for c in selected)
@@ -135,5 +148,7 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
     complete &= values.notna().all(axis=1)
     availability = availability.where(complete)
     identity = digest(canonical_bytes({"bindings": [b.model_dump(mode="json") for b in bindings],
+                                       "availability_policy":availability_policy,
+                                       "observed_at":observed_values.to_json(orient='split',date_format='iso'),
                                        "records": used, "values": values.to_json(orient="split", date_format="iso")}))
-    return EvidenceFields(values, availability, sources, tuple(coverage), identity)
+    return EvidenceFields(values, availability, sources, tuple(coverage), identity,observed_values,availability_policy)

@@ -180,7 +180,7 @@ class EnsembleModel:
         X_sub, y_sub = X.loc[train_mask], y.loc[train_mask]
         X_val, y_val = X.loc[val_mask], y.loc[val_mask]
         metadata = dict(self._train_metadata)
-        for field in ("feature_available_at", "label_available_at"):
+        for field in ("feature_available_at", "label_available_at", "label_end_at"):
             if field in metadata:
                 metadata[field] = metadata[field].loc[train_mask]
         if "context" in metadata and cutoff is not None:

@@ -215,7 +215,11 @@ class ModelWrapper:
 
     def train(self, X_train: pd.DataFrame, y_train: pd.Series, *, context: RunContext | None = None,
               feature_available_at: pd.Series | None = None, label_available_at: pd.Series | None = None,
-              feature_spec_hash: str | None = None, data_snapshot_hash: str | None = None) -> "ModelWrapper":
+              feature_spec_hash: str | None = None, data_snapshot_hash: str | None = None,
+              label_end_at: pd.Series | None = None,
+              availability_policy: str = "decision-time-vintage-1") -> "ModelWrapper":
+        if availability_policy not in ("decision-time-vintage-1", "captured-vintage-at-fit-1") or (context is None and availability_policy != "decision-time-vintage-1"):
+            raise ModelError("supported availability policy and actual temporal context required")
         if not isinstance(X_train, pd.DataFrame) or not isinstance(y_train, pd.Series):
             raise ModelError("training requires indexed DataFrame/Series")
         if X_train.empty or not X_train.index.is_unique or not X_train.index.equals(y_train.index):
@@ -234,14 +238,25 @@ class ModelWrapper:
                     raise ModelError("availability requires a timezone")
                 if (availability > context.as_of).any():
                     raise ModelError("future observations cannot enter training")
-            if (dates > context.as_of).any() or (feature_available_at.to_numpy() > dates.to_numpy()).any():
+            if (dates > context.as_of).any():
+                raise ModelError("future feature observations cannot enter training")
+            if availability_policy == "decision-time-vintage-1" and (feature_available_at.to_numpy() > dates.to_numpy()).any():
                 raise ModelError("revised/future features unavailable at their historical decision date")
+            ends = label_available_at if label_end_at is None else label_end_at
+            if not ends.index.equals(X_train.index) or ends.isna().any() or any(pd.Timestamp(t).tzinfo is None for t in ends):
+                raise ModelError("explicit aligned outcome ends require timezone-aware timestamps")
+            if (ends > context.as_of).any() or (ends.to_numpy() < dates.to_numpy()).any() or (ends > label_available_at).any():
+                raise ModelError("future or inconsistent outcome end/availability")
             if not feature_spec_hash or not data_snapshot_hash:
                 raise ModelError("feature and snapshot hashes required for temporal training")
             provenance = dict(feature_spec_hash=feature_spec_hash, training_data_hash=data_snapshot_hash,
                               fitted_at=context.as_of, training_start=dates.min().to_pydatetime(),
                               training_end=dates.max().to_pydatetime(),
                               labels_available_through=pd.Timestamp(label_available_at.max()).to_pydatetime(),
+                              features_available_through=pd.Timestamp(feature_available_at.max()).to_pydatetime(),
+                              label_end_through=pd.Timestamp(ends.max()).to_pydatetime(),
+                              label_end_policy="availability-upper-bound-1" if label_end_at is None else "explicit-outcome-end-1",
+                              vintage_policy=availability_policy,
                               code_version=context.code_version)
         try:
             clean = X_train.astype(float).replace([np.inf, -np.inf], np.nan)
@@ -263,7 +278,10 @@ class ModelWrapper:
         return self
 
     def predict(self, X: pd.DataFrame, *, context: RunContext | None = None,
-                feature_available_at: pd.Series | None = None) -> pd.Series:
+                feature_available_at: pd.Series | None = None,
+                availability_policy: str = "decision-time-vintage-1") -> pd.Series:
+        if availability_policy not in ("decision-time-vintage-1", "captured-vintage-at-fit-1") or (context is None and availability_policy != "decision-time-vintage-1"):
+            raise ModelError("supported availability policy and actual temporal context required")
         if self.model is None or self._imputer is None:
             raise ModelError(f"{self.model_name} has not been trained. Call train() first.")
         if tuple(X.columns) != self._feature_names or not X.index.is_unique:
@@ -272,12 +290,18 @@ class ModelWrapper:
             if self._provenance is None:
                 raise ModelError("unversioned model cannot perform temporal inference")
             dates = self._dates(X.index)
-            if (dates <= self._provenance["fitted_at"]).any() or (dates > context.as_of).any():
+            if self._provenance["fitted_at"] >= context.as_of or (dates > context.as_of).any():
+                raise ModelError("model fit must precede inference decision and observations must precede cutoff")
+            if availability_policy == "decision-time-vintage-1" and (dates <= self._provenance["fitted_at"]).any():
                 raise ModelError("inference observations must follow model fit and precede cutoff")
             if feature_available_at is None or not feature_available_at.index.equals(X.index) or feature_available_at.isna().any():
                 raise ModelError("explicit prediction feature availability required")
-            if (feature_available_at > context.as_of).any() or (feature_available_at.to_numpy() > dates.to_numpy()).any():
+            if any(pd.Timestamp(t).tzinfo is None for t in feature_available_at):
+                raise ModelError("prediction availability requires a timezone")
+            if (feature_available_at > context.as_of).any():
                 raise ModelError("future feature in inference")
+            if availability_policy == "decision-time-vintage-1" and (feature_available_at.to_numpy() > dates.to_numpy()).any():
+                raise ModelError("future feature in historical inference")
         try:
             clean = X.astype(float).replace([np.inf, -np.inf], np.nan)
             transformed = pd.DataFrame(self._scaler.transform(self._imputer.transform(clean)), index=X.index, columns=self._feature_names)

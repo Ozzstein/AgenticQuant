@@ -115,6 +115,10 @@ class ModelArtifact(VersionedContract):
     environment: tuple[tuple[str, str], ...]
     parameters_json: NonEmptyString
     preprocessing: NonEmptyString = "train-median-standard-scaler-v1"
+    vintage_policy: Literal["decision-time-vintage-1", "captured-vintage-at-fit-1"] = "decision-time-vintage-1"
+    features_available_through: UtcTimestamp | None = None
+    label_end_through: UtcTimestamp | None = None
+    label_end_policy: Literal["explicit-outcome-end-1", "availability-upper-bound-1"] = "availability-upper-bound-1"
 
     @model_validator(mode="after")
     def ordered(self) -> "ModelArtifact":
@@ -122,4 +126,8 @@ class ModelArtifact(VersionedContract):
             raise ValueError("model training/label/fit chronology is invalid")
         if len(set(self.feature_names)) != len(self.feature_names):
             raise ValueError("duplicate model features")
+        if self.features_available_through is not None and self.features_available_through > self.fitted_at:
+            raise ValueError("features were unavailable at model fit")
+        if self.label_end_through is not None and not self.training_end <= self.label_end_through <= self.labels_available_through:
+            raise ValueError("outcome end/availability chronology is invalid")
         return self

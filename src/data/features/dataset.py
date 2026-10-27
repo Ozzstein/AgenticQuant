@@ -20,6 +20,7 @@ class FeatureDataset:
     label_available_at: pd.Series
     snapshot_hash: str
     feature_spec_hash: str
+    label_end_at: pd.Series | None = None
 
     def eligible_training(self, as_of) -> "FeatureDataset":
         """Only rows whose inputs and realized outcomes were known by the fit cutoff."""
@@ -28,7 +29,8 @@ class FeatureDataset:
             raise ValueError("training cutoff requires a timezone")
         mask = (self.feature_available_at <= cutoff) & (self.label_available_at <= cutoff) & self.labels.notna()
         return FeatureDataset(self.features.loc[mask], self.labels.loc[mask], self.feature_available_at.loc[mask],
-                              self.label_available_at.loc[mask], self.snapshot_hash, self.feature_spec_hash)
+                              self.label_available_at.loc[mask], self.snapshot_hash, self.feature_spec_hash,
+                              self.label_end_at.loc[mask] if self.label_end_at is not None else None)
 
 
 def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *, horizon: int = 1,
@@ -80,13 +82,14 @@ def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *,
     # observations (EMA/OBV). Later revisions never receive an earlier timestamp.
     available = frame.available_at.groupby(level="instrument").cummax()
     future_price = frame.close.groupby(level="instrument").shift(-horizon)
+    label_end = pd.Series(frame.index.get_level_values('datetime'),index=frame.index).groupby(level='instrument').shift(-horizon)
     label_available = frame.available_at.groupby(level="instrument").shift(-horizon)
     labels = (future_price / frame.close - 1).rename("forward_return")
     label_available = pd.concat([label_available.rename("future"), available.rename("current")], axis=1).max(axis=1)
     label_available = label_available.where(labels.notna())
     snapshot_hash = snapshot.content_hash() if evidence_fields is None else digest(canonical_bytes({"market": snapshot.content_hash(), "contextual": evidence_fields.snapshot_hash}))
     return FeatureDataset(features, labels, available, label_available,
-                          snapshot_hash, digest(canonical_bytes([s.model_dump(mode="json") for s in specs])))
+                          snapshot_hash, digest(canonical_bytes([s.model_dump(mode="json") for s in specs])),label_end)
 
 
 def join_features(base: pd.DataFrame, additional: pd.DataFrame) -> pd.DataFrame:

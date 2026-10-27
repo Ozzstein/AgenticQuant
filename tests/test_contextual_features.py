@@ -86,3 +86,26 @@ def test_prefetch_is_cutoff_equivalent_and_caches_only_immutable_reads(tmp_path,
     put(store,'new-revision',30,date(6),supersedes='revision')
     later = materialize_evidence_fields(store,index,context,bindings,allowed_evidence_ids=frozenset({'initial','revision','new-revision'}))
     assert later.values.iloc[-1,0]==30  # Cache is invocation-local, never hides a new immutable revision.
+
+
+def test_current_captured_fields_require_explicit_observation_dates(tmp_path):
+    store=EvidenceStore(tmp_path/'current.sqlite')
+    put(store,'captured',12,date(10))
+    index=pd.MultiIndex.from_tuples([(date(2),'equity:a'),(date(3),'equity:a')],names=['datetime','instrument'])
+    context=RunContext(run_id='current',mode='paper',as_of=date(11),config_hash='0'*64,code_version='test')
+    binding=NumericEvidenceBinding(name='pe',target_instrument_id='equity:a',source_instrument_id='equity:a',
+        kind='ratios',value_path=('pe',),observation_date_path=('date',),max_age_seconds=86400*10)
+    strict=materialize_evidence_fields(store,index,context,(binding,))
+    assert strict.values.isna().all().all()
+    captured=materialize_evidence_fields(store,index,context,(binding,),availability_policy='captured-vintage-at-fit-1')
+    assert captured.values.pe.tolist()==[12,12]
+    assert captured.available_at.tolist()==[date(10)]*2
+    assert captured.observed_at.pe.tolist()==[date(1)]*2
+    assert captured.source_ids.tolist()==[('captured',)]*2
+    unstamped=materialize_evidence_fields(store,index,context,(binding.model_copy(update={'observation_date_path':()}),),
+        availability_policy='captured-vintage-at-fit-1')
+    assert unstamped.values.isna().all().all()
+    historical=materialize_evidence_fields(store,index,context.model_copy(update={'as_of':date(3)}),(binding,),
+        availability_policy='captured-vintage-at-fit-1')
+    assert historical.values.isna().all().all()
+    assert captured.snapshot_hash!=strict.snapshot_hash

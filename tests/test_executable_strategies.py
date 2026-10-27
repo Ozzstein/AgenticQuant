@@ -353,3 +353,48 @@ def test_mixed_universe_sparse_contributions_route_and_preserve_actual_holdings(
     assert target.sleeve_contributions == {'equity':{equity.instrument_id:Decimal('.2')},
                                          'crypto':{crypto.instrument_id:Decimal('.3')}}
     assert result.target_weight.sum() == pytest.approx(.5)
+
+
+def test_latest_available_mixed_closes_keep_sources_and_current_membership():
+    from src.data.evidence.store import canonical_bytes
+    from src.data.features.dataset import FeatureDataset
+    from src.domain.common import RunContext
+    from src.domain.market import FeatureSpec
+    spec=baseline_specs()['agent_consensus']
+    equity=archived_snapshot(periods=1).bars[0].instrument
+    crypto=archived_snapshot(crypto=True,periods=1).bars[0].instrument
+    close=pd.Timestamp('2024-03-08T21:00Z')
+    midnight=pd.Timestamp('2024-03-09T00:00Z')
+    context=RunContext(run_id='mixed',mode='research',as_of=midnight+pd.Timedelta(minutes=15),
+        config_hash='0'*64,code_version='test',data_snapshot_ids=('a'*64,))
+    index=pd.MultiIndex.from_tuples([(close,equity.instrument_id),(midnight,crypto.instrument_id)],
+        names=['datetime','instrument'])
+    features=pd.DataFrame(1e8,index=index,columns=[f.name for f in spec.features])
+    availability=pd.Series(context.as_of-pd.Timedelta(minutes=1),index=index)
+    dataset=FeatureDataset(features,pd.Series(np.nan,index=index),availability,pd.Series(pd.NaT,index=index),
+        'a'*64,digest(canonical_bytes([FeatureSpec.model_dump(f,mode='json') for f in spec.features])))
+    universe=SimpleNamespace(universe_version='observed-current',data_snapshot_id='a'*64,
+        effective_at=context.as_of-pd.Timedelta(minutes=2),available_at=context.as_of-pd.Timedelta(minutes=2),
+        instrument_ids=(equity.instrument_id,crypto.instrument_id))
+    votes={key:SimpleNamespace(action='BUY',agreeing_roles=('a','b','c','d'),derived_votes=(),reason='test')
+        for key in universe.instrument_ids}
+    args=dict(universe=universe,instruments=(equity,crypto),holdings=pd.Series(dtype=float),
+        signal_at=midnight,regime=regime_for(context),consensus=votes)
+    with pytest.raises(StrategyInputError,match='universe'):
+        evaluate_strategy(spec,dataset,context,**args)
+    output=evaluate_strategy(spec,dataset,context,feature_sampling_policy='latest-available-per-instrument-1',**args)
+    assert (output.action=='BUY').all()
+    assert output.attrs['feature_observed_ats']=={equity.instrument_id:close.isoformat(),crypto.instrument_id:midnight.isoformat()}
+    assert output.attrs['feature_available_ats']=={key:availability.iloc[0].isoformat() for key in universe.instrument_ids}
+    pd.testing.assert_index_equal(dataset.features.index,index)
+    altered=FeatureDataset(features,dataset.labels,availability.copy(),dataset.label_available_at,'a'*64,dataset.feature_spec_hash)
+    altered.feature_available_at.iloc[0]=context.as_of+pd.Timedelta(seconds=1)
+    blocked=evaluate_strategy(spec,altered,context,feature_sampling_policy='latest-available-per-instrument-1',**args)
+    assert blocked.loc[equity.instrument_id,'action']=='ABSTAIN'
+    sleeves={'mixed':output,'equity':output.loc[[equity.instrument_id]].copy()}
+    sleeves['mixed'].attrs={**output.attrs,'strategy':'mixed'}
+    sleeves['equity'].attrs={**output.attrs,'strategy':'equity','signal_at':close.isoformat()}
+    blend=blend_sleeves(sleeves,{'mixed':.5,'equity':.5},context,current_weights=pd.Series(dtype=float))
+    assert blend.attrs['signal_ats']=={'mixed':midnight.isoformat(),'equity':close.isoformat()}
+    assert blend.attrs['signal_at']==midnight.isoformat()
+    assert blend.attrs['sleeve_provenance']['equity']==sleeves['equity'].attrs

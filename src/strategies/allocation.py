@@ -114,7 +114,7 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
     if not np.allclose(attributed.reindex(all_current, fill_value=0), current_weights.reindex(all_current, fill_value=0), rtol=0, atol=1e-12):
         raise StrategyInputError("attributed current holdings do not reconcile to portfolio")
     contributions, vetoed = {}, set()
-    identities = []
+    identities, signal_ats = [], {}
     for name, frame in outputs.items():
         if not frame.index.is_unique or frame.attrs.get("strategy") != name or frame.attrs.get("context") != context.model_dump(mode="json"):
             raise StrategyInputError("sleeve provenance/identity mismatch")
@@ -126,7 +126,11 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
         market = frame.attrs.get("market_snapshot_hash", frame.attrs["data_snapshot_hash"])
         if market != frame.attrs["data_snapshot_hash"] and not {market, frame.attrs["data_snapshot_hash"]}.issubset(context.data_snapshot_ids):
             raise StrategyInputError("common market and actual feature snapshots must be approved in RunContext")
-        identities.append((market, frame.attrs["universe_version"], frame.attrs["signal_at"]))
+        signal = pd.Timestamp(frame.attrs['signal_at'])
+        if signal.tzinfo is None or signal > context.as_of:
+            raise StrategyInputError("sleeve signal must precede the shared actual decision cutoff")
+        signal_ats[name] = frame.attrs['signal_at']
+        identities.append((market, frame.attrs["universe_version"]))
         contributions[name] = frame.target_weight * allocations[name]
         previous = current_contributions[name].reindex(frame.index, fill_value=0)
         omitted = current_contributions[name][current_contributions[name] > 0].index.difference(frame.index)
@@ -140,7 +144,7 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
             raise StrategyInputError("EXIT must explicitly close its sleeve contribution")
         vetoed.update(frame.index[frame.action == "VETO"])
     if len(set(identities)) != 1:
-        raise StrategyInputError("cannot net mismatched snapshot, universe or signal cutoffs")
+        raise StrategyInputError("cannot net mismatched snapshot or universe")
     contribution = pd.DataFrame(contributions).fillna(0.)
     missing = current_weights[current_weights > 0].index.difference(contribution.index)
     if len(missing):
@@ -157,7 +161,9 @@ def blend_sleeves(outputs: Mapping[str, pd.DataFrame], allocations: Mapping[str,
                         data_snapshot_hash=identities[0][0], market_snapshot_hash=identities[0][0],
                         data_snapshot_hashes={name: frame.attrs["data_snapshot_hash"] for name, frame in outputs.items()},
                         model_training_data_hashes={name: frame.attrs.get("model_training_data_hash") for name, frame in outputs.items()},
-                        universe_version=identities[0][1], signal_at=identities[0][2],
+                        universe_version=identities[0][1],
+                        signal_at=max(pd.Timestamp(t) for t in signal_ats.values()).isoformat(),
+                        signal_ats=signal_ats,
                         strategy_hashes={name: frame.attrs["strategy_hash"] for name, frame in outputs.items()},
                         model_artifact_hashes={name: frame.attrs["model_hash"] for name, frame in outputs.items()},
                         sleeve_provenance={name: dict(frame.attrs) for name, frame in outputs.items()},

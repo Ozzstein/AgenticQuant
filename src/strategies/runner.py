@@ -85,7 +85,11 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
                       resolver: Callable | None = None,
                       approved_baseline_hashes: frozenset[str] = frozenset(),
                       research_registry=None, trial_id: str | None = None,
-                      market_snapshot_hash: str | None = None) -> pd.DataFrame:
+                      market_snapshot_hash: str | None = None,
+                      feature_sampling_policy: str = "exact") -> pd.DataFrame:
+    if feature_sampling_policy not in ("exact", "latest-available-per-instrument-1"):
+        raise StrategyInputError("unknown explicit feature sampling policy")
+    current_sampling = feature_sampling_policy == "latest-available-per-instrument-1"
     activation = require_strategy_eligible(spec, context, resolver=resolver, approved_baseline_hashes=approved_baseline_hashes,
                                           research_registry=research_registry, trial_id=trial_id)
     parameters = dict(spec.parameters)
@@ -95,7 +99,8 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     if date.tzinfo is None or date > context.as_of or (pd.Timestamp(context.as_of)-date).total_seconds() > spec.max_signal_age_seconds:
         raise StrategyInputError("signal is future, stale or lacks timezone")
     due = rebalance_due(spec, date, last_rebalanced_at, decision_as_of=context.as_of)
-    if universe.effective_at > date or universe.available_at > date or not universe.universe_version:
+    membership_cutoff = context.as_of if current_sampling else date
+    if universe.effective_at > membership_cutoff or universe.available_at > membership_cutoff or not universe.universe_version:
         raise StrategyInputError("universe was not effective and available at signal cutoff")
     if universe.data_snapshot_id not in {dataset.snapshot_hash, *context.data_snapshot_ids}:
         raise StrategyInputError("universe/data snapshot mismatch")
@@ -121,7 +126,8 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
                         data_snapshot_hash=dataset.snapshot_hash, market_snapshot_hash=market_snapshot_hash or dataset.snapshot_hash,
                         feature_spec_hash=dataset.feature_spec_hash, model_training_data_hash=None,
                         universe_version=universe.universe_version, regime_model_hash=regime.model_hash,
-                        model_hash=None, cadence_due=False)
+                        model_hash=None, cadence_due=False, feature_sampling_policy=feature_sampling_policy,
+                        feature_observed_ats={}, feature_available_ats={})
     removed = result.index.difference(sorted(eligible))
     result.loc[removed, ["target_weight", "action", "reason"]] = [0., "EXIT", "removed_from_eligible_universe"]
     if regime.regime not in spec.regimes:
@@ -130,9 +136,23 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     if not (force_rebalance or due):
         return result
     result.attrs["cadence_due"] = True
-    rows = dataset.features.loc[dataset.features.index.get_level_values("datetime") == date]
+    observed = dataset.features.index.get_level_values("datetime")
+    if current_sampling:
+        available = dataset.feature_available_at.reindex(dataset.features.index)
+        candidate = dataset.features.loc[(observed <= date) & available.notna() & (available <= context.as_of)]
+        # Choose the latest observed row before screening finite/ADV values;
+        # missing essential fields cannot silently fall back to an older row.
+        rows = candidate.sort_index().groupby(level="instrument", sort=False).tail(1)
+    else:
+        rows = dataset.features.loc[observed == date]
     ready = dataset.feature_available_at.reindex(rows.index)
-    valid = rows.apply(lambda row: np.isfinite(row.to_numpy(dtype=float)).all(), axis=1) & ready.notna() & (ready <= date)
+    source_dates = rows.index.get_level_values('datetime')
+    result.attrs['feature_observed_ats'] = {key:pd.Timestamp(at).isoformat() for at,key in rows.index if key in eligible}
+    result.attrs['feature_available_ats'] = {key:pd.Timestamp(ready.loc[(at,key)]).isoformat() for at,key in rows.index if key in eligible}
+    availability_cutoff = context.as_of if current_sampling else date
+    valid = (rows.apply(lambda row: np.isfinite(row.to_numpy(dtype=float)).all(), axis=1)
+             & ready.notna() & (ready <= availability_cutoff)
+             & ((pd.Timestamp(context.as_of)-source_dates).total_seconds() <= spec.max_signal_age_seconds))
     rows = rows.loc[valid & rows.index.get_level_values("instrument").isin(eligible)]
     rows = rows.loc[rows.adv_20 >= spec.min_adv]
     available = set(rows.index.get_level_values("instrument"))
@@ -169,7 +189,8 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
             raise StrategyInputError("the specification requires its actual versioned saved model")
         if model.artifact.feature_spec_hash != spec.feature_spec_hash:
             raise StrategyInputError("model was trained with a different feature specification")
-        prediction = model.predict(rows, context=context, feature_available_at=ready.loc[rows.index]).droplevel("datetime")
+        prediction = model.predict(rows, context=context, feature_available_at=ready.loc[rows.index],
+            availability_policy="captured-vintage-at-fit-1" if current_sampling else "decision-time-vintage-1").droplevel("datetime")
         result.attrs["model_hash"] = model.artifact.content_hash()
         result.attrs["model_training_data_hash"] = model.artifact.training_data_hash
         screen = prediction > parameters["minimum_prediction"]

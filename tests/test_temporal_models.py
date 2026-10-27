@@ -73,3 +73,40 @@ def test_icir_is_cross_sectional_not_pooled():
     metrics = prediction_metrics(p, y)
     assert metrics["ic"] == 0 and metrics["icir"] == 0
     assert np.isnan(prediction_metrics(p.iloc[:3], y.iloc[:3])["icir"])
+
+
+def test_explicit_captured_fit_and_decision_preserve_economic_rows(tmp_path,mock_config):
+    X,y,available,ends,context=data()
+    captured=pd.Series(context.as_of-timedelta(minutes=1),index=X.index)
+    args=dict(context=context,feature_available_at=captured,label_available_at=captured,
+        label_end_at=ends,feature_spec_hash='1'*64,data_snapshot_hash='2'*64)
+    model=ModelWrapper('Linear',mock_config)
+    with pytest.raises(ModelError,match='historical decision'):
+        model.train(X,y,**args)
+    model.train(X,y,availability_policy='captured-vintage-at-fit-1',**args)
+    model.save(str(tmp_path/'captured.joblib'))
+    assert model.artifact.vintage_policy=='captured-vintage-at-fit-1'
+    assert model.artifact.features_available_through==captured.max()
+    assert model.artifact.label_end_through==ends.max()
+    assert model.artifact.label_end_policy=='explicit-outcome-end-1'
+    assert model.artifact.training_data_hash=='2'*64
+    old_index=X.tail(3).index.copy()
+    decision=context.model_copy(update={'as_of':context.as_of+timedelta(minutes=1)})
+    with pytest.raises(ModelError,match='follow model fit'):
+        model.predict(X.tail(3),context=decision,feature_available_at=captured.tail(3))
+    pred=model.predict(X.tail(3),context=decision,feature_available_at=captured.tail(3),
+        availability_policy='captured-vintage-at-fit-1')
+    assert pred.index.equals(old_index) and np.isfinite(pred).all()
+    loaded=ModelWrapper('Linear',mock_config).load(str(tmp_path/'captured.joblib'))
+    assert loaded.artifact==model.artifact
+    historical=context.model_copy(update={'as_of':context.as_of-timedelta(days=2)})
+    with pytest.raises(ModelError,match='future observations'):
+        ModelWrapper('Linear',mock_config).train(X,y,**{**args,'context':historical},
+            availability_policy='captured-vintage-at-fit-1')
+    with pytest.raises(ModelError,match='future feature'):
+        model.predict(X.tail(3),context=decision,
+            feature_available_at=pd.Series(decision.as_of+timedelta(microseconds=1),index=old_index),
+            availability_policy='captured-vintage-at-fit-1')
+    with pytest.raises(ModelError,match='outcome end'):
+        model.train(X,y,**{**args,'label_end_at':ends.map(lambda _:context.as_of+timedelta(days=1))},
+            availability_policy='captured-vintage-at-fit-1')
