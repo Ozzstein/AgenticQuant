@@ -28,6 +28,17 @@ class AgentCallBudget:
                 status TEXT, started_at TEXT, latency_ms REAL, actual_model TEXT)""")
 
     def reserve(self, model, messages, output_limit):
+        # UTF-8 bytes plus schema/envelope allowance is a conservative token
+        # reservation, reconciled only when the provider supplies valid usage.
+        input_bound = len(json.dumps([str(m.content) for m in messages]).encode()) + 8192
+        return self.reserve_bound(model, input_bound, output_limit)
+
+    def reserve_bound(self, model, input_bound, output_limit):
+        """Admit a caller-computed conservative bound using the same durable caps."""
+        if type(input_bound) is not int or input_bound < 1:
+            raise AgentBudgetError("positive integer input reservation required")
+        if type(output_limit) is not int or output_limit < 0:
+            raise AgentBudgetError("nonnegative integer output reservation required")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise AgentBudgetError("analysis deadline expired")
@@ -41,9 +52,6 @@ class AgentCallBudget:
         if not quotes:
             raise AgentBudgetError("verified model pricing unavailable")
         price = max(quotes, key=lambda p: p.effective_at)
-        # UTF-8 bytes plus schema/envelope allowance is a conservative token
-        # reservation, reconciled only when the provider supplies valid usage.
-        input_bound = len(json.dumps([str(m.content) for m in messages]).encode()) + 8192
         tokens = input_bound + output_limit
         cost = (
             Decimal(input_bound) * price.input_usd_per_million
@@ -52,6 +60,11 @@ class AgentCallBudget:
         identity = str(uuid4())
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM calls WHERE run_id=? AND status='usage_overrun' LIMIT 1",
+                (self.run_id,),
+            ).fetchone():
+                raise AgentBudgetError("prior provider usage exceeded reservation")
             for column, value, requests, token_limit, cost_limit in (
                 (
                     "run_id",
@@ -105,11 +118,15 @@ class AgentCallBudget:
         metadata = getattr(raw, "response_metadata", None) or {}
         actual = metadata.get("model_name") or metadata.get("model")
         input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-        known = all(type(v) is int and v >= 0 for v in (input_tokens, output_tokens))
+        known = all(type(v) is int and 0 <= v < 2**62 for v in (input_tokens, output_tokens))
         with sqlite3.connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
             reserved = db.execute(
-                "SELECT reserved_tokens,reserved_cost FROM calls WHERE id=?", (identity,)
+                "SELECT reserved_tokens,reserved_cost,status FROM calls WHERE id=? AND run_id=?",
+                (identity, self.run_id),
             ).fetchone()
+            if not reserved or reserved[2] != "reserved":
+                raise AgentBudgetError("unknown or already settled reservation")
             if known:
                 tokens = input_tokens + output_tokens
                 cost = (
@@ -121,6 +138,9 @@ class AgentCallBudget:
                 input_tokens = output_tokens = None
                 if status == "ok":
                     status = "usage_unknown"
+            overrun = tokens > reserved[0] or cost > Decimal(reserved[1])
+            if overrun:
+                status = "usage_overrun"
             db.execute(
                 "UPDATE calls SET charged_tokens=?,charged_cost=?,input_tokens=?,output_tokens=?,status=?,latency_ms=?,actual_model=? WHERE id=?",
                 (
@@ -134,5 +154,6 @@ class AgentCallBudget:
                     identity,
                 ),
             )
-            if tokens > reserved[0] or cost > Decimal(reserved[1]):
-                raise AgentBudgetError("provider usage exceeded conservative reservation")
+        # Raise only after commit: an overrun must never roll back its actual charge.
+        if overrun:
+            raise AgentBudgetError("provider usage exceeded conservative reservation")
