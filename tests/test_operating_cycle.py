@@ -81,6 +81,124 @@ def prefix(snapshot, at):
     )
 
 
+def capture_openings(store, events, context, *, feed="iex"):
+    """Synthetic individual wire trades through the actual capture/proof path."""
+    from src.data.adapters.operating import OperatingCapture
+
+    captured = OperatingCapture(store, clock=lambda: context.as_of)
+    projected, receipts = [], []
+    for instrument in dict(
+        (event.instrument.instrument_id, event.instrument) for event in events
+    ).values():
+        selected = [event for event in events if event.instrument == instrument]
+        crypto = instrument.asset_class == "crypto"
+        convention = (
+            "kraken-individual-spot-print-1"
+            if crypto
+            else f"alpaca-{feed}-regular-sale-individual-print-1"
+        )
+        rows, prints, wire = [], [], []
+        for original in selected:
+            at = pd.Timestamp(original.opened_at)
+            native = str(at.value // 1_000_000_000)
+            trade_id = native if crypto else "Q:" + native
+            identity = digest(
+                canonical_bytes(
+                    [instrument.model_dump(mode="json"), convention, trade_id, at.value]
+                )
+            )
+            event = original.model_copy(update={"event_id": identity})
+            rows.append(event)
+            prints.append(
+                {"event_id": identity, "trade_id": trade_id, "event_time_wire": at.isoformat()}
+            )
+            wire.append(
+                [
+                    str(event.price),
+                    str(event.opening_volume),
+                    str(D(at.value) / D(1_000_000_000)),
+                    "b",
+                    "m",
+                    "",
+                    int(native),
+                ]
+                if crypto
+                else {
+                    "i": int(native),
+                    "x": "Q",
+                    "t": at.isoformat(),
+                    "p": str(event.price),
+                    "s": str(event.opening_volume),
+                    "c": ["@"],
+                }
+            )
+        payload = (
+            {"error": [], "result": {"XXBTZUSD": wire, "last": "0"}}
+            if crypto
+            else {"trades": {instrument.symbol: wire}, "next_page_token": None}
+        )
+
+        class WireBoundary:
+            base_url = "https://api.kraken.com" if crypto else "https://data.alpaca.markets"
+
+            def get(self, path, **kwargs):
+                return canonical_bytes(payload)
+
+        raw, _ = captured.wire(
+            WireBoundary(),
+            "/0/public/Trades" if crypto else "/v2/stocks/trades",
+            context,
+            upstream="kraken-spot-rest-v0" if crypto else "alpaca-market-data",
+            params={"pair": "XXBTZUSD"} if crypto else {"symbols": instrument.symbol, "feed": feed},
+            instrument=instrument,
+        )
+        envelope = captured.derived(
+            context,
+            (raw,),
+            lambda at: {
+                "convention": convention,
+                "timestamp_projection": "ceil-microsecond-1",
+                "opening_events": [e.model_dump(mode="json") for e in rows],
+                "opening_liquidity": [
+                    {
+                        k: e.model_dump(mode="json")[k]
+                        for k in (
+                            "event_id",
+                            "instrument",
+                            "opened_at",
+                            "opening_volume",
+                            "fx_rate",
+                        )
+                    }
+                    for e in rows
+                ],
+                "prints": prints,
+            },
+            kind="operating_prints",
+            logical_key="synthetic-wire:" + instrument.instrument_id + ":" + feed,
+            instrument=instrument,
+        )
+        projected.extend(rows)
+        receipts.extend(
+            ObservedOpenReceipt(
+                event_id=e.event_id,
+                evidence_id=envelope.record.evidence_id,
+                evidence_hash=envelope.content_hash(),
+                observed_at=envelope.record.ingested_at,
+                available_at=envelope.record.available_at,
+            )
+            for e in rows
+        )
+    return tuple(projected), tuple(receipts)
+
+
+def opening_bindings(receipts, kind):
+    return tuple(
+        SourceBinding(evidence_id=key, available_at=available, pointer="/" + kind)
+        for key, available in dict.fromkeys((r.evidence_id, r.available_at) for r in receipts)
+    )
+
+
 @pytest.fixture(scope="module")
 def archive(tmp_path_factory):
     path = tmp_path_factory.mktemp("cycle-synthetic-archive")
@@ -103,7 +221,7 @@ def archive(tmp_path_factory):
             symbol="BTCUSD",
             asset_class="crypto",
             quote_currency="USD",
-            venue="test",
+            venue="kraken",
         ),
     )
     bars, records, numeric = [], [], []
@@ -320,44 +438,6 @@ def archive(tmp_path_factory):
 
 
 def prove(plan, store, registry, *, observed=False):
-    opening = (
-        SourceBinding(
-            evidence_id=plan.inputs.receipts[0].evidence_id,
-            available_at=plan.inputs.receipts[0].available_at,
-            pointer="/opening_liquidity" if plan.inputs.opening_events else "",
-        )
-        if plan.inputs.receipts
-        else None
-    )
-    if observed:
-        from src.operations.contracts import ObservedOpenReceipt
-
-        key = "received-opening-" + plan.inputs.content_hash()
-        at = plan.inputs.context.as_of
-        payload = expected_artifacts(plan.inputs)
-        envelope = put(
-            store,
-            key,
-            {
-                "opening_liquidity": payload["opening_liquidity"],
-                "opening_events": payload["opening_events"],
-            },
-            at,
-        )
-        receipts = tuple(
-            ObservedOpenReceipt(
-                event_id=b.event_id,
-                evidence_id=key,
-                evidence_hash=envelope.content_hash(),
-                observed_at=at,
-                available_at=at,
-            )
-            for b in (plan.inputs.opening_events or plan.inputs.bars)
-        )
-        plan = plan.model_copy(
-            update={"inputs": plan.inputs.model_copy(update={"receipts": receipts})}
-        )
-        opening = SourceBinding(evidence_id=key, available_at=at, pointer="/opening_liquidity")
     names = {
         "universe_history": "universe_history_id",
         "availability_audit": "availability_audit_id",
@@ -376,16 +456,16 @@ def prove(plan, store, registry, *, observed=False):
             else plan.inputs.context.as_of
         )
         key = "proof-" + plan.inputs.content_hash() + "-" + kind
-        if kind in {"opening_liquidity", "opening_events"} and opening is not None:
-            source = opening.model_copy(update={"pointer": "/" + kind})
+        if kind in {"opening_liquidity", "opening_events"}:
+            sources = opening_bindings(plan.inputs.receipts, kind)
         else:
             put(store, key, value, at)
-            source = SourceBinding(evidence_id=key, available_at=at)
+            sources = (SourceBinding(evidence_id=key, available_at=at),)
         bound = BoundArtifact(
             kind=kind,
             inputs_hash=plan.inputs.content_hash(),
             value_json=canonical_bytes(value).decode(),
-            sources=(source,),
+            sources=sources,
         )
         refs.append((names[kind], registry.archive_contract(bound)))
     rules_key = "rules-" + plan.inputs.content_hash()
@@ -562,33 +642,7 @@ def runtime(archive, tmp_path_factory):
             )
             for b in selected
         )
-        opening_key = f"actual-opening-receipt:{run_id}:{number}"
-        liquidity = [
-            {
-                k: e.model_dump(mode="json")[k]
-                for k in ("event_id", "instrument", "opened_at", "opening_volume", "fx_rate")
-            }
-            for e in opening_events
-        ]
-        envelope = put(
-            archive.store,
-            opening_key,
-            {
-                "opening_liquidity": liquidity,
-                "opening_events": [e.model_dump(mode="json") for e in opening_events],
-            },
-            at,
-        )
-        receipts = tuple(
-            ObservedOpenReceipt(
-                event_id=e.event_id,
-                evidence_id=opening_key,
-                evidence_hash=envelope.content_hash(),
-                observed_at=at,
-                available_at=at,
-            )
-            for e in opening_events
-        )
+        opening_events, receipts = capture_openings(archive.store, opening_events, context)
         metadata = tuple(
             InstrumentRisk(
                 instrument=b.instrument,
@@ -986,13 +1040,8 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
         update={"context": context, "snapshot": market, "universes": universes}
     )
     sources = []
-    economic_values = expected_artifacts(inputs)
-    put(
-        store,
-        "builder-opening-source",
-        {k: economic_values[k] for k in ("opening_events", "opening_liquidity")},
-        at,
-    )
+    openings, receipts = capture_openings(store, inputs.opening_events, context)
+    inputs = inputs.model_copy(update={"opening_events": openings, "receipts": receipts})
     for kind, rows in {
         **expected_artifacts(inputs),
         "venue_rules": [r.model_dump(mode="json") for r in inputs.rules],
@@ -1006,18 +1055,7 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
         )
         key = "builder-source-" + kind
         if kind in {"opening_events", "opening_liquidity"}:
-            sources.append(
-                (
-                    kind,
-                    (
-                        SourceBinding(
-                            evidence_id="builder-opening-source",
-                            available_at=at,
-                            pointer="/" + kind,
-                        ),
-                    ),
-                )
-            )
+            sources.append((kind, opening_bindings(inputs.receipts, kind)))
         else:
             put(store, key, rows, available)
             sources.append((kind, (SourceBinding(evidence_id=key, available_at=available),)))
@@ -1630,3 +1668,58 @@ def test_training_whitelist_is_independent_of_current_sources_and_cannot_discove
     data = runtime.service.materialize_features(bars_only, training=True)[bar_spec.name]
     assert data.snapshot_hash == bar_recipe.data_snapshot_hash
     assert training_frame_hash(data, bar_recipe.fitted_at) == bar_recipe.training_frame_hash
+
+
+def test_historical_native_feed_alias_is_recorded_without_reusing_liquidity_or_nav(
+    runtime, completed
+):
+    from src.execution.venue import PaperVenue
+
+    plan = runtime.plan(number=359, run_id="cycle-native-alias")
+    events, receipts = capture_openings(
+        runtime.archive.store, plan.inputs.opening_events, plan.inputs.context, feed="sip"
+    )
+    plan = prove(
+        plan.model_copy(
+            update={
+                "inputs": plan.inputs.model_copy(
+                    update={"opening_events": events, "receipts": receipts}
+                )
+            }
+        ),
+        runtime.archive.store,
+        runtime.service.registry,
+    )
+    anchor = next(iter(runtime.service._prior_anchor(plan).values())).portfolio.as_of
+    historical = [
+        e for e in events if e.instrument.asset_class == "equity" and e.opened_at < anchor
+    ]
+    assert historical
+    account = plan.inputs.account.account_id
+    old_nav = list(
+        runtime.ledger.db.execute(
+            "SELECT * FROM snapshots WHERE account=? AND at<=? ORDER BY at",
+            (account, anchor.isoformat()),
+        )
+    )
+    original_fills = runtime.ledger.fills(account)
+    result = runtime.service.run(plan, now=plan.inputs.context.as_of)
+    assert result.status == "completed", result.reason
+    venue = PaperVenue(
+        runtime.ledger, account, {r.instrument.instrument_id: r for r in plan.inputs.rules}
+    )
+    for event in historical:
+        binding = venue.opening_source_binding(event.event_id)
+        assert binding is not None and binding.event_id != binding.consumed_event_id
+        assert not any(fill.event_id == event.event_id for fill in runtime.ledger.fills(account))
+    assert runtime.ledger.fills(account)[: len(original_fills)] == original_fills
+    assert (
+        list(
+            runtime.ledger.db.execute(
+                "SELECT * FROM snapshots WHERE account=? AND at<=? ORDER BY at",
+                (account, anchor.isoformat()),
+            )
+        )
+        == old_nav
+    )
+    assert runtime.service.run(plan, now=plan.inputs.context.as_of) == result

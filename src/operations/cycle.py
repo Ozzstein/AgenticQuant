@@ -687,51 +687,63 @@ class PaperCycleService:
             return max(candidates, key=lambda x: x[0])[1]
         return None
 
+    def _require_resolved_execution(self, account, execution):
+        for pending in self.ledger.pending(account):
+            if execution.state(pending["intent"].intent_id)["state"] in {
+                "ambiguous",
+                "submitting",
+                "cancel_pending",
+                "reconciliation_required",
+            }:
+                raise RecoveryRequired("unresolved venue outcome blocks observed opening")
+
+    def _settle_observed_open(self, plan, venue, execution, event):
+        account = plan.inputs.account.account_id
+        self._require_resolved_execution(account, execution)
+        receipt = next(r for r in plan.inputs.receipts if r.event_id == event.event_id)
+        from src.operations.evidence import prepare_opening_source
+
+        identity = prepare_opening_source(
+            self.evidence, venue, event, receipt, as_of=plan.inputs.context.as_of
+        )
+        accepted = venue.accepted_intent_ids_before(event.opened_at)
+        metadata = {
+            p["intent"].intent_id: execution.admission_metadata(p["intent"].intent_id)
+            for p in self.ledger.pending(account)
+            if p["intent"].intent_id in accepted
+            and p["intent"].instrument == event.instrument
+            and p["intent"].eligible_at <= event.opened_at
+        }
+        settled = venue.observed_open_receipt(event.event_id)
+        if settled is not None:
+            # Filled orders may no longer be pending. Recover the
+            # original immutable admission map, never today's risk
+            # metadata or an empty replacement for a consumed order.
+            metadata = {
+                intent_id: execution.admission_metadata(intent_id)
+                for intent_id, _ in settled.admission_metadata_hashes
+            }
+        return venue.settle_open(
+            event,
+            metadata,
+            available_at=receipt.available_at,
+            observed_at=receipt.observed_at,
+            as_of=plan.inputs.context.as_of,
+            evidence_id=receipt.evidence_id,
+            evidence_hash=receipt.evidence_hash,
+            source_identity=identity,
+        )
+
     def _observe(self, plan, book, venue, execution, opening, events, at):
         account = plan.inputs.account.account_id
         for kind, event in events:
             if kind == "action":
                 self.ledger.corporate_action(account, event)
             elif kind in {"open", "opening_event"}:
-                for pending in self.ledger.pending(account):
-                    if execution.state(pending["intent"].intent_id)["state"] in {
-                        "ambiguous",
-                        "submitting",
-                        "cancel_pending",
-                        "reconciliation_required",
-                    }:
-                        raise RecoveryRequired("unresolved venue outcome blocks observed opening")
                 if plan.inputs.receipts:
-                    receipt = next(r for r in plan.inputs.receipts if r.event_id == event.event_id)
-                    accepted = venue.accepted_intent_ids_before(event.opened_at)
-                    metadata = {
-                        p["intent"].intent_id: execution.admission_metadata(p["intent"].intent_id)
-                        for p in self.ledger.pending(account)
-                        if p["intent"].intent_id in accepted
-                        and p["intent"].instrument == event.instrument
-                        and p["intent"].eligible_at <= event.opened_at
-                    }
-                    settled = venue.observed_open_receipt(event.event_id)
-                    if settled is not None:
-                        # Filled orders may no longer be pending. Recover the
-                        # original immutable admission map, never today's risk
-                        # metadata or an empty replacement for a consumed order.
-                        metadata = {
-                            intent_id: execution.admission_metadata(intent_id)
-                            for intent_id, _ in settled.admission_metadata_hashes
-                        }
-                    venue.settle_open(
-                        event,
-                        metadata,
-                        available_at=receipt.available_at,
-                        observed_at=receipt.observed_at,
-                        as_of=plan.inputs.context.as_of,
-                        evidence_id=receipt.evidence_id,
-                        evidence_hash=receipt.evidence_hash,
-                    )
+                    self._settle_observed_open(plan, venue, execution, event)
                 else:
-                    # Strict source-proof compatibility: this consumes only
-                    # previously accepted orders; never backdates a dispatch.
+                    self._require_resolved_execution(account, execution)
                     venue.advance_open(event, self._metadata(plan, at))
             elif kind == "market_close":
                 event.require_execution_price()
@@ -1687,6 +1699,25 @@ class PaperCycleService:
                                     same = prior_bar.model_dump(
                                         exclude={"evidence_id"}
                                     ) == event.model_dump(exclude={"evidence_id"})
+                                if (
+                                    not same
+                                    and row is None
+                                    and kind in {"open", "opening_event"}
+                                    and plan.inputs.receipts
+                                ):
+                                    # Only a source-proved alias of consumed native
+                                    # liquidity can cross an already committed NAV.
+                                    # Canonical settlement records the alias, never
+                                    # a second fill/mark or another NAV period.
+                                    with self.ledger.atomic():
+                                        fills = self._settle_observed_open(
+                                            plan, venue, execution, event
+                                        )
+                                        if fills:
+                                            raise ValueError(
+                                                "historical opening alias cannot introduce a fill"
+                                            )
+                                    same = True
                                 if not same:
                                     raise ValueError(
                                         "historical economic event is missing or changed"
