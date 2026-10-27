@@ -154,7 +154,7 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore, *,
     verify_market_snapshot(store, spec.breadth_snapshot)
     if {r.evidence_id for r in spec.breadth_snapshot.evidence} - records.keys():
         raise RegistryError('breadth snapshot evidence is not frozen')
-    archived_universes = []
+    archived_universes, membership_sources = [], []
     for source in spec.universe_sources:
         if source.evidence_id not in records:
             raise RegistryError('unfrozen historical membership source')
@@ -165,6 +165,7 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore, *,
             if source.available_at > universe.available_at:
                 raise RegistryError('membership source is later than declared availability')
             archived_universes.append(universe)
+            membership_sources.append((universe, source.evidence_id))
     if tuple(archived_universes) != spec.universes:
         raise RegistryError('historical membership differs from stored source')
     dates = pd.DatetimeIndex([o.at for o in spec.raw], name='datetime')
@@ -209,13 +210,14 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore, *,
         if not eligible:
             raise RegistryError('historical breadth membership missing')
         selected = max(eligible, key=lambda u: (u.effective_at, u.available_at))
+        if any(u != selected and (u.effective_at,u.available_at)==(selected.effective_at,selected.available_at) for u in eligible):
+            raise RegistryError('conflicting historical breadth membership')
         if set(selected.instrument_ids)-set(instruments):
             raise RegistryError('historical constituent price coverage missing')
         membership.loc[observation.at, list(selected.instrument_ids)] = True
-        for source in spec.universe_sources:
-            if source.available_at <= (cutoff if captured else observation.at):
-                ids.add(source.evidence_id)
-        ids.update(source_id for (at, _), source_id in bar_sources.items() if at == observation.at)
+        # A later, genuinely new membership must not rewrite source lineage of
+        # earlier fitted observations under the captured-vintage policy.
+        ids.update(source_id for universe,source_id in membership_sources if universe==selected)
         row_ids.append(ids)
     signals = macro_signals(raw, prices, membership)
     finite = np.isfinite(signals).all(axis=1)
@@ -227,7 +229,14 @@ def materialize_macro_dataset(spec: MacroDatasetSpec, store: EvidenceStore, *,
     source_ids, availability = [], []
     # Breadth uses 200 prices; all rolling inputs retain actual source lineage.
     for offset in range(start, len(dates)):
-        ids = tuple(sorted(set().union(*row_ids[max(0, offset-199):offset+1])))
+        window=dates[max(0,offset-199):offset+1]
+        ids=set().union(*row_ids[max(0,offset-199):offset+1])
+        # Current constituent breadth really uses each current member's 200
+        # original prices, including its pre-membership history. Unused newly
+        # captured nonmember history cannot alter the old training prefix.
+        for instrument in membership.columns[membership.iloc[offset]]:
+            ids.update(bar_sources[(at,instrument)] for at in window if (at,instrument) in bar_sources)
+        ids=tuple(sorted(ids))
         for key in ids:
             records[key].require_available(cutoff if captured else dates[offset].to_pydatetime())
         source_ids.append(ids)
