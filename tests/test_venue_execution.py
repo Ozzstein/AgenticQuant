@@ -280,6 +280,23 @@ def report_for(engine, order, fills, *, at, status="filled", complete=True, evid
     )
 
 
+def test_venue_rule_defaults_preserve_canonical_hash_on_roundtrip():
+    rules = VenueRules(
+        venue="paper",
+        instrument=A,
+        symbol=A.symbol,
+        available_at=T,
+        quantity_step=1,
+        price_tick=".01",
+        market_type="equity",
+        active=True,
+    )
+    loaded = VenueRules.model_validate_json(rules.model_dump_json())
+    assert isinstance(rules.minimum_quantity, D) and isinstance(rules.minimum_notional, D)
+    assert rules.model_dump_json() == loaded.model_dump_json()
+    assert rules.content_hash() == loaded.content_hash()
+
+
 def test_interleaved_actual_fills_after_mark_reconcile_globally_and_restart(tmp_path, monkeypatch):
     from src.domain.portfolio import PriceMark
     from tests.test_durable_accounting import fill

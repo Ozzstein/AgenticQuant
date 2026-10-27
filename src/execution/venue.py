@@ -30,8 +30,8 @@ class VenueRules(VersionedContract):
     available_at: UtcTimestamp
     quantity_step: Positive
     price_tick: Positive
-    minimum_quantity: Decimal = Field(default=0, ge=0)
-    minimum_notional: Decimal = Field(default=0, ge=0)
+    minimum_quantity: Decimal = Field(default=D(0), ge=0)
+    minimum_notional: Decimal = Field(default=D(0), ge=0)
     maximum_quantity: Positive | None = None
     order_types: tuple[Literal["market", "limit", "stop"], ...] = ("market", "limit")
     time_in_force: tuple[Literal["GTC", "DAY", "IOC", "FOK"], ...] = ("GTC",)
