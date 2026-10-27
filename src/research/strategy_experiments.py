@@ -255,7 +255,8 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         observation = regimes[date]
         if observation.status != 'available':
             return None  # Missing regime blocks new decisions, never implies liquidation.
-        output = evaluate_strategy(plan.strategy,data,inputs.context.model_copy(update={'as_of':at}),
+        callback_context = inputs.context.model_copy(update={'as_of':at,'account_id':snapshot.account_id})
+        output = evaluate_strategy(plan.strategy,data,callback_context,
             universe=universe,instruments=tuple(identities.values()),holdings=holdings,signal_at=at,
             regime=observation,model=models[date],holding_sessions=pd.Series(ages,dtype=float),
             last_rebalanced_at=previous_rebalance[date],research_registry=registry if kind == 'strategy' else None,
@@ -265,7 +266,7 @@ def _execute_registered(registry, trial_id, *, plan_type, kind, store, ledger_pa
         if output.action.isin(['HOLD','ABSTAIN','VETO']).all():
             return None
         from src.execution.routing import target_from_strategy_frame
-        return target_from_strategy_frame(output,inputs.context.model_copy(update={'as_of':at}),
+        return target_from_strategy_frame(output,callback_context,
             tuple(identities.values()),current_snapshot=snapshot,
             target_id=digest(canonical_bytes({'recipe':recipe,'at':date.isoformat(),'snapshot':snapshot.content_hash()})))
 

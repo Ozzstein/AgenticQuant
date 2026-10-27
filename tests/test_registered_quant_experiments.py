@@ -179,6 +179,19 @@ def test_registered_real_model_and_holdings_callback(experiment,tmp_path):
     changed = PortfolioReplay(tmp_path/'cost.sqlite').run(**kwargs)
     assert changed.equity_curve != result.equity_curve
     assert changed.manifest['decision_recipe_hash'] == result.manifest['decision_recipe_hash']
+    import json
+
+    from src.core.backtester import ReplayArtifact, load_replay_artifact
+    from src.core.benchmark import BenchmarkRunner
+    cost_results = BenchmarkRunner().cost_sensitivity(inputs=kwargs,output_dir=tmp_path/'cost-scenarios')
+    assert len(cost_results) == 3 and all(r.trades for r in cost_results)
+    for cost in cost_results:
+        assert cost.account_id.startswith('backtest:cost-')
+        assert cost.manifest['decision_recipe_hash'] == result.manifest['decision_recipe_hash']
+    references = json.loads((tmp_path/'cost-scenarios/cost-artifacts.json').read_text())
+    for reference in references:
+        persisted = load_replay_artifact(ReplayArtifact.model_validate(reference))
+        assert persisted.trades
     assert registry.active('strategy:'+plan.strategy.name) is None
     with pytest.raises(RegistryError,match='already admitted'):
         execute_registered_strategy(registry,trial.trial_id,store=store,ledger_path=tmp_path/'ledger.sqlite',artifact_dir=tmp_path/'models')
