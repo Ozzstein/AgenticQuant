@@ -437,7 +437,9 @@ def archive(tmp_path_factory):
     )
 
 
-def prove(plan, store, registry, *, observed=False):
+def prove(plan, store, registry, *, observed=False, income_sources=None):
+    from src.operations.contracts import INCOME_FIELDS
+
     names = {
         "universe_history": "universe_history_id",
         "availability_audit": "availability_audit_id",
@@ -448,6 +450,7 @@ def prove(plan, store, registry, *, observed=False):
         "opening_liquidity": "opening_liquidity_id",
         "instrument_metadata": "instrument_metadata_id",
     }
+    names.update({kind: kind + "_id" for kind in INCOME_FIELDS})
     refs = []
     for kind, value in expected_artifacts(plan.inputs).items():
         at = (
@@ -458,6 +461,9 @@ def prove(plan, store, registry, *, observed=False):
         key = "proof-" + plan.inputs.content_hash() + "-" + kind
         if kind in {"opening_liquidity", "opening_events"}:
             sources = opening_bindings(plan.inputs.receipts, kind)
+        elif kind in INCOME_FIELDS:
+            assert income_sources is not None
+            sources = income_sources[kind]
         else:
             put(store, key, value, at)
             sources = (SourceBinding(evidence_id=key, available_at=at),)
@@ -1723,3 +1729,435 @@ def test_historical_native_feed_alias_is_recorded_without_reusing_liquidity_or_n
         == old_nav
     )
     assert runtime.service.run(plan, now=plan.inputs.context.as_of) == result
+
+
+@pytest.fixture
+def income_runtime(tmp_path):
+    """Canonical economic fixture only; this does not assert provider authority."""
+    from src.domain.portfolio import (
+        CashDividend,
+        DividendDistribution,
+        Fill,
+        OrderIntent,
+        PaperDividendPolicy,
+        PriceMark,
+    )
+    from src.execution.sleeves import SleeveBook
+    from src.execution.venue import PaperVenue
+
+    at = pd.Timestamp("2024-01-02T14:00:00Z").to_pydatetime()
+    instrument = Instrument(
+        instrument_id="us:income", symbol="INCOME", asset_class="equity", quote_currency="USD"
+    )
+    account = AccountSpec(
+        account_id="paper:income",
+        mode="paper",
+        base_currency="USD",
+        initial_cash=D(10000),
+        opened_at=at,
+    )
+    ledger = PortfolioLedger(tmp_path / "ledger.sqlite")
+    ledger.create_account(account)
+    book = SleeveBook(ledger, account.account_id).initialize({"owner": D(5000), "new": D(5000)})
+    order = OrderIntent(
+        intent_id="income-buy",
+        account_id=account.account_id,
+        run_id="fixture",
+        instrument=instrument,
+        side="buy",
+        quantity=D(10),
+        decision_at=at,
+        eligible_at=at + timedelta(seconds=1),
+        reference_price=D(100),
+        estimated_fee=D(0),
+        strategy_id="owner",
+    )
+    book.register_intent(order, {"owner": D(10)}, source_hash="1" * 64, quantity_quantum=D(1))
+    ledger.submit(order)
+    ledger.apply_fill(
+        Fill(
+            fill_id="income-fill",
+            intent_id=order.intent_id,
+            account_id=account.account_id,
+            quantity=D(10),
+            price=D(100),
+            fee=D(0),
+            executed_at=order.eligible_at,
+            event_id="fixture-price",
+        )
+    )
+    ledger.mark(
+        account.account_id,
+        [PriceMark(instrument=instrument, price=D(100), as_of=order.eligible_at)],
+    )
+    opening = book.snapshot(at + timedelta(seconds=10))
+    terms = CashDividend(
+        action_id="income-action",
+        revision_id="1",
+        instrument=instrument,
+        ex_at=at + timedelta(days=1),
+        entitlement_at=at + timedelta(days=1),
+        record_date=None,
+        payable_date=(at + timedelta(days=2)).date(),
+        published_at=None,
+        available_at=at + timedelta(seconds=5),
+        cash_per_unit=D(1),
+        currency="USD",
+        convention="pre-ex-beneficial-ownership-1",
+        entitlement_source_id="fixture-rule",
+        entitlement_source_hash="2" * 64,
+        source_id="fixture-terms",
+        source_hash="3" * 64,
+    )
+    paid = at + timedelta(days=2, seconds=10)
+    notice = DividendDistribution(
+        distribution_id="paid-notice",
+        action_id=terms.action_id,
+        terms_hash=terms.content_hash(),
+        effective_date=paid.date(),
+        observed_at=paid,
+        available_at=paid + timedelta(seconds=1),
+        currency="USD",
+        gross_per_unit=D(1),
+        net_per_unit=D(".8"),
+        fee_per_unit=D(".05"),
+        withholding_per_unit=D(".15"),
+        fee_source_hash="4" * 64,
+        tax_source_hash="5" * 64,
+        source_id="fixture-paid",
+        source_hash="6" * 64,
+    )
+    policy = PaperDividendPolicy(
+        policy_id="source-policy",
+        account_id=account.account_id,
+        distribution_hash=notice.content_hash(),
+        convention="source-confirmed-paper-distribution-1",
+        fee_tax_convention="source-confirmed-per-unit-deductions-1",
+        available_at=notice.available_at,
+        source_id="fixture-deductions",
+        source_hash="7" * 64,
+    )
+    cfg = AppConfig(
+        _env_file=None, output_dir=str(tmp_path / "output"), log_dir=str(tmp_path / "logs")
+    )
+    service = PaperCycleService(
+        cfg,
+        operations_store=OperationsStore(tmp_path / "operations"),
+        evidence_store=EvidenceStore(tmp_path / "evidence"),
+        registry=ResearchRegistry(tmp_path / "registry"),
+        ledger=ledger,
+        attribution_store=AttributedPerformanceStore(tmp_path / "attribution.sqlite"),
+        artifact_dir=tmp_path / "models",
+    )
+    inputs = SimpleNamespace(
+        account=account,
+        context=SimpleNamespace(as_of=notice.available_at),
+        income_policy="source-confirmed-paper-distribution-1",
+        cash_dividends=(terms,),
+        dividend_payments=(),
+        dividend_distributions=(notice,),
+        paper_dividend_policies=(policy,),
+        action_coverage=(),
+    )
+    value = SimpleNamespace(
+        service=service,
+        book=book,
+        ledger=ledger,
+        terms=terms,
+        notice=notice,
+        policy=policy,
+        plan=SimpleNamespace(inputs=inputs),
+        anchor=opening,
+        venue=PaperVenue(ledger, account.account_id, {}),
+        at=at,
+    )
+    yield value
+    ledger.close()
+
+
+def test_income_cycle_uses_pre_ex_ownership_and_original_payment_clocks(income_runtime):
+    from src.domain.portfolio import CorporateAction
+
+    from src.operations.cycle import _sleeves
+
+    r = income_runtime
+    admission = r.service._admit_income(r.plan, r.book, r.anchor)
+    assert (
+        admission["required_started_at"]
+        == next(iter(r.anchor.values())).portfolio.as_of.isoformat()
+    )
+    assert r.ledger.cash_dividends(r.book.account_id, as_of=r.terms.ex_at) == (r.terms,)
+    split = CorporateAction(
+        action_id="same-boundary-split",
+        instrument=r.terms.instrument,
+        effective_at=r.terms.ex_at,
+        kind="split",
+        value=D(2),
+        source_id="fixture-split",
+    )
+    receipt = r.service._observe(
+        r.plan,
+        r.book,
+        r.venue,
+        None,
+        r.anchor,
+        [("action", split), ("dividend_entitlement", r.terms)],
+        r.terms.ex_at,
+    )
+    anchor = _sleeves(receipt["anchor"])
+    entitlement = r.ledger.dividend_entitlements(r.book.account_id, as_of=r.terms.ex_at)[0]
+    assert entitlement.quantity == 10
+    assert anchor["owner"].portfolio.positions[0].quantity == 20
+    assert anchor["owner"].portfolio.receivable_balance == 10
+    assert anchor["new"].portfolio.receivable_balance == 0
+    original_cash = anchor["owner"].portfolio.cash
+    receipt = r.service._observe(
+        r.plan,
+        r.book,
+        r.venue,
+        None,
+        anchor,
+        [("dividend_distribution", r.notice)],
+        r.notice.available_at,
+    )
+    paid = _sleeves(receipt["anchor"])
+    assert paid["owner"].portfolio.cash == original_cash + 8
+    assert paid["owner"].portfolio.receivable_balance == 0
+    assert paid["owner"].portfolio.fees == D(".5")
+    assert paid["owner"].portfolio.withholding_taxes == D("1.5")
+    assert paid["new"].portfolio.cash == 5000
+    period = r.book.performance_period(
+        anchor, r.notice.available_at, available_at=r.notice.available_at
+    )
+    assert period["owner"]["end_flow"] == 0
+    assert period["owner"]["closing_nav"] - period["owner"]["opening_nav"] == -2
+    assert r.service.attribution.daily_returns(as_of=r.notice.available_at, annualization=252).empty
+    payment = r.ledger.dividend_payments(r.book.account_id, as_of=r.notice.available_at)[0]
+    assert (
+        payment.available_at == r.notice.available_at
+        and payment.effective_date == r.notice.effective_date
+    )
+    assert (
+        payment.origin == "paper-distribution"
+        and payment.entitlement_hash == entitlement.content_hash()
+    )
+    assert not r.service._observe_income(
+        r.plan, r.book, "dividend_distribution", r.notice, r.notice.available_at
+    )
+    assert r.ledger.reconcile(r.book.account_id)["reconciled"]
+
+
+def test_income_cycle_retains_original_announcements_and_rejects_late_new_entitlement(
+    income_runtime,
+):
+    from src.execution.ledger import LedgerError
+
+    r = income_runtime
+    r.service._admit_income(r.plan, r.book, r.anchor)
+    r.plan.inputs.cash_dividends = ()
+    with pytest.raises(ValueError, match="original admitted dividend terms"):
+        r.service._admit_income(r.plan, r.book, r.anchor)
+    r.plan.inputs.cash_dividends = (r.terms,)
+    # Publishing a NAV after ex without the entitlement cannot be repaired by
+    # relabeling today's capture as a past announcement.
+    r.ledger.snapshot(r.book.account_id, r.terms.ex_at + timedelta(seconds=1), 345600)
+    with pytest.raises(LedgerError, match="published NAV"):
+        r.service._observe_income(r.plan, r.book, "dividend_entitlement", r.terms, r.terms.ex_at)
+    assert not r.ledger.dividend_entitlements(r.book.account_id, as_of=r.plan.inputs.context.as_of)
+
+
+def test_income_cycle_rejects_policy_substitution_and_scheduled_date_cash(income_runtime):
+    r = income_runtime
+    r.service._admit_income(r.plan, r.book, r.anchor)
+    r.service._observe_income(r.plan, r.book, "dividend_entitlement", r.terms, r.terms.ex_at)
+    cash = r.ledger.available_cash(r.book.account_id)
+    assert r.ledger.dividend_receivables(r.book.account_id)[0].outstanding == 10
+    assert r.ledger.available_cash(r.book.account_id) == cash
+    assert not r.ledger.dividend_payments(r.book.account_id, as_of=r.notice.observed_at)
+    r.plan.inputs.paper_dividend_policies = (
+        r.policy.model_copy(update={"account_id": "paper:other"}),
+    )
+    with pytest.raises(ValueError, match="paper dividend policy"):
+        r.service._observe_income(
+            r.plan, r.book, "dividend_distribution", r.notice, r.notice.available_at
+        )
+    assert r.ledger.available_cash(r.book.account_id) == cash
+    assert not r.ledger.dividend_payments(r.book.account_id, as_of=r.notice.available_at)
+
+
+def test_fresh_cycle_without_income_policy_blocks_before_account_or_provider_admission(runtime):
+    plan = runtime.plan(run_id="legacy-income-gap")
+    original_calls = len(runtime.calls)
+    result = runtime.service.run(plan, now=plan.inputs.context.as_of)
+    assert result.status == "blocked" and "explicit sourced income policy" in result.reason
+    assert len(runtime.calls) == original_calls
+    state = runtime.ops.status(result.run_id)
+    assert state["stages"]["account"]["state"] == "pending"
+    assert state["stages"]["verified_inputs"]["state"] == "failed"
+    payload = plan.model_dump(mode="json")
+    assert "income_policy" not in payload["inputs"] and "income_authorities" not in payload
+    assert not {
+        "cash_dividends",
+        "dividend_payments",
+        "dividend_distributions",
+        "action_coverage",
+        "paper_dividend_policies",
+    } & set(payload["inputs"])
+    restored = PaperCyclePlan.model_validate(payload)
+    assert restored.content_hash() == plan.content_hash()
+    changed = plan.model_copy(
+        update={
+            "inputs": plan.inputs.model_copy(
+                update={"income_policy": "source-confirmed-paper-distribution-1"}
+            )
+        }
+    )
+    assert changed.content_hash() != plan.content_hash()
+    assert "cash_dividends" in changed.model_dump(mode="json")["inputs"]
+
+
+def test_income_admission_rolls_back_partial_terms_when_later_revision_is_invalid(income_runtime):
+    from src.execution.ledger import LedgerError
+
+    r = income_runtime
+    missing_previous = r.terms.model_copy(
+        update={"action_id": "another-action", "supersedes_hash": "8" * 64}
+    )
+    r.plan.inputs.cash_dividends = (r.terms, missing_previous)
+    with pytest.raises(LedgerError, match="revision chain"):
+        r.service._admit_income(r.plan, r.book, r.anchor)
+    assert r.ledger.cash_dividends(r.book.account_id, as_of=r.plan.inputs.context.as_of) == ()
+    assert r.ledger.reconcile(r.book.account_id)["reconciled"]
+
+
+@pytest.mark.parametrize("account_capture", [False, True])
+def test_native_income_gaps_block_cycle_before_economic_or_provider_admission(
+    runtime, account_capture
+):
+    import httpx
+    from src.data.adapters.base import ReadHTTP
+    from src.data.adapters.dividends import (
+        DATA,
+        PAPER,
+        AlpacaDividendAdapter,
+        verify_operating_dividend_capture,
+    )
+    from src.domain.portfolio import ActionCoverage
+
+    from src.operations.contracts import INCOME_FIELDS
+
+    plan = runtime.plan(run_id="native-income-gap-" + str(account_capture))
+    cutoff = plan.inputs.context.as_of
+    requested = plan.inputs.context.model_copy(update={"as_of": cutoff - timedelta(seconds=1)})
+    instrument = next(
+        i.instrument for i in plan.inputs.metadata if i.instrument.asset_class == "equity"
+    )
+    provider_account = "00000000-0000-4000-8000-000000000001"
+
+    def response(request):
+        assert request.method == "GET"
+        if request.url.path == "/v2/account":
+            return httpx.Response(200, json={"id": provider_account, "status": "ACTIVE"})
+        if request.url.path == "/v2/account/activities":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "activity_type": "DIV",
+                        "id": "native-posting",
+                        "date": cutoff.date().isoformat(),
+                        "net_amount": "1.02",
+                        "symbol": instrument.symbol,
+                        "cusip": "fixture-cusip",
+                        "qty": "2",
+                        "per_share_amount": "0.51",
+                    }
+                ],
+            )
+        assert request.url.path == "/v1/corporate-actions"
+        return httpx.Response(
+            200,
+            json={
+                "corporate_actions": {
+                    "cash_dividends": [
+                        {
+                            "id": "native-announcement",
+                            "symbol": instrument.symbol,
+                            "cusip": "fixture-cusip",
+                            "rate": "0.51",
+                            "special": False,
+                            "foreign": False,
+                            "process_date": cutoff.date().isoformat(),
+                            "ex_date": (cutoff + timedelta(days=3)).date().isoformat(),
+                            "record_date": (cutoff + timedelta(days=4)).date().isoformat(),
+                            "payable_date": (cutoff + timedelta(days=10)).date().isoformat(),
+                        }
+                    ]
+                },
+                "next_page_token": None,
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as client:
+        adapter = AlpacaDividendAdapter(
+            runtime.archive.store,
+            "fixture-key",
+            "fixture-secret",
+            data_http=ReadHTTP("alpaca", DATA, min_interval=0, client=client),
+            trading_http=ReadHTTP("alpaca", PAPER, min_interval=0, client=client),
+            clock=lambda: cutoff,
+        )
+        arguments = {"started_at": plan.inputs.account.opened_at, "ended_at": requested.as_of}
+        if account_capture:
+            arguments.update(
+                account_id=plan.inputs.account.account_id, provider_account_id=provider_account
+            )
+        capture = (
+            adapter.account_dividend_sources if account_capture else adapter.cash_dividend_sources
+        )(instrument, requested, **arguments)
+    assert capture.status == "available"
+    source = capture.evidence[-1]
+    parsed = verify_operating_dividend_capture(
+        runtime.archive.store, source.record.evidence_id, as_of=cutoff
+    )
+    assert parsed["native_observations"] and parsed["action_coverage"]
+    assert all(not parsed[name] for name in INCOME_FIELDS if name != "action_coverage")
+    assert all(
+        row["completeness"] == "unknown" and row["gaps"] for row in parsed["action_coverage"]
+    )
+    inputs = plan.inputs.model_copy(
+        update={
+            "income_policy": "posted-account"
+            if account_capture
+            else "source-confirmed-paper-distribution-1",
+            "action_coverage": tuple(
+                ActionCoverage.model_validate(v) for v in parsed["action_coverage"]
+            ),
+        }
+    )
+    sources = {
+        kind: (
+            SourceBinding(
+                evidence_id=source.record.evidence_id,
+                available_at=source.record.available_at,
+                pointer="/" + kind,
+            ),
+        )
+        for kind in INCOME_FIELDS
+    }
+    plan = prove(
+        plan.model_copy(update={"inputs": inputs}),
+        runtime.archive.store,
+        runtime.service.registry,
+        income_sources=sources,
+    )
+    calls = len(runtime.calls)
+    result = runtime.service.run(plan, now=cutoff)
+    assert result.status == "blocked" and (
+        "coverage" in result.reason or "income source" in result.reason
+    ), result.reason
+    assert len(runtime.calls) == calls
+    state = runtime.ops.status(result.run_id)
+    assert state["stages"]["account"]["state"] == "pending"
+    assert state["stages"]["verified_inputs"]["state"] == "failed"
+    assert not runtime.ledger.fills(plan.inputs.account.account_id)

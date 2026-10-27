@@ -5,16 +5,21 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 from src.data.features.contextual import NumericEvidenceBinding
 from src.domain.market import MarketSnapshot
 from src.domain.portfolio import (
     AccountSpec,
+    ActionCoverage,
+    CashDividend,
     CorporateAction,
+    DividendDistribution,
+    DividendPayment,
     ExecutionBar,
     FillPolicy,
     InstrumentRisk,
     OpeningEvent,
+    PaperDividendPolicy,
     RiskPolicy,
     UniverseEligibility,
 )
@@ -31,6 +36,14 @@ from src.domain.common import (
     Sha256,
     UtcTimestamp,
     VersionedContract,
+)
+
+INCOME_FIELDS = (
+    "cash_dividends",
+    "dividend_payments",
+    "dividend_distributions",
+    "action_coverage",
+    "paper_dividend_policies",
 )
 
 
@@ -63,6 +76,21 @@ class PaperCycleInputs(VersionedContract):
     rules: tuple[VenueRules, ...] = Field(min_length=1)
     initial_capital: tuple[tuple[NonEmptyString, Decimal], ...]
     receipts: tuple[ObservedOpenReceipt, ...] = ()
+    income_policy: Literal["posted-account", "source-confirmed-paper-distribution-1"] | None = None
+    cash_dividends: tuple[CashDividend, ...] = ()
+    dividend_payments: tuple[DividendPayment, ...] = ()
+    dividend_distributions: tuple[DividendDistribution, ...] = ()
+    action_coverage: tuple[ActionCoverage, ...] = ()
+    paper_dividend_policies: tuple[PaperDividendPolicy, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_identity(self, handler):
+        result = handler(self)
+        if self.income_policy is None and not any(getattr(self, name) for name in INCOME_FIELDS):
+            for field in INCOME_FIELDS:
+                result.pop(field, None)
+            result.pop("income_policy", None)
+        return result
 
     @model_validator(mode="after")
     def causal(self):
@@ -119,6 +147,49 @@ class PaperCycleInputs(VersionedContract):
                 raise ValueError("opening receipts must exactly cover unique economic bar events")
             if any(r.available_at > context.as_of for r in self.receipts):
                 raise ValueError("opening receipt is future to the operating cutoff")
+        if self.income_policy is None and any(getattr(self, name) for name in INCOME_FIELDS):
+            raise ValueError("income events require an explicit account income policy")
+        if self.income_policy is not None:
+            if any(a.kind == "dividend" for a in self.actions):
+                raise ValueError("legacy immediate cash actions cannot replace sourced dividends")
+            for name in INCOME_FIELDS:
+                if any(row.available_at > context.as_of for row in getattr(self, name)):
+                    raise ValueError("income source is future to the operating cutoff")
+            if any(t.available_at > t.entitlement_at for t in self.cash_dividends):
+                raise ValueError("late terms cannot establish a causal pre-ex entitlement")
+            identities = (
+                tuple((t.action_id, t.revision_id) for t in self.cash_dividends),
+                tuple(p.payment_id for p in self.dividend_payments),
+                tuple(d.distribution_id for d in self.dividend_distributions),
+                tuple(c.coverage_id for c in self.action_coverage),
+                tuple(p.policy_id for p in self.paper_dividend_policies),
+            )
+            if any(len(set(items)) != len(items) for items in identities):
+                raise ValueError("duplicate income event/revision/coverage identity")
+            if any(p.account_id != self.account.account_id for p in self.dividend_payments) or any(
+                p.account_id != self.account.account_id for p in self.paper_dividend_policies
+            ):
+                raise ValueError("income posting or paper policy belongs to another account")
+            if self.income_policy == "posted-account":
+                if (
+                    self.dividend_distributions
+                    or self.paper_dividend_policies
+                    or any(p.origin != "posted-account" for p in self.dividend_payments)
+                ):
+                    raise ValueError("posted income requires actual account-bound postings")
+            else:
+                if self.dividend_payments:
+                    raise ValueError("local paper income cannot accept supplied account payments")
+                policies = {p.distribution_hash: p for p in self.paper_dividend_policies}
+                if len(policies) != len(self.paper_dividend_policies) or set(policies) != {
+                    d.content_hash() for d in self.dividend_distributions
+                }:
+                    raise ValueError("each actual distribution requires its exact paper policy")
+                if any(
+                    policies[d.content_hash()].available_at > d.available_at
+                    for d in self.dividend_distributions
+                ):
+                    raise ValueError("paper distribution policy was not available at settlement")
         return self
 
 
@@ -194,6 +265,7 @@ class PaperCyclePlan(VersionedContract):
     scheduled_for: UtcTimestamp
     provenance: tuple[tuple[str, Sha256], ...]
     rule_sources: tuple[SourceBinding, ...] = ()
+    income_authorities: tuple[SourceBinding, ...] = ()
     strategies: tuple[StrategySpec, ...] = Field(min_length=1)
     numeric_bindings: tuple[NumericEvidenceBinding, ...] = ()
     numeric_sources: tuple[FrozenEvidence, ...] = ()
@@ -204,6 +276,13 @@ class PaperCyclePlan(VersionedContract):
     # Only these archived documents can be exposed to the generative desk.
     desk_evidence_ids: tuple[NonEmptyString, ...] = ()
     max_source_chars: int = Field(default=24000, ge=1000, le=120000)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_identity(self, handler):
+        result = handler(self)
+        if self.inputs.income_policy is None and not self.income_authorities:
+            result.pop("income_authorities", None)
+        return result
 
     @model_validator(mode="after")
     def coherent(self):
@@ -261,6 +340,7 @@ class PaperCycleTemplate(VersionedContract):
     fill_policy: FillPolicy
     risk_policy: RiskPolicy
     initial_capital: tuple[tuple[NonEmptyString, Decimal], ...]
+    income_policy: Literal["posted-account", "source-confirmed-paper-distribution-1"] | None = None
     strategies: tuple[StrategySpec, ...] = Field(min_length=1)
     models: tuple[ModelRecipe, ...]
     macro_recipe: MacroRecipe

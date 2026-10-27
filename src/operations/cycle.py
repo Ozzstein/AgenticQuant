@@ -23,10 +23,15 @@ from src.data.evidence.service import ROLE_KINDS, EvidenceService
 from src.data.features.contextual import materialize_evidence_fields
 from src.data.features.dataset import FeatureDataset, feature_dataset
 from src.domain.portfolio import (
+    ActionCoverage,
+    CashDividend,
     CorporateAction,
+    DividendDistribution,
+    DividendPayment,
     ExecutionBar,
     InstrumentRisk,
     OpeningEvent,
+    PaperDividendPolicy,
     PortfolioSnapshot,
     PortfolioTarget,
     PriceMark,
@@ -39,6 +44,7 @@ from src.execution.venue import PaperVenue, VenueExecution, VenueRules
 from src.operations.store import RecoveryRequired, RunManifest, canonical, digest
 from src.research.evidence import (
     BoundArtifact,
+    SourceBinding,
     expected_artifacts,
     json_pointer,
     verify_market_snapshot,
@@ -65,6 +71,7 @@ from src.domain.common import RunContext
 from src.domain.decisions import AgentDecision
 from src.execution.portfolio_optimizer import AllocationConstraints, PortfolioOptimizer
 from src.operations.contracts import (
+    INCOME_FIELDS,
     CycleResult,
     ObservedOpenReceipt,
     PaperCycleInputs,
@@ -230,9 +237,15 @@ class PaperCycleService:
             values.extend(selected if isinstance(selected, list) else [selected])
         return values
 
-    def _verify_inputs(self, inputs, references, rule_sources):
+    def _verify_inputs(self, inputs, references, rule_sources, income_authorities=()):
         from src.operations.evidence import verify_paper_provenance
 
+        if inputs.income_policy is None:
+            raise ValueError("fresh paper cycles require an explicit sourced income policy")
+        prior = self._prior_account_anchor(inputs.account.account_id, inputs.context.run_id)
+        started = next(iter(prior.values())).portfolio.as_of if prior else inputs.account.opened_at
+        if started >= inputs.context.as_of:
+            raise ValueError("income interval must follow the actual committed account anchor")
         return verify_paper_provenance(
             self.registry,
             self.evidence,
@@ -240,6 +253,10 @@ class PaperCycleService:
             references,
             receipts=inputs.receipts,
             rule_sources=rule_sources,
+            income_policy=inputs.income_policy,
+            required_started_at=started,
+            required_ended_at=inputs.context.as_of,
+            income_authorities=income_authorities,
         )
 
     def prepare(
@@ -252,6 +269,7 @@ class PaperCycleService:
         economic_sources,
         macro_dataset,
         contextual_sources: tuple[FrozenEvidence, ...] = (),
+        income_authorities: tuple[SourceBinding, ...] = (),
     ) -> PaperCyclePlan:
         """Build a current plan from an authoritative refresh and archived arrays.
 
@@ -259,6 +277,8 @@ class PaperCycleService:
         supplied receipt-shaped object is accepted as a successful refresh.
         """
         template = PaperCycleTemplate.model_validate(template.model_dump())
+        if template.income_policy is None:
+            raise ValueError("fresh paper preparation requires an explicit sourced income policy")
         status = self.operations.status(refresh_run_id)
         manifest = self.operations.manifest(refresh_run_id)
         if (
@@ -296,8 +316,9 @@ class PaperCycleService:
         if "opening_events" in sources:
             names.pop("execution_bars")
             names["opening_events"] = "opening_events_id"
+        names.update({kind: kind + "_id" for kind in INCOME_FIELDS})
         if len(sources) != len(economic_sources) or set(sources) != set(names) | {"venue_rules"}:
-            raise ValueError("exact eight unique economic source kinds required")
+            raise ValueError("exact eight base and five income source kinds required")
         values = {
             kind: self._source_values(bindings, completed) for kind, bindings in sources.items()
         }
@@ -350,6 +371,20 @@ class PaperCycleService:
             rules=tuple(VenueRules.model_validate(v) for v in values["venue_rules"]),
             initial_capital=template.initial_capital,
             receipts=tuple(open_receipts),
+            income_policy=template.income_policy,
+            cash_dividends=tuple(CashDividend.model_validate(v) for v in values["cash_dividends"]),
+            dividend_payments=tuple(
+                DividendPayment.model_validate(v) for v in values["dividend_payments"]
+            ),
+            dividend_distributions=tuple(
+                DividendDistribution.model_validate(v) for v in values["dividend_distributions"]
+            ),
+            action_coverage=tuple(
+                ActionCoverage.model_validate(v) for v in values["action_coverage"]
+            ),
+            paper_dividend_policies=tuple(
+                PaperDividendPolicy.model_validate(v) for v in values["paper_dividend_policies"]
+            ),
         )
         refs = []
         for kind, expected in expected_artifacts(inputs).items():
@@ -364,7 +399,8 @@ class PaperCycleService:
                 sources=sources[kind],
             )
             refs.append((names[kind], self.registry.archive_contract(bound)))
-        self._verify_inputs(inputs, dict(refs), sources["venue_rules"])
+        with self.operations.exclusive("account:" + inputs.account.account_id):
+            self._verify_inputs(inputs, dict(refs), sources["venue_rules"], income_authorities)
         numeric = tuple(FrozenEvidence.model_validate(v) for v in contextual_sources)
         if any(contextual_fields(spec) for spec in template.strategies) and not numeric:
             raise ValueError("explicit contextual source whitelist required; no ambient discovery")
@@ -384,6 +420,7 @@ class PaperCycleService:
             scheduled_for=scheduled_for,
             provenance=tuple(refs),
             rule_sources=sources["venue_rules"],
+            income_authorities=income_authorities,
             strategies=template.strategies,
             models=template.models,
             macro_recipe=template.macro_recipe,
@@ -660,12 +697,17 @@ class PaperCycleService:
         )
 
     def _prior_anchor(self, plan):
+        return self._prior_account_anchor(
+            plan.inputs.account.account_id, plan.inputs.context.run_id
+        )
+
+    def _prior_account_anchor(self, account_id, run_id):
         candidates = []
-        for run in self.operations.account_runs(plan.inputs.account.account_id):
+        for run in self.operations.account_runs(account_id):
             if (
                 run["kind"] != "paper_cycle"
-                or run["account_id"] != plan.inputs.account.account_id
-                or run["run_id"] == plan.inputs.context.run_id
+                or run["account_id"] != account_id
+                or run["run_id"] == run_id
             ):
                 continue
             if run["status"] != "completed":
@@ -734,10 +776,83 @@ class PaperCycleService:
             source_identity=identity,
         )
 
+    def _admit_income(self, plan, book, anchor):
+        """Admit original terms; ownership/cash remain canonical ledger operations."""
+        with self.ledger.atomic():
+            account = plan.inputs.account.account_id
+            started = next(iter(anchor.values())).portfolio.as_of
+            supplied = {t.content_hash() for t in plan.inputs.cash_dividends}
+            outstanding = {
+                r.entitlement.action_id for r in self.ledger.dividend_receivables(account)
+            }
+            accrued = {
+                e.action_id
+                for e in self.ledger.dividend_entitlements(account, as_of=plan.inputs.context.as_of)
+            }
+            # The canonical reader verifies the full stored revision/admission
+            # chain. A source refresh cannot silently drop a
+            # previously announced entitlement or an unsettled receivable.
+            for terms in self.ledger.cash_dividends(account, as_of=plan.inputs.context.as_of):
+                if (terms.action_id not in accrued or terms.action_id in outstanding) and (
+                    terms.content_hash() not in supplied
+                ):
+                    raise ValueError(
+                        "original admitted dividend terms must remain explicitly sourced"
+                    )
+            for terms in sorted(plan.inputs.cash_dividends, key=lambda t: t.available_at):
+                self.ledger.register_cash_dividend(
+                    account, terms, as_of=max(started, terms.available_at)
+                )
+            for coverage in plan.inputs.action_coverage:
+                self.ledger.record_action_coverage(
+                    account, coverage, as_of=plan.inputs.context.as_of
+                )
+            return {
+                "policy": plan.inputs.income_policy,
+                "required_started_at": started.isoformat(),
+                "required_ended_at": plan.inputs.context.as_of.isoformat(),
+                "terms_hashes": [t.content_hash() for t in plan.inputs.cash_dividends],
+                "coverage_hashes": [c.content_hash() for c in plan.inputs.action_coverage],
+                "receivables": [
+                    r.model_dump(mode="json") for r in self.ledger.dividend_receivables(account)
+                ],
+            }
+
+    @staticmethod
+    def _ordered_observations(events):
+        priority = {
+            "dividend_entitlement": 0,
+            "dividend_payment": 1,
+            "dividend_distribution": 1,
+            "action": 2,
+            "close": 3,
+            "market_close": 3,
+            "open": 4,
+            "opening_event": 4,
+        }
+        return sorted(events, key=lambda pair: priority[pair[0]])
+
+    @staticmethod
+    def _observe_income(plan, book, kind, event, at):
+        if kind == "dividend_entitlement":
+            return book.accrue_dividend(event.action_id, at=at)
+        if kind == "dividend_payment":
+            return book.apply_dividend_payment(event, as_of=at)
+        if kind == "dividend_distribution":
+            policy = next(
+                p
+                for p in plan.inputs.paper_dividend_policies
+                if p.distribution_hash == event.content_hash()
+            )
+            return book.apply_paper_dividend_distribution(event, policy=policy, as_of=at)
+        raise ValueError("unknown canonical income event")
+
     def _observe(self, plan, book, venue, execution, opening, events, at):
         account = plan.inputs.account.account_id
-        for kind, event in events:
-            if kind == "action":
+        for kind, event in self._ordered_observations(events):
+            if kind.startswith("dividend_"):
+                self._observe_income(plan, book, kind, event, at)
+            elif kind == "action":
                 self.ledger.corporate_action(account, event)
             elif kind in {"open", "opening_event"}:
                 if plan.inputs.receipts:
@@ -1531,10 +1646,23 @@ class PaperCycleService:
                     events.setdefault(bar.closed_at, []).append(("market_close", bar))
         for action in plan.inputs.actions:
             events.setdefault(action.effective_at, []).append(("action", action))
+        latest_terms = {}
+        for terms in sorted(plan.inputs.cash_dividends, key=lambda t: t.available_at):
+            latest_terms[terms.action_id] = terms
+        for terms in latest_terms.values():
+            if terms.entitlement_at <= plan.inputs.context.as_of:
+                events.setdefault(terms.entitlement_at, []).append(("dividend_entitlement", terms))
+        for payment in plan.inputs.dividend_payments:
+            events.setdefault(payment.available_at, []).append(("dividend_payment", payment))
+        for distribution in plan.inputs.dividend_distributions:
+            events.setdefault(distribution.available_at, []).append(
+                ("dividend_distribution", distribution)
+            )
         event_names = {at: "observe:" + at.isoformat() for at in sorted(events)}
         stages = (
             "verified_inputs",
             "account",
+            *(("income_admission",) if plan.inputs.income_policy is not None else ()),
             *event_names.values(),
             "reconcile",
             "features",
@@ -1594,6 +1722,11 @@ class PaperCycleService:
                     age < 0 or age > self.config.operations.max_cycle_age_seconds
                 ):
                     raise ValueError("future or stale operating input cutoff")
+                if (
+                    prior["stages"]["verified_inputs"].get("state") == "completed"
+                    and plan.inputs.income_policy is None
+                ):
+                    raise ValueError("fresh paper cycles require an explicit sourced income policy")
 
                 def verify():
                     if cycle_config_hash(self.config) != plan.inputs.context.config_hash:
@@ -1603,7 +1736,12 @@ class PaperCycleService:
                     age = (start - plan.inputs.context.as_of).total_seconds()
                     if age < 0 or age > self.config.operations.max_cycle_age_seconds:
                         raise ValueError("future or stale operating input cutoff")
-                    self._verify_inputs(plan.inputs, dict(plan.provenance), plan.rule_sources)
+                    source_proofs = self._verify_inputs(
+                        plan.inputs,
+                        dict(plan.provenance),
+                        plan.rule_sources,
+                        plan.income_authorities,
+                    )
                     for spec in plan.strategies:
                         require_strategy_eligible(
                             spec,
@@ -1624,6 +1762,7 @@ class PaperCycleService:
                     return {
                         "inputs_hash": plan.inputs.content_hash(),
                         "verified_at": start.isoformat(),
+                        "source_proofs": source_proofs,
                     }
 
                 stage("verified_inputs", verify)
@@ -1644,6 +1783,8 @@ class PaperCycleService:
 
                 anchor = _sleeves(stage("account", account)["anchor"])
                 book = SleeveBook(self.ledger, plan.inputs.account.account_id)
+                if plan.inputs.income_policy is not None:
+                    stage("income_admission", lambda: self._admit_income(plan, book, anchor))
                 rules = {r.instrument.instrument_id: r for r in plan.inputs.rules}
                 venue = PaperVenue(
                     self.ledger,
@@ -1662,21 +1803,19 @@ class PaperCycleService:
                     fill_policy=plan.inputs.fill_policy,
                 )
                 for at, name in event_names.items():
-                    ordered = sorted(
-                        events[at],
-                        key=lambda pair: {
-                            "action": 0,
-                            "close": 1,
-                            "market_close": 1,
-                            "open": 2,
-                            "opening_event": 2,
-                        }[pair[0]],
-                    )
+                    ordered = self._ordered_observations(events[at])
                     if at < next(iter(anchor.values())).portfolio.as_of:
                         # Overlapping historical bundles must exactly match the
                         # previously consumed economic events; no new past fills.
                         def historical(ordered=ordered):
                             for kind, event in ordered:
+                                if kind.startswith("dividend_"):
+                                    # Canonical APIs verify the exact persisted
+                                    # entitlement/payment before idempotent return.
+                                    # A missing old event hits the published-NAV
+                                    # fence; no historical cash is synthesized.
+                                    self._observe_income(plan, book, kind, event, at)
+                                    continue
                                 identity = (
                                     "action:" + event.action_id
                                     if kind == "action"
