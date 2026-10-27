@@ -399,8 +399,19 @@ class TestCLISmoke:
         from src.research.registry import ResearchRegistry
         assert callable(ResearchRegistry.resolve)
 
-    def test_regime_status_importable(self):
-        from scripts.run_pipeline import regime_status  # noqa: F401
+    def test_retired_ambient_regime_status_is_not_an_operating_command(self):
+        from typer.testing import CliRunner
 
-    def test_regime_backtest_importable(self):
-        from scripts.run_pipeline import regime_backtest  # noqa: F401
+        from scripts.run_pipeline import app
+
+        result = CliRunner().invoke(app, ["regime-status"])
+        assert result.exit_code == 2 and "No such command" in result.output
+
+    def test_regime_research_requires_registered_trial_and_archives(self, tmp_path):
+        from typer.testing import CliRunner
+
+        from scripts.run_rd_agent import app
+
+        result = CliRunner().invoke(app, ["run", "--trial", "unregistered"])
+        assert result.exit_code == 2 and "--registry" in result.output
+        assert not list(tmp_path.iterdir())

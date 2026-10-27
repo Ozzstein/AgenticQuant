@@ -55,7 +55,7 @@ def analyze_input(request: DeskAnalysisInput, *, evidence_path: Path, ledger_pat
                 deterministic_vetoes=request.deterministic_vetoes)
     decision = analyze_instrument(request.instrument, request.context, sources=sources,
         hmm_context=hmm, portfolio_context=portfolio, qlib_context=request.qlib_context,
-        config=config, observation_mode=observation_mode)
+        config=config, observation_mode=observation_mode, evidence_store=store)
     return decision, {role: {kind: value.model_dump(mode="json") for kind, value in kinds.items()}
                       for role, kinds in coverage.items()}
 

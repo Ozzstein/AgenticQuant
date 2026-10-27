@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pandas as pd
 import typer
 
-from src.core.backtester import PortfolioReplay, ReplayArtifact, ReplayResult
+from src.core.backtester import PortfolioReplay, ReplayArtifact, ReplayResult, write_immutable
 from src.core.benchmark import BenchmarkRunner, MatchedComparison
 from src.core.validation import ValidationSuite
 from src.core.walk_forward import WalkForwardRunner, reconstruct_oos_inputs
@@ -153,8 +153,10 @@ def run(
     """Run actual predictions/targets or purged walk-forward feature rows."""
     try:
         result = _run_pipeline(input, ledger, output.parent / (output.stem + "-artifacts"))
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(result.model_dump_json(indent=2))
+        write_immutable(
+            output,
+            json.dumps(result.model_dump(mode="json"), sort_keys=True, indent=2, allow_nan=False),
+        )
     except Exception as exc:
         _failure(output, exc)
     typer.echo(

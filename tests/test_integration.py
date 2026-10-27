@@ -1,405 +1,185 @@
-"""Integration tests for TASK-06 scripts and pipeline components.
+"""Canonical service/CLI composition over actual stores and synthetic input data.
 
-All tests are marked @pytest.mark.integration. Run with:
-    pytest tests/test_integration.py -v --tb=short -m integration
-
-External API calls are mocked; no real API keys required.
+Provider responses are fixtures; no historical or financial efficacy is claimed.
+Fresh source-complete paper acceptance remains in test_operating_cycle and is
+not replaced here by an invented successful plan.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from datetime import timedelta
 
 import pandas as pd
 import pytest
+from typer.testing import CliRunner
 
-# Make sure src is importable
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from tests.test_core_backtest import A, replay_inputs, write_bundle
+from tests.test_research_copilot import ProviderFixture
+from tests.test_research_copilot import research_env as research_env
 
 pytestmark = pytest.mark.integration
 
 
-# ---------------------------------------------------------------------------
-# Test 1: run_backtest._run_pipeline
-# ---------------------------------------------------------------------------
+def test_run_backtest_script_uses_actual_bundle_ledger_and_losing_nav(tmp_path):
+    from scripts.run_backtest import _run_pipeline
+    from src.execution.ledger import PortfolioLedger
+
+    bundle, ledger = tmp_path / "inputs.json", tmp_path / "ledger.db"
+    write_bundle(bundle, replay_inputs())
+    result = _run_pipeline(bundle, ledger, tmp_path / "artifacts")
+    assert result.status == "complete"
+    assert result.equity_curve == [10000, 10000, 11000, 8800]
+    assert result.metrics.total_return == pytest.approx(-0.12)
+    book = PortfolioLedger(ledger, read_only=True)
+    try:
+        assert book.reconcile(result.account_id)["reconciled"]
+        assert len(book.fills(result.account_id)) == 1
+    finally:
+        book.close()
 
 
-def test_run_backtest_script(tmp_path):
-    """run_backtest._run_pipeline works correctly with mocked yfinance."""
-    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+def test_run_agents_analyze_missing_authorities_cannot_invent_direction(tmp_path):
+    from scripts.run_agents import DeskAnalysisInput, analyze_input
+    from src.domain.decisions import AgentAction, AgentDecision
+    from src.utils.config import AppConfig
 
-    dates = pd.date_range("2022-01-01", "2022-06-30", freq="B")
-    tickers = ["SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "JPM", "V", "UNH"]
-
-    # Build a long-format DataFrame mimicking DataPipeline.yfinance_fallback output
-    frames = []
-    for ticker in tickers:
-        frame = pd.DataFrame(
-            {
-                "close": [100 + i * 0.1 for i in range(len(dates))],
-                "open": [99 + i * 0.1 for i in range(len(dates))],
-                "high": [101 + i * 0.1 for i in range(len(dates))],
-                "low": [99 + i * 0.1 for i in range(len(dates))],
-                "volume": [1_000_000] * len(dates),
-                "ticker": ticker,
-            },
-            index=dates,
-        )
-        frames.append(frame)
-    mock_df = pd.concat(frames)
-    mock_df.index.name = "date"
-
-    with patch("src.core.data_pipeline.DataPipeline.yfinance_fallback", return_value=mock_df):
-        from scripts.run_backtest import _run_pipeline
-
-        result = _run_pipeline("Linear", 5, "2022-01-01", "2022-06-30", False)
-
-    assert result is not None
-    assert hasattr(result, "metrics")
-    assert result.metrics.sharpe_ratio is not None
+    context = replay_inputs()["context"]
+    config = AppConfig(output_dir=str(tmp_path / "outputs"), log_dir=str(tmp_path / "logs"),
+                       anthropic_api_key="", openai_api_key="")
+    decision, coverage = analyze_input(DeskAnalysisInput(instrument=A, context=context),
+                                      evidence_path=tmp_path / "evidence.db", config=config)
+    assert isinstance(decision, AgentDecision)
+    assert decision.context == context and decision.instrument == A
+    assert decision.action in (AgentAction.ABSTAIN, AgentAction.VETO)
+    assert decision.new_exposure_blocked
+    assert coverage and all(row["status"] != "complete" for kinds in coverage.values()
+                            for row in kinds.values())
 
 
-# ---------------------------------------------------------------------------
-# Test 2: agents.graph.analyze_ticker
-# ---------------------------------------------------------------------------
+def test_pipeline_label_cannot_select_a_separate_backtest_or_broker(monkeypatch):
+    from scripts.run_pipeline import _run_pipeline_once
+
+    monkeypatch.setattr("src.execution.broker.create_broker",
+                        lambda *a, **kw: pytest.fail("parallel broker route"))
+    with pytest.raises(ValueError, match="explicit PaperCyclePlan"):
+        _run_pipeline_once("backtest")
 
 
-def test_run_agents_analyze():
-    """analyze_ticker runs correctly with mocked LangGraph graph."""
-    from src.utils.schemas import AnalysisResult, Decision
-
-    mock_result = AnalysisResult(
-        ticker="AAPL",
-        decision=Decision.BUY,
-        confidence=75.0,
-        reasoning="Mocked analysis",
-    )
-
-    with patch("src.agents.graph.build_trading_desk_graph") as mock_build:
-        compiled = MagicMock()
-        compiled.invoke.return_value = {"result": mock_result, "debate_transcript": []}
-        mock_build.return_value = compiled
-
-        from src.agents.graph import analyze_ticker
-
-        result = analyze_ticker("AAPL")
-
-    assert result.ticker == "AAPL"
-    assert result.decision in list(Decision)
-
-
-# ---------------------------------------------------------------------------
-# Test 3: run_pipeline._run_pipeline_once
-# ---------------------------------------------------------------------------
-
-
-def test_run_pipeline_backtest_mode():
-    """run_pipeline._run_pipeline_once executes in backtest mode with mocked data."""
-    from src.utils.schemas import AnalysisResult, Decision
-
-    mock_result = AnalysisResult(
-        ticker="SPY",
-        decision=Decision.HOLD,
-        confidence=50.0,
-        reasoning="Mocked",
-    )
-
-    dates = pd.date_range("2023-01-01", periods=60, freq="B")
-    frames = []
-    for ticker in ["SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "JPM", "V", "UNH"]:
-        frame = pd.DataFrame(
-            {
-                "close": [100 + i for i in range(len(dates))],
-                "open": [99 + i for i in range(len(dates))],
-                "high": [101 + i for i in range(len(dates))],
-                "low": [99 + i for i in range(len(dates))],
-                "volume": [1_000_000] * len(dates),
-                "ticker": ticker,
-            },
-            index=dates,
-        )
-        frames.append(frame)
-    mock_df = pd.concat(frames)
-    mock_df.index.name = "date"
-
-    with patch("src.core.data_pipeline.DataPipeline.yfinance_fallback", return_value=mock_df), \
-         patch("src.agents.graph.analyze_ticker", return_value=mock_result):
-
-        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-        from scripts.run_pipeline import _run_pipeline_once
-
-        try:
-            summary = _run_pipeline_once("backtest")
-        except Exception as e:
-            pytest.fail(f"_run_pipeline_once raised unexpectedly: {e}")
-
-    assert isinstance(summary, dict)
-    assert "tickers_analyzed" in summary
-    assert "nav" in summary
-
-
-# ---------------------------------------------------------------------------
-# Test 4: factor library roundtrip
-# ---------------------------------------------------------------------------
-
-
-def test_factor_library_roundtrip(tmp_path):
-    """Factor library JSON saves and loads correctly, merging into dataset."""
+def test_factor_library_roundtrip_executes_exact_formula_without_activation(tmp_path):
+    from src.core.data_pipeline import DataPipeline
+    from src.research.registry import ResearchRegistry
     from src.utils.config import AppConfig
     from src.utils.schemas import FactorDefinition
+    from tests.test_feature_fidelity import panel
 
-    # Write a minimal factor library to tmp_path (which will be output_dir)
-    factors = [
-        FactorDefinition(
-            name="test_momentum",
-            expression="close.pct_change(20)",
-            category="momentum",
-            ic_mean=0.03,
-            icir=0.5,
-        )
-    ]
-    factor_path = tmp_path / "factor_library.json"
-    factor_path.write_text(json.dumps([f.model_dump() for f in factors]))
+    factor = FactorDefinition(name="misleading_momentum_name", expression="Ref($close,2)/$close-1")
+    (tmp_path / "factor_library.json").write_text(json.dumps([factor.model_dump(mode="json")]))
+    frame = panel()
+    actual = DataPipeline(AppConfig(output_dir=str(tmp_path))).load_factor_library(base_df=frame)
+    expected = frame.close.groupby(level="instrument").shift(2) / frame.close - 1
+    pd.testing.assert_series_equal(actual[factor.name], expected.rename(factor.name))
+    assert ResearchRegistry(tmp_path / "registry.db").status()["active"] == []
 
-    dates = pd.date_range("2023-01-01", periods=50, freq="B")
-    mock_df = pd.DataFrame(
-        {
-            "close": [float(i + 100) for i in range(50)],
-            "open": [float(i + 99) for i in range(50)],
-            "high": [float(i + 101) for i in range(50)],
-            "low": [float(i + 99) for i in range(50)],
-            "volume": [1_000_000] * 50,
-            "ticker": ["SPY"] * 50,
-        },
-        index=dates,
+
+def wrapper(env, *, responses=False):
+    from src.core.factor_proposer import FactorProposer
+
+    calls = []
+    service = FactorProposer(
+        env.config, registry=env.registry, evidence_store=env.store,
+        code_hash=env.code_hash, environment_hash=env.environment_hash,
+        llm_factory=(lambda purpose, model: ProviderFixture(purpose, model, calls)) if responses else None,
     )
-
-    # Create a config pointing output_dir to tmp_path so load_factor_library
-    # finds the JSON we wrote above
-    cfg = AppConfig(output_dir=str(tmp_path))
-
-    with patch("src.core.data_pipeline.DataPipeline.yfinance_fallback", return_value=mock_df):
-        from src.core.data_pipeline import DataPipeline
-
-        pipeline = DataPipeline(cfg)
-        lib_df = pipeline.load_factor_library()
-
-    # Library should return a DataFrame (may be empty if no qlib data)
-    assert isinstance(lib_df, pd.DataFrame)
+    return service, calls
 
 
-# ---------------------------------------------------------------------------
-# Test 5: RDAgentRunner KB persistence
-# ---------------------------------------------------------------------------
+def test_research_restart_retains_actual_quarantine_without_made_up_performance(research_env):
+    from src.core.rd_agent_runner import RDAgentRunner
+
+    env = research_env
+    service, calls = wrapper(env, responses=True)
+    result = service.propose_factors(1, context=env.context, sources=(env.source,), description="Study persistence")
+    assert result.status == "available" and len(calls) == 1
+    candidate = env.registry.candidate(result.candidates[0].candidate_id)
+    reopened = RDAgentRunner(env.config, registry_path=env.registry.path, evidence_path=env.store.path)
+    assert reopened.registry.candidate(candidate.candidate_id) == candidate
+    status = reopened.library_status()
+    assert status["counts"] == {"candidates": 1, "trials": 0, "holdouts": 0, "outcomes": 0}
+    assert status["active"] == []
+    assert all(reopened.registry.blob(key) for key in candidate.source_evidence_hashes)
 
 
-def test_knowledge_base_persistence(tmp_path):
-    """RDAgentRunner loads KB from previous run on second invocation."""
-    import src.core.rd_agent_runner as rdmod
-
-    original_kb_path = rdmod._KB_PATH
-    original_kb_dir = rdmod._KB_DIR
-    rdmod._KB_PATH = tmp_path / "kb.json"
-    rdmod._KB_DIR = tmp_path
-
-    try:
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner1 = RDAgentRunner()
-        result1 = runner1.co_optimize(iterations=2, budget=0.5)
-        assert "factors_accepted" in result1
-
-        # Second run — KB should be loaded from disk (written by runner1)
-        runner2 = RDAgentRunner()
-        result2 = runner2.co_optimize(iterations=2, budget=0.5)
-        assert "factors_accepted" in result2
-
-        # Verify KB file exists after runs
-        assert rdmod._KB_PATH.exists()
-
-    finally:
-        rdmod._KB_PATH = original_kb_path
-        rdmod._KB_DIR = original_kb_dir
+def test_copilot_missing_access_returns_typed_unavailable(research_env):
+    env = research_env
+    service, calls = wrapper(env)
+    result = service.propose_factors(1, context=env.context, sources=(env.source,), description="Study momentum")
+    assert result.status == "unavailable" and not result.candidates and not calls
+    assert env.registry.status()["counts"]["candidates"] == 0
 
 
-# ---------------------------------------------------------------------------
-# Test 6: KB prevents reproposals
-# ---------------------------------------------------------------------------
+def test_copilot_model_archives_payload_and_generation_without_simulated_sharpe(research_env):
+    from src.research.copilot import GenerationObservation
 
-# ---------------------------------------------------------------------------
-# Tests 7-10: TASK-06 remaining done criteria
-# ---------------------------------------------------------------------------
-
-
-def test_copilot_factor(tmp_path):
-    """copilot_factor returns dict with factors_evaluated > 0 and description key."""
-    import src.core.rd_agent_runner as rdmod
-
-    original_kb_path = rdmod._KB_PATH
-    original_kb_dir = rdmod._KB_DIR
-    rdmod._KB_PATH = tmp_path / "kb.json"
-    rdmod._KB_DIR = tmp_path
-
-    try:
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-        result = runner.copilot_factor("momentum rsi factor")
-
-        assert "description" in result
-        assert "factors_evaluated" in result
-        assert result["factors_evaluated"] > 0
-        assert "factors_accepted" in result
-        assert "accepted" in result
-        assert "best_ic" in result
-    finally:
-        rdmod._KB_PATH = original_kb_path
-        rdmod._KB_DIR = original_kb_dir
+    env = research_env
+    service, calls = wrapper(env, responses=True)
+    result = service.propose_model_config(1, context=env.context, sources=(env.source,), description="Study a linear model")
+    assert result.status == "available" and len(calls) == 1
+    receipt = result.candidates[0]
+    payload = json.loads(receipt.payload_json)
+    assert set(payload) == {"features", "model_name", "model_parameters"}
+    assert payload["model_name"] == "Linear"
+    assert env.registry.candidate(receipt.candidate_id).kind == "model"
+    observation = GenerationObservation.model_validate_json(env.registry.blob(result.observation_hashes[0]))
+    assert observation.input_tokens == 100 and observation.output_tokens == 100
+    assert observation.completed_at <= result.available_at
+    assert env.registry.status()["counts"]["outcomes"] == 0
 
 
-def test_copilot_model(tmp_path):
-    """copilot_model returns dict with model_name, simulated_sharpe, saved keys."""
-    import src.core.rd_agent_runner as rdmod
+def test_canonical_replay_cli_restart_keeps_actual_ledger_bytes(tmp_path):
+    from src.utils.cli import app
 
-    original_kb_path = rdmod._KB_PATH
-    original_kb_dir = rdmod._KB_DIR
-    rdmod._KB_PATH = tmp_path / "kb.json"
-    rdmod._KB_DIR = tmp_path
-
-    try:
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-
-        # Write a temp paper file with lightgbm keywords
-        paper_file = tmp_path / "test_paper.txt"
-        paper_file.write_text("This paper describes a lightgbm gradient boosting approach.")
-
-        result = runner.copilot_model(source=str(paper_file))
-
-        assert "model_name" in result
-        assert "simulated_sharpe" in result
-        assert "saved" in result
-        assert result["model_name"] in ("LightGBM", "CatBoost", "XGBoost", "Linear")
-    finally:
-        rdmod._KB_PATH = original_kb_path
-        rdmod._KB_DIR = original_kb_dir
+    inputs, ledger, output = tmp_path / "input.json", tmp_path / "ledger.db", tmp_path / "result.json"
+    write_bundle(inputs, replay_inputs())
+    args = ["backtest", "run", "--input", str(inputs), "--ledger", str(ledger), "--output", str(output)]
+    runner = CliRunner()
+    first = runner.invoke(app, args)
+    assert first.exit_code == 0, first.output
+    original = output.read_bytes(), hashlib.sha256(ledger.read_bytes()).hexdigest()
+    second = runner.invoke(app, args)
+    assert second.exit_code == 0, second.output
+    assert (output.read_bytes(), hashlib.sha256(ledger.read_bytes()).hexdigest()) == original
+    assert json.loads(output.read_text())["reconciliation"]["reconciled"]
 
 
-def test_pipeline_idempotency(tmp_path):
-    """_run_pipeline_once returns cached result on second call same day."""
-    import scripts.run_pipeline as pipeline_mod
+def test_explicit_feature_specs_materialize_exact_expression_and_future_label_bounds():
+    from src.data.features.dataset import feature_dataset
+    from src.domain.market import FeatureSpec
+    from tests.data_quant_fixtures import archived_snapshot
 
-    original_state_dir = pipeline_mod._PIPELINE_STATE_DIR
-    pipeline_mod._PIPELINE_STATE_DIR = tmp_path / "pipeline_state"
-
-    from src.utils.schemas import AnalysisResult, Decision
-
-    mock_result = AnalysisResult(
-        ticker="SPY",
-        decision=Decision.HOLD,
-        confidence=50.0,
-        reasoning="Mocked",
-    )
-
-    dates = pd.date_range("2023-01-01", periods=60, freq="B")
-    frames = []
-    for ticker in ["SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "JPM", "V", "UNH"]:
-        frame = pd.DataFrame(
-            {
-                "close": [100 + i for i in range(len(dates))],
-                "open": [99 + i for i in range(len(dates))],
-                "high": [101 + i for i in range(len(dates))],
-                "low": [99 + i for i in range(len(dates))],
-                "volume": [1_000_000] * len(dates),
-                "ticker": ticker,
-            },
-            index=dates,
-        )
-        frames.append(frame)
-    mock_df = pd.concat(frames)
-
-    try:
-        with patch("src.core.data_pipeline.DataPipeline.yfinance_fallback", return_value=mock_df), \
-             patch("src.agents.graph.analyze_ticker", return_value=mock_result):
-
-            from scripts.run_pipeline import _run_pipeline_once
-
-            summary1 = _run_pipeline_once("backtest")
-            # Second call — should hit idempotency cache
-            summary2 = _run_pipeline_once("backtest")
-
-        assert isinstance(summary1, dict)
-        assert isinstance(summary2, dict)
-        assert set(summary1.keys()) == set(summary2.keys())
-        assert "tickers_analyzed" in summary1
-        assert "nav" in summary1
-    finally:
-        pipeline_mod._PIPELINE_STATE_DIR = original_state_dir
+    snapshot = archived_snapshot()
+    specs = (FeatureSpec(name="custom_factor", expression="$close/Ref($close,2)-1"),)
+    data = feature_dataset(snapshot, specs, horizon=2)
+    prices = pd.Series({(b.closed_at,b.instrument.instrument_id):float(b.close) for b in snapshot.bars}).sort_index()
+    prices.index.names = ["datetime", "instrument"]
+    expected = prices / prices.groupby(level="instrument").shift(2) - 1
+    pd.testing.assert_series_equal(data.features.custom_factor, expected.rename("custom_factor"))
+    cutoff = sorted(prices.index.get_level_values("datetime").unique())[50] + timedelta(seconds=1)
+    eligible = data.eligible_training(cutoff)
+    assert not eligible.features.empty
+    assert (eligible.label_end_at <= cutoff).all()
+    assert (eligible.label_available_at <= cutoff).all()
+    assert data.labels.groupby(level="instrument").tail(2).isna().all()
 
 
-def test_factor_merge_into_features(tmp_path):
-    """_build_features with extra_factors returns DataFrame with > 4 columns."""
-    dates = pd.date_range("2023-01-01", periods=50, freq="B")
-    mock_df = pd.DataFrame(
-        {
-            "close": [float(i + 100) for i in range(50)],
-            "open": [float(i + 99) for i in range(50)],
-            "high": [float(i + 101) for i in range(50)],
-            "low": [float(i + 99) for i in range(50)],
-            "volume": [1_000_000] * 50,
-            "ticker": ["SPY"] * 50,
-        },
-        index=dates,
-    )
+def test_unregistered_factor_search_cannot_create_research_outcomes(tmp_path):
+    from src.core.rd_agent_runner import RDAgentRunner
+    from src.research.registry import RegistryError
+    from src.utils.config import AppConfig
 
-    # Build a simple extra factor column
-    extra_factor = pd.DataFrame(
-        {"custom_factor": [float(i) * 0.01 for i in range(50)]},
-        index=dates,
-    )
-
-    from scripts.run_backtest import _build_features
-
-    X, y = _build_features(mock_df, extra_factors=extra_factor)
-
-    assert not X.empty
-    assert X.shape[1] > 4, f"Expected > 4 cols, got {X.shape[1]}: {list(X.columns)}"
-    assert "custom_factor" in X.columns
-
-
-def test_kb_prevents_reproposals(tmp_path):
-    """Factors that failed IC threshold are not re-proposed in subsequent runs."""
-    import src.core.rd_agent_runner as rdmod
-
-    original_kb_path = rdmod._KB_PATH
-    original_kb_dir = rdmod._KB_DIR
-    rdmod._KB_PATH = tmp_path / "kb.json"
-    rdmod._KB_DIR = tmp_path
-
-    try:
-        from src.core.rd_agent_runner import RDAgentRunner
-
-        runner = RDAgentRunner()
-
-        # Pre-populate KB with "failed" factors (exact base names from templates)
-        failed_names = {"momentum_20d", "rsi_14", "macd_signal"}
-        kb = runner._load_kb()
-        kb["failed_factors"] = sorted(failed_names)
-        runner._save_kb(kb)
-
-        # Run factor mining — the failed factors should be skipped
-        # (they may appear with version suffixes like rsi_14_v1 if base not skipped,
-        #  but the exact base names should not appear in results)
-        result = runner.mine_factors(iterations=5)
-
-        # None of the exact failed factor names should appear in the result
-        result_names = {f.name for f in result}
-        overlap = result_names & failed_names
-        assert len(overlap) == 0, f"Failed factors were re-proposed: {overlap}"
-
-    finally:
-        rdmod._KB_PATH = original_kb_path
-        rdmod._KB_DIR = original_kb_dir
+    runner = RDAgentRunner(AppConfig(output_dir=str(tmp_path)), registry_path=tmp_path / "research.db",
+                           evidence_path=tmp_path / "evidence.db")
+    with pytest.raises(RegistryError):
+        runner.mine_factors(trial_ids=["not-admitted"], output_dir=tmp_path / "search")
+    assert runner.library_status()["counts"] == {"candidates": 0, "trials": 0, "holdouts": 0, "outcomes": 0}
+    assert not (tmp_path / "search").exists()

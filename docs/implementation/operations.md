@@ -320,3 +320,30 @@ suite, whereas the newly built wheel correctly contains `scripts`.
 The user confirmed no sufficient corporate-action/custodial income source has
 been selected. Fresh source-complete acceptance therefore remains blocked; the
 retained positive-cycle requirements are not replaced by mock completeness.
+
+### Full pinned audit and canonical migrations — 2026-10-27
+
+The full Python source snapshot `fd54c9f` completed 1,886 tests in 1,139.76s:
+1,851 passed, 17 failed, 18 setup errors, zero skips. The XML/log are retained at
+`/tmp/quantagentlab-root-fd54c9f-full.{xml,log}`. Fourteen failures referenced retired
+interfaces: ticker/model-label execution, mutable KB globals, old regime commands
+and the legacy `--broker` selector. Three failures plus all 18 setup errors depend
+on genuine missing positive income policy/coverage; those acceptance cases remain
+enabled and unchanged.
+
+After integrating lane checkpoints through `8f556cf`, 378 focused tests passed in
+48.36s across decision evaluation/history/memory, actual later-clock desk
+snapshots, historical sleeves, LEAN original-order recovery, crypto context and
+accounting. Canonical `run_agents` now forwards the actual EvidenceStore.
+Retired integration tests now exercise real typed inputs, source/usage-backed
+quarantine, exact feature formulas, read-only ledger status and actual CLI replay,
+with explicit rejection of removed parallel routes. The migration exposed a real
+CLI artifact problem: restart serialized nested manifest keys in a different
+order and overwrote result bytes. Backtest output now uses canonical sorted JSON
+and the existing immutable writer. The 62 migration/core/artifact tests passed in
+21.91s, including unchanged result and SQLite bytes across CLI restart.
+
+The root editable package was reinstalled offline from the existing lock after
+the full audit; the installed `aiquant` entry point now imports packaged scripts
+without a PYTHONPATH override. No dependency versions changed. Root source Ruff
+and diff checks pass. These focused counts are not a whole-repository green claim.

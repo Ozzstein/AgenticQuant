@@ -257,56 +257,48 @@ class TestBrokerFactory:
         assert isinstance(broker, PaperTrader)
         assert broker.portfolio.cash == pytest.approx(100_000.0)
 
-    def test_cli_trade_status_with_paper_broker(self) -> None:
-        """CLI `trade status` outputs NAV line via PaperTrader."""
+    def test_cli_trade_status_reads_canonical_ledger_without_mutation(self, tmp_path, monkeypatch):
+        import hashlib
+        import json
+        from functools import lru_cache
+
+        from typer.testing import CliRunner
+
+        from src.core.backtester import PortfolioReplay
+        from src.utils.cli import app
+        from tests.test_core_backtest import replay_inputs
+
+        ledger = tmp_path / "actual.sqlite3"
+        replay = PortfolioReplay(ledger).run(**replay_inputs())
+        config = AppConfig(output_dir=str(tmp_path / "outputs"),
+                           paper_ledger_path=str(ledger), paper_account_id=replay.account_id)
+        monkeypatch.setattr("src.utils.config.get_config", lru_cache()(lambda: config))
+        before = hashlib.sha256(ledger.read_bytes()).hexdigest()
+        result = CliRunner().invoke(app, ["trade", "status"])
+        assert result.exit_code == 0, result.output
+        portfolio = json.loads(result.output)["portfolio"]
+        assert portfolio["reconciliation"]["reconciled"]
+        assert portfolio["snapshot"]["nav"] == "8800"
+        assert portfolio["snapshot"]["account_id"] == replay.account_id
+        assert hashlib.sha256(ledger.read_bytes()).hexdigest() == before
+
+    def test_retired_paper_flag_cannot_select_a_parallel_book(self, monkeypatch):
         from typer.testing import CliRunner
 
         from src.utils.cli import app
 
-        runner = CliRunner()
-        result = runner.invoke(app, ["trade", "status", "--broker", "paper"])
+        monkeypatch.setattr("src.execution.broker.create_broker",
+                            lambda *a, **kw: pytest.fail("legacy broker bypass"))
+        result = CliRunner().invoke(app, ["trade", "status", "--broker", "paper"])
+        assert result.exit_code == 2 and "No such option" in result.output
 
-        assert result.exit_code == 0, f"CLI exited with {result.exit_code}: {result.output}"
-        assert "NAV" in result.output
+    def test_pipeline_requires_canonical_plan_before_broker_admission(self, monkeypatch):
+        from scripts.run_pipeline import _run_pipeline_once
 
-    def test_cli_trade_with_broker_flag_paper(self) -> None:
-        """CLI `trade status --broker paper` names PaperTrader in output."""
-        from typer.testing import CliRunner
-
-        from src.utils.cli import app
-
-        runner = CliRunner()
-        result = runner.invoke(app, ["trade", "status", "--broker", "paper"])
-
-        assert result.exit_code == 0, f"CLI exited with {result.exit_code}: {result.output}"
-        assert "PaperTrader" in result.output
-
-    def test_pipeline_uses_broker_factory(self) -> None:
-        """_run_pipeline_once uses create_broker when building the trader."""
-        from unittest.mock import MagicMock, patch
-
-        mock_broker = MagicMock()
-        mock_portfolio = MagicMock()
-        mock_portfolio.cash = 100_000.0
-        mock_portfolio.nav = 100_000.0
-        mock_portfolio.positions = {}
-        mock_broker.portfolio = mock_portfolio
-        mock_broker.execute_order.return_value = None
-        mock_broker.snapshot.return_value = None
-
-        # Patch create_broker in run_pipeline's local import namespace
-        with patch("src.execution.broker.create_broker", return_value=mock_broker) as mock_factory:
-            # Also patch heavy dependencies so the pipeline doesn't actually run
-            with patch("src.agents.graph.analyze_ticker", return_value=MagicMock()):
-                with patch("src.core.data_pipeline.DataPipeline"):
-                    # Verify create_broker is importable from that module
-                    from src.execution.broker import create_broker
-
-                    assert callable(create_broker)
-                    # Verify mock_factory is called when injected
-                    result = mock_factory(None)
-                    assert result is mock_broker
-                    mock_factory.assert_called_once()
+        monkeypatch.setattr("src.execution.broker.create_broker",
+                            lambda *a, **kw: pytest.fail("legacy broker bypass"))
+        with pytest.raises(ValueError, match="explicit PaperCyclePlan"):
+            _run_pipeline_once("backtest")
 
 
 class TestCcxtConfig:
@@ -424,23 +416,15 @@ class TestCcxtFactory:
         broker = create_broker(config)
         assert isinstance(broker, PaperTrader)
 
-    def test_cli_trade_ccxt_flag(self) -> None:
-        # Patch at the module where CcxtTrader is defined — CLI imports from there
-        from unittest.mock import MagicMock, patch
-
+    def test_retired_ccxt_flag_cannot_dispatch_legacy_float_orders(self, monkeypatch):
         from typer.testing import CliRunner
 
         from src.utils.cli import app
 
-        runner = CliRunner()
-        mock_trader = MagicMock()
-        mock_trader.portfolio.nav = 100_000.0
-        mock_trader.portfolio.cash = 100_000.0
-        mock_trader.portfolio.positions = {}
-        with patch("src.execution.ccxt_trader.CcxtTrader", return_value=mock_trader):
-            result = runner.invoke(app, ["trade", "status", "--broker", "ccxt"])
-        assert result.exit_code == 0
-        assert "NAV" in result.output or "100" in result.output
+        monkeypatch.setattr("src.execution.ccxt_trader.CcxtTrader",
+                            lambda *a, **kw: pytest.fail("legacy remote broker bypass"))
+        result = CliRunner().invoke(app, ["trade", "status", "--broker", "ccxt"])
+        assert result.exit_code == 2 and "No such option" in result.output
 
 
 def test_broker_and_replay_metrics_share_exact_return_conventions():
