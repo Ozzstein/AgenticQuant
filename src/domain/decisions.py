@@ -125,6 +125,12 @@ class DecisionPolicy(VersionedContract):
     thresholds: tuple[TaskThreshold, ...] = ()
     max_source_age_seconds: float | None = Field(default=None, gt=0)
 
+    def evaluation_subject_hash(self) -> str:
+        """Exact candidate semantics without the later publication reference."""
+        return digest(
+            canonical_json(self.model_dump(mode="json", exclude={"activation", "evaluation_id"}))
+        )
+
     @field_validator("model")
     @classmethod
     def pinned(cls, value):

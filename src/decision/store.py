@@ -41,6 +41,12 @@ class DecisionStore:
                     ON attempts BEGIN SELECT RAISE(ABORT, 'immutable attempt'); END;
                 CREATE TRIGGER IF NOT EXISTS attempt_immutable_delete BEFORE DELETE
                     ON attempts BEGIN SELECT RAISE(ABORT, 'immutable attempt'); END;
+                CREATE TABLE IF NOT EXISTS evaluation_artifacts (
+                    identity TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS evaluation_immutable_update BEFORE UPDATE
+                    ON evaluation_artifacts BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
+                CREATE TRIGGER IF NOT EXISTS evaluation_immutable_delete BEFORE DELETE
+                    ON evaluation_artifacts BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(reservations)")}
             for name, kind in (("observation_id", "TEXT"), ("attempt", "INTEGER")):
@@ -53,6 +59,38 @@ class DecisionStore:
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
+
+    def _append_evaluation(self, value):
+        """Owned EvaluationService write boundary; never a supplied pass flag."""
+        from src.decision.evaluation import EVALUATION_TYPES
+
+        kind = type(value).__name__
+        if EVALUATION_TYPES.get(kind) is not type(value):
+            raise ValueError("unknown evaluation contract")
+        value = type(value).model_validate(value.model_dump())
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO evaluation_artifacts VALUES(?,?,?)",
+                (value.content_hash(), kind, value.model_dump_json()),
+            )
+        return value.content_hash()
+
+    def evaluation_artifact(self, identity, expected_type):
+        """Read an immutable typed record; semantic proof is resolved by service."""
+        from src.decision.evaluation import EVALUATION_TYPES
+
+        if EVALUATION_TYPES.get(expected_type.__name__) is not expected_type:
+            raise ValueError("unknown evaluation contract")
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT kind,payload FROM evaluation_artifacts WHERE identity=?", (identity,)
+            ).fetchone()
+        if row is None or row[0] != expected_type.__name__:
+            raise ValueError("missing authoritative evaluation record")
+        value = expected_type.model_validate_json(row[1])
+        if value.content_hash() != identity:
+            raise ValueError("evaluation record hash differs")
+        return value
 
     def append(self, request: DecisionRequest, result: DecisionResult):
         with self.connect() as db:

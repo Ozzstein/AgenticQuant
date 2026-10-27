@@ -140,11 +140,9 @@ def parse_response(
                 abstain |= confidence < threshold.min_provider_confidence
         if threshold:
             abstain |= top < threshold.min_probability
-        kwargs["disposition"] = (
-            "abstain"
-            if abstain
-            else ("accepted" if request.policy.activation == "evaluated" else "observed")
-        )
+        # Wire validation has no evaluation authority. Only the service may
+        # promote an observation after resolving the exact published proof.
+        kwargs["disposition"] = "abstain" if abstain else "observed"
         judgments.append(Judgment(**kwargs))
     return data["model"], tuple(judgments), usage["input_tokens"], usage["output_tokens"]
 
@@ -157,10 +155,11 @@ class DecisionService:
     Refresh always appends a new observation; it cannot rewrite prior evidence.
     """
 
-    def __init__(self, store: DecisionStore, *, transport=None, limits=None):
+    def __init__(self, store: DecisionStore, *, transport=None, limits=None, evidence_store=None):
         self.store = store
         self.transport = transport if transport is not None else JevHTTPTransport()
         self.limits = limits or OperatingLimits()
+        self.evidence_store = evidence_store
 
     def evaluate(self, request: DecisionRequest, **kwargs) -> DecisionResult:
         try:
@@ -187,8 +186,16 @@ class DecisionService:
         deadline = clock + timeout_seconds
         identity = str(uuid4())
         attempts, raw, actual, input_tokens, output_tokens = 0, None, None, None, None
+        evaluated = False
 
         def finish(status, reason="", *, judgments=(), reused=None):
+            if evaluated and status == DecisionStatus.OK:
+                judgments = tuple(
+                    j.model_copy(update={"disposition": "accepted"})
+                    if j.disposition == "observed"
+                    else j
+                    for j in judgments
+                )
             cost = None
             price = self.limits.input_usd_per_million
             if input_tokens is not None and price is not None and actual == request.policy.model:
@@ -222,11 +229,52 @@ class DecisionService:
             self.store.append(request, result)
             return result
 
+        if request.policy.activation == "evaluated":
+            from src.decision.evaluation import EvaluationService
+
+            try:
+                authority = EvaluationService(self.store, evidence_store=self.evidence_store)
+                authority.resolve(
+                    request.policy,
+                    question_hashes=tuple(q.content_hash() for q in request.questions),
+                    as_of=request.context.as_of,
+                )
+                for source in request.sources:
+                    authority._source(source, request.context.as_of)
+                evaluated = True
+            except Exception:
+                return finish(
+                    DecisionStatus.UNAVAILABLE, "evaluated policy proof unavailable or ineligible"
+                )
+            if time.monotonic() >= deadline:
+                return finish(
+                    DecisionStatus.TIMED_OUT, "deadline expired while resolving evaluation proof"
+                )
+
         if mode in ("cache", "replay"):
             cached = self.store.find(
                 request.cache_key(), observation_id=observation_id, successful_only=mode == "cache"
             )
             if cached:
+                if evaluated:
+                    try:
+                        exported = self.store.export_observation(cached.observation_id)
+                        original = DecisionRequest.model_validate(exported["request"])
+                        _, parsed, _, _ = parse_response(original, cached.raw_response)
+                        normalized = tuple(
+                            j.model_copy(update={"disposition": "observed"})
+                            if j.disposition == "accepted"
+                            else j
+                            for j in cached.judgments
+                        )
+                        if parsed != normalized or cached.actual_model != request.policy.model:
+                            raise ValueError(
+                                "cached judgment differs from raw provider observation"
+                            )
+                    except Exception:
+                        return finish(
+                            DecisionStatus.MALFORMED, "evaluated cached observation proof differs"
+                        )
                 actual, raw = cached.actual_model, cached.raw_response
                 # Reuse preserves original usage on its observation, not a new charge.
                 return finish(

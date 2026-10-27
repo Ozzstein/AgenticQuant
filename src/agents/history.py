@@ -290,6 +290,21 @@ class DeskHistoryStore:
             decision_store.export_observation(identity)
             for identity in receipt.decision.judgment_observation_ids
         ]
+        from src.decision.evaluation import EvaluationService
+
+        def verify_policy(observation):
+            request = DecisionRequest.model_validate(observation["request"])
+            if request.policy.activation == "evaluated":
+                EvaluationService(decision_store, evidence_store=evidence_store).resolve(
+                    request.policy,
+                    question_hashes=tuple(q.content_hash() for q in request.questions),
+                    as_of=request.context.as_of,
+                )
+            if observation["reused"] is not None:
+                verify_policy(observation["reused"])
+
+        for observation in expected:
+            verify_policy(observation)
         if canonical(expected) != receipt.jev_observations_json:
             raise ValueError("history Jev observation differs from authority")
         inputs = json.loads(receipt.inputs_json)

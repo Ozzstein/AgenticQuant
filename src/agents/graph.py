@@ -37,7 +37,7 @@ def build_trading_desk_graph(
 ):
     config = config or get_config()
     service = decision_service or DecisionService(
-        DecisionStore(Path(config.output_dir) / "decisions.sqlite")
+        DecisionStore(Path(config.output_dir) / "decisions.sqlite"), evidence_store=evidence_store
     )
     policy = policy or DecisionPolicy()
 

@@ -215,7 +215,8 @@ class PaperCycleService:
         self.artifacts = Path(artifact_dir).resolve()
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.decisions = decision_service or DecisionService(
-            DecisionStore(Path(config.output_dir) / "decisions.sqlite")
+            DecisionStore(Path(config.output_dir) / "decisions.sqlite"),
+            evidence_store=self.evidence,
         )
         self.policy, self.llm_factory, self.resolver = decision_policy, llm_factory, resolver
         self.history = DeskHistoryStore(Path(config.output_dir) / "desk-history.sqlite3")

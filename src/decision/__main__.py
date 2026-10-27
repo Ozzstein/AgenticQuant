@@ -13,13 +13,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Typed Jev judgment, with immutable replay")
     parser.add_argument("request", type=Path)
     parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument("--evidence", "--evidence-store", dest="evidence", type=Path)
     parser.add_argument("--mode", choices=["cache", "refresh", "replay"], default="cache")
     parser.add_argument("--observation-id")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args(argv)
     try:
         request = DecisionRequest.model_validate_json(args.request.read_text())
-        result = DecisionService(DecisionStore(args.store)).evaluate(
+        evidence = None
+        if args.evidence:
+            from src.data.evidence.store import EvidenceStore
+
+            if not args.evidence.is_file():
+                raise ValueError("evidence authority does not exist")
+            evidence = EvidenceStore(args.evidence)
+        result = DecisionService(DecisionStore(args.store), evidence_store=evidence).evaluate(
             request,
             mode=args.mode,
             observation_id=args.observation_id,
@@ -28,7 +36,10 @@ def main(argv=None):
         print(result.model_dump_json(indent=2))
         return 0 if result.status == DecisionStatus.OK else 2
     except (ValueError, OSError):
-        print("Invalid decision request or inaccessible observation store", file=sys.stderr)
+        print(
+            "Invalid decision request or inaccessible observation/evidence authority",
+            file=sys.stderr,
+        )
         return 2
 
 
