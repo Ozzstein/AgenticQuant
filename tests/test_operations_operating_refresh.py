@@ -2,12 +2,14 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 from src.data.adapters.base import ProviderError, ReadHTTP
 from src.data.adapters.operating import verify_operating_capture
+from src.data.calendars import sessions
 from src.domain.common import RunContext
 from src.operations import operating_fetch, refresh
 from src.operations.refresh import FetchSourceRef, FetchTask, RefreshPlan, RefreshService
@@ -57,30 +59,63 @@ def wire_boundary(monkeypatch, f):
     original = f.adapter.data.client._transport
 
     def handler(request):
-        response = original.handle_request(request)
         if request.url.path == "/v2/calendar":
+            f.requests.append(request)
+            schedule = sessions(
+                request.url.params["start"], request.url.params["end"], calendar="XNYS"
+            )
             rows = [
-                r
-                for r in response.json()
-                if request.url.params["start"] <= r["date"] <= request.url.params["end"]
+                {
+                    "date": day,
+                    "open": opened.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M"),
+                    "close": closed.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M"),
+                }
+                for day, (opened, closed) in schedule.items()
             ]
             return httpx.Response(200, json=rows)
-        return response
+        if request.url.path == "/v2/stocks/bars":
+            f.requests.append(request)
+            start = datetime.fromisoformat(request.url.params["start"])
+            end = datetime.fromisoformat(request.url.params["end"])
+            schedule = sessions(start.date().isoformat(), end.date().isoformat(), calendar="XNYS")
+            rows = [
+                {
+                    "t": opened.isoformat(),
+                    "o": "100",
+                    "h": "102",
+                    "l": "99",
+                    "c": "101",
+                    "v": "1000",
+                    "vw": "100.123456789",
+                }
+                for opened, closed in schedule.values()
+                if start <= opened and closed <= end
+            ][-20:]
+            return httpx.Response(
+                200, json={"bars": {f.instrument.symbol: rows}, "next_page_token": None}
+            )
+        return original.handle_request(request)
 
     monkeypatch.setattr(f.adapter.data.client, "_transport", httpx.MockTransport(handler))
 
 
-def chain(f):
+def chain(f, as_of=None):
+    now = as_of or datetime.now(timezone.utc)
+    start = (now - timedelta(days=60)).replace(hour=0, minute=0, second=0, microsecond=0)
     return (
-        task("calendar", "alpaca_calendar", {"start": "2024-02-01", "end": "2024-03-11"}),
+        task(
+            "calendar",
+            "alpaca_calendar",
+            {"start": start.date().isoformat(), "end": now.date().isoformat()},
+        ),
         task(
             "bars",
             "alpaca_bars",
             {
-                "start": "2024-02-01T00:00:00+00:00",
-                "end": "2024-03-11T20:00:00+00:00",
+                "start": start.isoformat(),
+                "end": now.isoformat(),
                 "feed": "iex",
-                "symbol_asof": "2024-03-11",
+                "symbol_asof": now.date().isoformat(),
             },
             instrument=f.instrument,
             sources=(ref("calendar_id", "calendar", "operating_calendar"),),
@@ -113,7 +148,7 @@ def test_actual_closed_chain_preserves_clock_and_replays_exact_dependency_receip
     f = equity_capture
     wire_boundary(monkeypatch, f)
     ctx = current_context(f)
-    plan = RefreshPlan(context=ctx, scheduled_for=ctx.as_of, tasks=chain(f))
+    plan = RefreshPlan(context=ctx, scheduled_for=ctx.as_of, tasks=chain(f,ctx.as_of))
     ops = OperationsStore(tmp_path / "operations.db")
     service = RefreshService(ops, f.store, fetcher=refresh._fetch)
     before = len(f.requests)
