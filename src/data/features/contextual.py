@@ -44,7 +44,8 @@ def _at(value, path):
 
 
 def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, context: RunContext,
-                                bindings: tuple[NumericEvidenceBinding, ...]) -> EvidenceFields:
+                                bindings: tuple[NumericEvidenceBinding, ...], *,
+                                allowed_evidence_ids: frozenset[str] | None = None) -> EvidenceFields:
     if index.names != ["datetime", "instrument"] or not index.is_unique:
         raise ValueError("unique datetime/instrument identity required")
     dates = index.get_level_values("datetime")
@@ -67,10 +68,14 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
                 continue
             key = (date, instrument_id)
             query = store.query(as_of=date.to_pydatetime(), kind=binding.kind,
-                                instrument_id=binding.source_instrument_id, current_revisions_only=True)
+                                instrument_id=binding.source_instrument_id, current_revisions_only=False)
+            pinned = [item for item in query.records if allowed_evidence_ids is None or item.record.evidence_id in allowed_evidence_ids]
+            superseded = {item.supersedes_id for item in pinned if item.supersedes_id}
             candidates = []
-            for envelope in query.records:
+            for envelope in pinned:
                 record = envelope.record
+                if record.evidence_id in superseded:
+                    continue
                 payload = store.normalized(record.evidence_id, as_of=date.to_pydatetime())
                 if any(str(payload.get(field)) != value for field, value in binding.filters):
                     continue

@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.core.macro_regime import CausalRegimeResult
 from src.core.model_zoo import ModelWrapper
+from src.data.evidence.store import canonical_bytes
 from src.data.features.dataset import FeatureDataset
 from src.domain.common import Instrument, RunContext
 from src.strategies.specification import StrategySpec, baseline_specs
@@ -27,7 +28,20 @@ class StrategyInputError(ValueError):
 
 
 def require_strategy_eligible(spec: StrategySpec, context: RunContext, *, resolver: Callable | None = None,
-                              approved_baseline_hashes: frozenset[str] = frozenset()):
+                              approved_baseline_hashes: frozenset[str] = frozenset(),
+                              research_registry=None, trial_id: str | None = None):
+    if trial_id is not None:
+        if context.mode != "backtest" or research_registry is None:
+            raise StrategyInputError("registered candidate experiments require an isolated backtest")
+        trial = research_registry.trial(trial_id)
+        candidate = research_registry.candidate(trial.candidate_id)
+        if candidate.kind != "strategy" or candidate.payload_hash != spec.content_hash():
+            raise StrategyInputError("trial candidate differs from executable strategy")
+        if not trial.evaluation_start <= context.as_of < trial.evaluation_end:
+            raise StrategyInputError("candidate execution is outside its preregistered trial")
+        if research_registry.blob(candidate.payload_hash) != canonical_bytes(spec.model_dump(mode="json")):
+            raise StrategyInputError("registered candidate content differs")
+        return "registered_trial:"+trial_id
     shipped = baseline_specs().get(spec.name)
     declared = shipped is not None and spec.origin == "declared_baseline" and shipped.content_hash() == spec.content_hash()
     if declared and (context.mode in ("research", "backtest") or spec.content_hash() in approved_baseline_hashes):
@@ -61,8 +75,10 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
                       last_rebalanced_at=None, force_rebalance: bool = False,
                       consensus: Mapping[str, ConsensusResult] | None = None,
                       resolver: Callable | None = None,
-                      approved_baseline_hashes: frozenset[str] = frozenset()) -> pd.DataFrame:
-    activation = require_strategy_eligible(spec, context, resolver=resolver, approved_baseline_hashes=approved_baseline_hashes)
+                      approved_baseline_hashes: frozenset[str] = frozenset(),
+                      research_registry=None, trial_id: str | None = None) -> pd.DataFrame:
+    activation = require_strategy_eligible(spec, context, resolver=resolver, approved_baseline_hashes=approved_baseline_hashes,
+                                          research_registry=research_registry, trial_id=trial_id)
     parameters = dict(spec.parameters)
     date = pd.Timestamp(signal_at)
     if date.tzinfo is None or date > context.as_of or (pd.Timestamp(context.as_of)-date).total_seconds() > spec.max_signal_age_seconds:

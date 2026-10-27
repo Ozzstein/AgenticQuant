@@ -690,13 +690,16 @@ class CausalHMMRegimeDetector:
 
     def __init__(self, state_path: str | Path, *, normalization_window: int = 252,
                  min_regime_days: int = 5, confidence_threshold: float = 0.6,
-                 n_init: int = 10, n_iter: int = 100):
+                 n_init: int = 10, n_iter: int = 100, risk_weights: dict[str, float] | None = None):
         if normalization_window < 20 or min_regime_days < 1 or not 0 <= confidence_threshold <= 1 or not 1 <= n_init <= 20:
             raise RegimeError("invalid causal HMM configuration")
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.window, self.min_days, self.threshold = normalization_window, min_regime_days, confidence_threshold
         self.n_init, self.n_iter = n_init, n_iter
+        self.risk_weights = dict(_RISK_SCORE_WEIGHTS if risk_weights is None else risk_weights)
+        if not self.risk_weights or set(self.risk_weights)-set(MACRO_SIGNALS) or not any(self.risk_weights.values()) or any(not np.isfinite(w) or abs(w)>10 for w in self.risk_weights.values()):
+            raise RegimeError("invalid exact macro state labeling weights")
         self.model = None
         self.model_hash = None
         self.trained_through = None
@@ -788,7 +791,7 @@ class CausalHMMRegimeDetector:
         if best is None:
             raise RegimeError("all causal HMM fits failed")
         self.model = best
-        risk = sum(best.means_[:, MACRO_SIGNALS.index(key)] * weight for key, weight in _RISK_SCORE_WEIGHTS.items())
+        risk = sum(best.means_[:, MACRO_SIGNALS.index(key)] * weight for key, weight in self.risk_weights.items())
         self.labels = {int(state): label for state, label in zip(np.argsort(risk), ("risk_on", "neutral", "risk_off", "crisis"))}
         self.trained_through, self.fitted_at = raw.index[-1].to_pydatetime(), context.as_of
         self.training_code_version = context.code_version
@@ -798,6 +801,7 @@ class CausalHMMRegimeDetector:
                                                  "transitions": best.transmat_.tolist(), "start": best.startprob_.tolist(),
                                                  "training": self.training_hash, "window": self.window,
                                                  "min_days": self.min_days, "threshold": self.threshold,
+                                                 "risk_weights": self.risk_weights, "n_init": self.n_init, "n_iter": self.n_iter,
                                                  "fitted_at": self.fitted_at.isoformat(), "code_version": context.code_version,
                                                  "implementation": "causal-gaussian-hmm-1"}))
         return self
@@ -899,6 +903,7 @@ class CausalHMMRegimeDetector:
             "environment": {name: importlib.metadata.version(name) for name in ("hmmlearn", "numpy", "pandas", "scipy")},
             "normalization_window": self.window, "minimum_duration": self.min_days,
             "confidence_threshold": self.threshold, "state_labels": self.labels,
+            "risk_weights": self.risk_weights, "n_init": self.n_init, "n_iter": self.n_iter,
         }))
         return path
 
