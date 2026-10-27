@@ -285,7 +285,13 @@ class PortfolioLedger:
             )
             self._journal(account, "cancel:" + intent_id, status, _utc(at), reason, ZERO)
 
-    def apply_fill(self, fill: Fill) -> bool:
+    def apply_fill(self, fill: Fill, *, observed_at: datetime | None = None) -> bool:
+        """Apply an actual execution, optionally received after a newer market mark.
+
+        Operational receipts may arrive late, but cannot reorder recorded money
+        movements or invalidate published NAV. Such conflicts require explicit
+        reconciliation; we never alter actual execution times to make them fit.
+        """
         with self.atomic():
             old = self.db.execute(
                 "SELECT payload FROM fills WHERE account=? AND id=?",
@@ -313,7 +319,34 @@ class PortfolioLedger:
                 and fill.fx_rate != 1
             ):
                 raise LedgerError("base currency fill must have FX rate 1")
-            self._clock(fill.account_id, fill.executed_at)
+            booked_at = fill.executed_at
+            if observed_at is not None:
+                booked_at = _utc(observed_at)
+                if self.spec(fill.account_id).mode == "backtest" or booked_at < fill.executed_at:
+                    raise LedgerError("operational receipt must follow actual execution")
+                latest = self.db.execute(
+                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist') ORDER BY sequence DESC LIMIT 1",
+                    (fill.account_id,),
+                ).fetchone()
+                if latest and datetime.fromisoformat(latest[0]) > fill.executed_at:
+                    raise LedgerError("late execution conflicts with committed economic chronology")
+                published = self.db.execute(
+                    "SELECT at FROM snapshots WHERE account=? AND at>=? LIMIT 1",
+                    (fill.account_id, fill.executed_at.isoformat()),
+                ).fetchone()
+                if published:
+                    raise LedgerError(
+                        "late execution requires explicit published NAV reconciliation"
+                    )
+                self.record_event(
+                    fill.account_id,
+                    "fill-receipt:" + fill.fill_id,
+                    json.dumps(
+                        {"fill_hash": fill.content_hash(), "observed_at": booked_at.isoformat()},
+                        sort_keys=True,
+                    ),
+                )
+            self._clock(fill.account_id, booked_at)
             row = self._account(fill.account_id)
             holding = self.db.execute(
                 "SELECT * FROM holdings WHERE account=? AND instrument=?",

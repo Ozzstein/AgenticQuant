@@ -264,3 +264,144 @@ def test_typed_factory_connects_owned_ledger_risk_and_market_runtime(tmp_path):
     service.adapters["paper"].advance_open(bar(at=order.eligible_at), {A.instrument_id: metadata()})
     assert service.reconcile_all(as_of=order.eligible_at)[0]["state"] == "filled"
     service.ledger.close()
+
+
+def report_for(engine, order, fills, *, at, status="filled", complete=True, evidence="receipt"):
+    return VenueOrderReport(
+        venue="paper",
+        client_order_id=engine.client_id(order.account_id, order.intent_id),
+        venue_order_id="venue-" + order.intent_id,
+        observed_at=at,
+        status=status,
+        cumulative_quantity=sum((f.quantity for f in fills), D(0)),
+        fills=tuple(fills),
+        executions_complete=complete,
+        evidence_id=evidence,
+    )
+
+
+def test_interleaved_actual_fills_after_mark_reconcile_globally_and_restart(tmp_path, monkeypatch):
+    from src.domain.portfolio import PriceMark
+    from tests.test_durable_accounting import fill
+
+    ledger, adapter, engine, order = setup(tmp_path)
+    second = order.model_copy(update={"intent_id": "second", "quantity": D(5)})
+    for current in (order, second):
+        engine.prepare(current, {A.instrument_id: metadata()}, as_of=T)
+    first_at = order.eligible_at
+    observed = first_at + timedelta(seconds=4)
+    first = fill(order, name="first", qty="2", at=first_at)
+    middle = fill(second, name="middle", qty="5", at=first_at + timedelta(seconds=1))
+    last = fill(order, name="last", qty="1", at=first_at + timedelta(seconds=2))
+    reports = {
+        order.intent_id: report_for(engine, order, [first, last], at=observed, status="cancelled"),
+        second.intent_id: report_for(engine, second, [middle], at=observed),
+    }
+    # Price observation may precede knowledge of the actual executions.
+    ledger.mark(order.account_id, [PriceMark(instrument=A, price=90, as_of=observed)])
+    for current in (order, second):
+        engine._status(current.intent_id, "ambiguous")
+    monkeypatch.setattr(adapter, "lookup", lambda intent, *args: reports[intent.intent_id])
+    engine.reconcile_all(as_of=observed)
+    assert [
+        r[0]
+        for r in ledger.db.execute("SELECT id FROM journal WHERE kind='fill' ORDER BY sequence")
+    ] == ["fill:first", "fill:middle", "fill:last"]
+    snap = ledger.snapshot(order.account_id, observed, 86400)
+    assert (snap.cash, snap.nav, snap.positions[0].quantity) == (D(99200), D(99920), D(8))
+    assert snap.positions[0].opened_at == first_at
+    assert snap.reserved_cash == 0
+    assert engine.state(order.intent_id)["state"] == "cancelled"
+    assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()
+    ledger, adapter, engine, order = setup(tmp_path)
+    for key, report in reports.items():
+        engine.ingest(key, report)
+    assert len(ledger.fills(order.account_id)) == 3
+    assert ledger.snapshot(order.account_id, observed, 86400) == snap
+    ledger.close()
+
+
+def test_incomplete_activity_history_never_books_a_guessed_partial_prefix(tmp_path):
+    from tests.test_durable_accounting import fill
+
+    ledger, adapter, engine, order = setup(tmp_path)
+    engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
+    execution = fill(order, name="observed", qty="2")
+    report = report_for(
+        engine, order, [execution], at=execution.executed_at, status="partial", complete=False
+    )
+    engine.ingest(order.intent_id, report)
+    assert not ledger.fills(order.account_id)
+    assert ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+    engine.ingest(
+        order.intent_id,
+        report.model_copy(update={"executions_complete": True, "evidence_id": "complete"}),
+    )
+    assert ledger.quantity(order.account_id, A.instrument_id) == 2
+    assert ledger.order(order.account_id, order.intent_id)["reserved"] == 800
+    ledger.close()
+
+
+@pytest.mark.parametrize("conflict", ["published_nav", "later_fill"])
+def test_late_receipt_cannot_silently_rewrite_committed_economics(tmp_path, conflict):
+    from tests.test_durable_accounting import fill
+
+    ledger, adapter, engine, order = setup(tmp_path)
+    engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
+    execution = fill(order, name="late", qty="2")
+    observed = execution.executed_at + timedelta(seconds=2)
+    if conflict == "published_nav":
+        ledger.snapshot(order.account_id, observed, 86400)
+    else:
+        ledger.apply_fill(fill(order, name="already-booked", qty="1", at=observed))
+    before = ledger.reconcile(order.account_id)
+    report = report_for(engine, order, [execution], at=observed, status="partial")
+    if conflict == "later_fill":
+        report = report.model_copy(update={"cumulative_quantity": D(3)})
+    with pytest.raises(LedgerError, match="NAV reconciliation|economic chronology"):
+        engine.ingest(order.intent_id, report)
+    assert engine.state(order.intent_id)["state"] == "reconciliation_required"
+    assert ledger.reconcile(order.account_id) == before
+    assert (
+        ledger.db.execute("SELECT applied FROM venue_reports WHERE evidence='receipt'").fetchone()[
+            0
+        ]
+        == 0
+    )
+    ledger.close()
+
+
+def test_process_exit_after_durable_receipt_recovers_without_remote_lookup(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    program = """
+import os,sys
+from pathlib import Path
+from tests.test_venue_execution import setup,report_for
+from tests.test_durable_accounting import A,T,metadata,fill
+ledger,adapter,engine,order=setup(Path(sys.argv[1]))
+engine.prepare(order,{A.instrument_id:metadata()},as_of=T)
+execution=fill(order)
+report=report_for(engine,order,[execution],at=execution.executed_at)
+ledger.apply_fill=lambda *args,**kwargs: os._exit(87)
+engine.ingest(order.intent_id,report)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path)],
+        env={**os.environ, "PYTHONPATH": str(Path.cwd()), "PYTHONDONTWRITEBYTECODE": "1"},
+        check=False,
+    )
+    assert completed.returncode == 87
+    ledger, adapter, engine, order = setup(tmp_path)
+    with pytest.raises(LedgerError, match="unapplied venue receipts"):
+        engine.dispatch(order.intent_id, as_of=order.eligible_at)
+    adapter.lookup = lambda *args: pytest.fail("durable terminal receipt needs no remote call")
+    engine.reconcile_all(as_of=order.eligible_at)
+    assert engine.state(order.intent_id)["state"] == "filled"
+    assert len(ledger.fills(order.account_id)) == 1
+    assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()

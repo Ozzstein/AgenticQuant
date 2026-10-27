@@ -197,6 +197,13 @@ class VenueExecution:
             raise LedgerError("intent has no durable venue route")
         return dict(row)
 
+    def _require_applied_receipts(self):
+        if self.ledger.db.execute(
+            "SELECT 1 FROM venue_reports WHERE applied=0 AND rowid IN (SELECT MAX(rowid) FROM venue_reports WHERE account=? GROUP BY intent) LIMIT 1",
+            (self.account_id,),
+        ).fetchone():
+            raise LedgerError("recover durable unapplied venue receipts before new risk")
+
     def prepare_target(self, target, metadata, *, sleeve_book=None):
         """Canonical target sizing/netting into this account's durable outbox.
 
@@ -209,6 +216,7 @@ class VenueExecution:
         target = PortfolioTarget.model_validate(target.model_dump())
         event_id = "venue-target:" + target.target_id
         with self.ledger.atomic():
+            self._require_applied_receipts()
             previous = self.ledger.db.execute(
                 "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, event_id)
             ).fetchone()
@@ -310,6 +318,7 @@ class VenueExecution:
             if existing:
                 self.ledger.submit(intent)  # immutable retry check
                 return self.state(intent.intent_id)
+            self._require_applied_receipts()
             if self.ledger.db.execute(
                 "SELECT 1 FROM venue_outbox WHERE account=? AND state IN ('submitting','ambiguous','cancel_pending','reconciliation_required')",
                 (self.account_id,),
@@ -350,6 +359,7 @@ class VenueExecution:
     def dispatch(self, intent_id: str, *, as_of: datetime):
         as_of = _utc(as_of)
         with self.ledger.atomic():
+            self._require_applied_receipts()
             state = self.state(intent_id)
             intent = self.ledger.order(self.account_id, intent_id)["intent"]
             if state["state"] != "prepared":
@@ -391,6 +401,9 @@ class VenueExecution:
         )
 
     def ingest(self, intent_id: str, report: VenueOrderReport):
+        self.ingest_many([(intent_id, report)])
+
+    def _persist_report(self, intent_id: str, report: VenueOrderReport) -> bool:
         # Persist the receipt before attempting economic application, so even an
         # invalid/out-of-order execution is reviewable and recoverable on restart.
         with self.ledger.atomic():
@@ -409,24 +422,69 @@ class VenueExecution:
                 if VenueOrderReport.model_validate_json(previous["payload"]) != report:
                     raise LedgerError("broker evidence identity reused with different content")
                 if previous["applied"]:
-                    return
+                    return False
             self.ledger.db.execute(
                 "INSERT OR IGNORE INTO venue_reports(account,intent,evidence,payload) VALUES (?,?,?,?)",
                 (self.account_id, intent_id, report.evidence_id, report.model_dump_json()),
             )
+        return True
+
+    def ingest_many(self, reports: list[tuple[str, VenueOrderReport]]):
+        """Persist all receipts, then book globally ordered executions atomically.
+
+        An incomplete activity history reserves the whole remaining order until
+        the adapter supplies complete executions/fees through its cumulative qty.
+        Acknowledgement averages never become fabricated individual executions.
+        """
+        pending = []
+        for intent_id, report in reports:
+            if self._persist_report(intent_id, report):
+                pending.append((intent_id, report))
+        if not pending:
+            return
         try:
             with self.ledger.atomic():
-                self._apply_report(intent_id, report)
-                self.ledger.db.execute(
-                    "UPDATE venue_reports SET applied=1 WHERE account=? AND intent=? AND evidence=?",
-                    (self.account_id, intent_id, report.evidence_id),
-                )
+                executions = []
+                for intent_id, report in pending:
+                    self._validate_report(intent_id, report)
+                    if report.executions_complete:
+                        known = {
+                            f.fill_id: f
+                            for f in self.ledger.fills(self.account_id)
+                            if f.intent_id == intent_id
+                        }
+                        for fill in report.fills:
+                            if fill.fill_id in known and known[fill.fill_id] != fill:
+                                raise LedgerError("venue changed an existing execution")
+                            known[fill.fill_id] = fill
+                        if (
+                            sum((f.quantity for f in known.values()), D(0))
+                            != report.cumulative_quantity
+                        ):
+                            raise LedgerError(
+                                "complete venue report lacks exact execution coverage"
+                            )
+                        executions.extend((fill, report.observed_at) for fill in report.fills)
+                # One receipt clock for the atomic batch; every fill retains its
+                # actual execution timestamp in both the economic journal and payload.
+                observed = max(report.observed_at for _, report in pending)
+                for fill, _ in sorted(
+                    executions, key=lambda pair: (pair[0].executed_at, pair[0].fill_id)
+                ):
+                    self.ledger.apply_fill(fill, observed_at=observed)
+                for intent_id, report in sorted(pending, key=lambda pair: pair[1].observed_at):
+                    self._apply_report(intent_id, report, booked_at=observed)
+                    self.ledger.db.execute(
+                        "UPDATE venue_reports SET applied=1 WHERE account=? AND intent=? AND evidence=?",
+                        (self.account_id, intent_id, report.evidence_id),
+                    )
         except Exception as exc:
             with self.ledger.atomic():
-                self._status(intent_id, "reconciliation_required", type(exc).__name__)
+                for intent_id, _ in pending:
+                    self._status(intent_id, "reconciliation_required", type(exc).__name__)
             raise
 
-    def _apply_report(self, intent_id, report):
+    def _validate_report(self, intent_id, report):
         state = self.state(intent_id)
         intent = self.ledger.order(self.account_id, intent_id)["intent"]
         if (
@@ -434,10 +492,14 @@ class VenueExecution:
             or report.cumulative_quantity > intent.quantity
         ):
             raise LedgerError("broker cumulative execution quantity regressed/exceeded intent")
-        for fill in sorted(report.fills, key=lambda f: (f.executed_at, f.fill_id)):
+        for fill in report.fills:
             if fill.account_id != self.account_id or fill.intent_id != intent_id:
                 raise LedgerError("broker execution account/intent mismatch")
-            self.ledger.apply_fill(fill)
+
+    def _apply_report(self, intent_id, report, *, booked_at):
+        self._validate_report(intent_id, report)
+        state = self.state(intent_id)
+        intent = self.ledger.order(self.account_id, intent_id)["intent"]
         booked = self.ledger.order(self.account_id, intent_id)["filled"]
         complete = report.executions_complete and booked == report.cumulative_quantity
         status = report.status if complete else "reconciliation_required"
@@ -452,7 +514,7 @@ class VenueExecution:
             self.ledger.cancel(
                 self.account_id,
                 intent_id,
-                report.observed_at,
+                booked_at,
                 status,
                 rejected=status == "rejected",
             )
@@ -469,6 +531,19 @@ class VenueExecution:
 
     def reconcile_all(self, *, as_of: datetime) -> list[dict]:
         as_of = _utc(as_of)
+        # Crash recovery uses actual durable receipts before requesting new I/O.
+        # A later successfully applied receipt supersedes an older failed one;
+        # the old immutable content remains retained for review.
+        pending = self.ledger.db.execute(
+            "SELECT intent,payload,applied FROM venue_reports WHERE rowid IN (SELECT MAX(rowid) FROM venue_reports WHERE account=? GROUP BY intent)",
+            (self.account_id,),
+        ).fetchall()
+        recovered = []
+        for row in pending:
+            report = VenueOrderReport.model_validate_json(row["payload"])
+            if not row["applied"] and report.observed_at <= as_of:
+                recovered.append((row["intent"], report))
+        self.ingest_many(recovered)
         rows = self.ledger.db.execute(
             "SELECT intent FROM venue_outbox WHERE account=? AND state NOT IN ('filled','cancelled','expired','rejected','prepared') ORDER BY rowid",
             (self.account_id,),
@@ -492,14 +567,9 @@ class VenueExecution:
                     self._status(
                         row[0], "ambiguous", "lookup unresolved; never safe to blindly resubmit"
                     )
-        # Apply executions by actual chronology across venues/reports.
-        for intent_id, report in sorted(
-            reports,
-            key=lambda pair: min(
-                (f.executed_at for f in pair[1].fills), default=pair[1].observed_at
-            ),
-        ):
-            self.ingest(intent_id, report)
+        # Each report can contain interleaved partial fills. Sort executions,
+        # not reports, and defer terminal cancellations until all fills settle.
+        self.ingest_many(reports)
         return [self.state(row[0]) for row in rows]
 
     def cancel(self, intent_id: str, *, as_of: datetime):
