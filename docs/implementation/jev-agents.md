@@ -161,3 +161,108 @@ role/debate linkage, as-of exclusion, old-memory rejection, corrupted/missing
 source/model/budget/Jev authorities and immutable triggers. History source tests
 loaded the actual data-lane EvidenceStore read-only while every owned module
 resolved from this worktree. Authenticated provider validation remains unverified.
+
+### Grounded research copilot, full papers and development memos (G / H)
+
+`src.research.copilot.ResearchCopilot` is the shared implementation behind the
+rewritten `src.core.factor_proposer.FactorProposer` and
+`src.core.research_analyst.ResearchAnalyst`. Constructor:
+
+```python
+ResearchCopilot(config, *, registry, evidence_store, code_hash,
+                environment_hash, llm_factory=None, limits=None)
+```
+
+`code_hash` and `environment_hash` must identify already archived execution
+artifacts. The generator never guesses a runtime identity from a source file or
+active environment. Provider model IDs, verified pricing and run/day caps come
+from the agreed AgentConfig. Unknown prices/credentials block admission. One
+synchronous operation has a bounded end-to-end deadline, actual async provider
+calls, SDK retries disabled, and durable AgentCallBudget reservations. Restart
+cannot reset request/token/spend totals or change model/pricing/configuration
+under the same run ID. Model mismatch retains the conservative charge and blocks
+further admission for that run; it cannot be priced at the requested model's
+rate. Uncertain usage is never recorded as zero.
+
+Public operations:
+
+- `propose(kind, description, *, context, sources=(), n=1, tested=(),
+  parent_ids=(), allowed_fields=('open','high','low','close','volume'),
+  selected_model='Linear', prior_memo_hash=None) -> ProposalOutcome`.
+- `propose_from_papers(evidence_ids, *, context, kind, description, n=1,
+  tested=(), parent_ids=(), allowed_fields=..., selected_model='Linear')`.
+- `write_memo(*, context, sources=(), development_trial_ids=(),
+  prior_memo_hash=None) -> MemoOutcome`.
+- `load_memo(memo_hash, *, context) -> MemoDocument`, requiring actual recorded
+  memo generation, settled budget identity, archived provider response, exact
+  source quotations and publication before the supplied cutoff.
+
+`kind` supports factor, model, strategy, regime and semantic_question. Factor and
+model payload bytes are the exact canonical `{features, model_name,
+model_parameters}` consumed by root ExperimentPlan, with FeatureSpec JSON,
+selected concrete family and bounded scalar parameters. Ensemble has an empty
+parameter object and uses the pinned four-family recipe. The data-owned bounded
+AST validator rejects arbitrary Python, unknown inputs, future shifts, centered
+windows and oversized expressions/windows without synthetic market inputs.
+Strategy payload is the actual complete StrategySpec with research_candidate
+origin. Regime payload is the actual data-owned HMMVariantSpec; it cannot replace
+the HMM with text labels. Semantic payload is a versioned TextFeatureDefinition
+with separate availability Choice and Score/Noul question. No payload contains
+self-reported validation, performance, promotion or executable Python.
+
+Sources are exact DecisionSource records checked against EvidenceStore's full
+documents and raw blobs. Full paper processing reads every bounded chunk before
+synthesis, archives all reads, retains source offsets, remaps exact quote spans
+for synthesis, and reports paper_chunks_total/read. It does not silently truncate
+papers. A missing/failed chunk prevents any candidate from being quarantined.
+Paper ingestion/extraction and provider retrieval remain data-owned; this API
+accepts immutable document IDs already ingested there.
+
+Every request, complete prompt/schema, parsed response, actual provider usage,
+pricing and GenerationObservation is archived as immutable registry blobs. A
+ProposalReceipt identifies candidate/hash, exact payload/hash, rationale,
+citations and provenance hash. ProposalOutcome explicitly reports available,
+abstained, unavailable or partial quarantine storage. Successful candidates are
+quarantined only; no trial registration, evaluation, holdout reading, activation
+or execution method is called. There are no random/template/keyword candidates
+or static success memos on errors.
+
+Memo evidence may include exact sources and explicitly named recorded
+**development** trial IDs. Registry.development_evaluation is the only outcome
+reader. Unknown, future, synthetic or held-out outcomes are refused before a
+provider call; recorded failed development trials remain usable as negative
+findings. Memo hypotheses are labeled unvalidated. Memo availability is actual
+generation time, so reuse must use a later eligible context/run; old-text
+interpretation is never backdated. Arbitrarily archived memo-shaped JSON does
+not establish generation provenance.
+
+Core wrapper migration is intentional: old methods returning lists of legacy
+FactorCandidate/Strategy/model dictionaries, string memos, mutable knowledge-base
+text, keyword paper guesses or retry wrappers are gone. Root owns migration of
+`tests/test_rd_agent.py` and canonical research CLI/orchestrator callers. New
+wrappers require explicit context, source documents, registry and pinned execution
+identities; they return the shared typed outcomes above. No shared config/schema
+or dependency edit is needed.
+
+Test integration uses actual root registry cbbfe14 and shared config/schemas,
+data expression contract 553114f and actual EvidenceStore, StrategySpec and market
+contracts loaded read-only. Regime tests load the actual
+HMMVariantSpec from data checkpoint d3724f1; that exact module must be integrated
+before regime proposal runtime is available. Owned modules always use
+this worktree on PYTHONPATH. No sibling checkout, shared virtual environment or
+root-owned file was changed.
+
+Verification: **303 passed in 46.49s** across the entire owned agent/decision/
+gateway/history/copilot suite plus both data contract tests, with actual shared
+configuration/schema from cbbfe14. Final targeted verification after complete
+prompt archival and malformed-metadata hardening: **111 passed in 18.82s**
+(53 copilot cases + 58 gateway cases), using registry cbbfe14 and HMM module/
+variant d3724f1 extracted read-only into isolated test scratch. Network sockets
+were disabled, Unix sockets allowed only for async/HTTP framing tests. Ruff and
+`git diff --check` passed. New cases cover all five payload kinds, exact model
+parameters, quoted/full paper coverage, negative development findings, holdout/
+future/synthetic exclusion, unknown sources/pricing, durable resumed caps,
+config/model mismatch, source instructions/conflicts, output/usage bounds,
+malformed usage metadata, no false success, immutable memo history and actual
+core entry points. This is offline implementation verification, not authenticated
+provider accuracy/cost acceptance or full-system performance validation.

@@ -66,10 +66,10 @@ class AgentCallBudget:
         with sqlite3.connect(self.path, timeout=10) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute(
-                "SELECT 1 FROM calls WHERE run_id=? AND status='usage_overrun' LIMIT 1",
+                "SELECT 1 FROM calls WHERE run_id=? AND status IN ('usage_overrun','model_mismatch') LIMIT 1",
                 (self.run_id,),
             ).fetchone():
-                raise AgentBudgetError("prior provider usage exceeded reservation")
+                raise AgentBudgetError("prior provider usage or model identity violated admission")
             for column, value, requests, token_limit, cost_limit in (
                 (
                     "run_id",
@@ -124,9 +124,16 @@ class AgentCallBudget:
     def finish(self, identity, price, *, raw=None, status="failed", elapsed_ms=0):
         usage = getattr(raw, "usage_metadata", None) or {}
         metadata = getattr(raw, "response_metadata", None) or {}
+        usage = usage if isinstance(usage, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
         actual = metadata.get("model_name") or metadata.get("model")
+        actual = actual if isinstance(actual, str) and len(actual) <= 160 else None
         input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
         known = all(type(v) is int and 0 <= v < 2**62 for v in (input_tokens, output_tokens))
+        if raw is not None and actual != price.model:
+            # The pinned rate cannot price a different or unidentified model.
+            known = False
+            status = "model_mismatch"
         with sqlite3.connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
             reserved = db.execute(
