@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal
 
 import numpy as np
@@ -102,7 +103,14 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
                     # dates merely because current fitting was authorized.
                     continue
                 if record.evidence_id not in normalized:
-                    normalized[record.evidence_id] = store.normalized(record.evidence_id,as_of=cutoff)
+                    if record.provider == 'coingecko' and record.provider_version == 'native-crypto-context-2' and envelope.kind == 'btc_dominance':
+                        from src.data.adapters.coingecko_context import verify_dominance_record
+                        normalized[record.evidence_id] = verify_dominance_record(store,record.evidence_id,as_of=cutoff)
+                    elif record.provider.startswith('ccxt:') and record.provider_version.endswith(':native-crypto-context-2') and envelope.kind in ('funding','open_interest'):
+                        from src.data.adapters.crypto_context import verify_derivative_record
+                        normalized[record.evidence_id] = verify_derivative_record(store,record.evidence_id,as_of=cutoff)
+                    else:
+                        normalized[record.evidence_id] = store.normalized(record.evidence_id,as_of=cutoff)
                 payload = normalized[record.evidence_id]
                 if any(str(payload.get(field)) != value for field, value in binding.filters):
                     continue
@@ -116,23 +124,24 @@ def materialize_evidence_fields(store: EvidenceStore, index: pd.MultiIndex, cont
                         # Event date is never a publication/availability assertion.
                         if observed.tzinfo is None:
                             observed = observed.tz_localize("UTC")
-                        number = float(_at(payload, binding.value_path))
-                    except (KeyError, IndexError, TypeError, ValueError):
+                        exact = Decimal(str(_at(payload, binding.value_path)))
+                        number = float(exact)
+                    except (KeyError, IndexError, TypeError, ValueError, ArithmeticError):
                         raise ValueError(f"malformed numeric evidence for {binding.name}: {record.evidence_id}") from None
                     if not np.isfinite(number):
                         raise ValueError(f"nonfinite numeric evidence: {record.evidence_id}")
-                    parsed[record.evidence_id] = (observed,number)
-                observed,number = parsed[record.evidence_id]
+                    parsed[record.evidence_id] = (observed,number,exact)
+                observed,number,exact = parsed[record.evidence_id]
                 if observed > date or (date-observed).total_seconds() > binding.max_age_seconds:
                     continue
-                candidates.append((observed, number, record))
+                candidates.append((observed, number, record, exact))
             if not candidates:
                 complete.loc[key] = False
                 coverage.append((date.isoformat(), instrument_id, binding.name, "missing_or_ineligible"))
                 continue
             latest = max(c[0] for c in candidates)
             selected = [c for c in candidates if c[0] == latest]
-            if len({c[1] for c in selected}) > 1:
+            if len({c[3] for c in selected}) > 1:
                 complete.loc[key] = False
                 coverage.append((date.isoformat(), instrument_id, binding.name, "conflicting"))
                 continue

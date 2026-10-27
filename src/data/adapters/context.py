@@ -44,18 +44,35 @@ class FinnhubAdapter(ContextAdapter):
 
 
 class CoinGeckoAdapter(ContextAdapter):
-    def __init__(self, store: EvidenceStore, *, http: ReadHTTP | None = None):
-        super().__init__(store, "coingecko", http or ReadHTTP("coingecko", "https://api.coingecko.com/api/v3"))
+    def __init__(self, store: EvidenceStore, *, http: ReadHTTP | None = None,
+                 api_key: str | None = None, tier: str = "demo", clock=None):
+        from src.data.adapters.coingecko_context import ORIGINS
+        if tier not in ORIGINS:
+            raise ProviderError("coingecko", "explicit_demo_or_pro_tier_required")
+        super().__init__(store, "coingecko", http or ReadHTTP("coingecko", ORIGINS[tier]))
+        self.tier, self.clock = tier, clock
+        self._cg_headers = {"x-cg-pro-api-key" if tier == "pro" else "x-cg-demo-api-key": api_key} if api_key else {}
+
+    def current_dominance(self, context: RunContext) -> FetchResult:
+        """Native dated BTC percentage, with measured capture availability."""
+        from src.data.adapters.coingecko_context import current_dominance
+        return current_dominance(self, context)
+
+    def dominance_history(self, context: RunContext, *, days: str = "30") -> FetchResult:
+        """Pro global/BTC caps joined only at equal native timestamps."""
+        from src.data.adapters.coingecko_context import dominance_history
+        return dominance_history(self, context, days=days)
 
     def global_context(self, context: RunContext, *, ingested_at: datetime) -> FetchResult:
-        return self.capture("/global", context, ingested_at=ingested_at, capability="crypto_global")
+        return self.capture("/global", context, ingested_at=ingested_at, capability="crypto_global",
+                            headers=self._cg_headers)
 
     def token(self, coin_id: str, instrument: Instrument, context: RunContext, *, ingested_at: datetime) -> FetchResult:
         if not re.fullmatch(r"[a-z0-9-]+", coin_id):
             raise ProviderError("coingecko", "invalid_canonical_coin_id")
         return self.capture(f"/coins/{coin_id}", context, ingested_at=ingested_at,
                             capability="token_context", instrument=instrument,
-                            params={"localization": "false", "tickers": "false"})
+                            params={"localization": "false", "tickers": "false"}, headers=self._cg_headers)
 
 
 class SECAdapter(ContextAdapter):
