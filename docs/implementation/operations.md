@@ -128,3 +128,29 @@ artifact tests passed in 22.14 seconds. These include settlement evidence before
 session close, exact receipt/price/quantity/FX tampering, unrelated price-envelope
 rejection, restart and shared opening-capacity conservation. The full mixed
 operating cycle and external source acceptance are separate requirements.
+
+## Source identity across opening-format upgrades
+
+`prepare_opening_source(store, venue, event, receipt, as_of=...)` authenticates
+both the current event and every unmapped historical receipt for that instrument
+against complete archived native provider responses. Provider, stable instrument,
+native trade ID and exact UTC nanoseconds identify the print independently of
+wire version or feed alias. The helper checks the original receipt's entire
+opening economics and archive clocks before binding any migration, and commits
+all prior mappings atomically. An unprovable old receipt blocks migration.
+
+Pass the returned identity to `PaperVenue.settle_open(source_identity=...)`.
+The venue decides whether the print is already consumed; aliases may add their
+own documentary receipt after a published NAV but cannot add fills, marks or
+liquidity. No identity is inferred from matching prices or rounded event times.
+H's old-anchor branch must use this path rather than silently dropping a new ID.
+The direct engine also rejects omission of identity once source-bound history
+exists. Legacy records without preserved raw print membership cannot be upgraded
+by supplying a guessed tuple.
+
+Verification: 29 offline source-identity tests were exercised; the two final
+root migration regressions passed in 1.31 seconds after correcting test API
+arguments. They use actual adapter parsing over synthetic provider wires, a
+seven-unit partial fill, a v1/v2 alias after published NAV, restart, exact retained
+remaining quantity, and price/hash substitution failures before mapping writes.
+No authenticated provider acceptance is implied.

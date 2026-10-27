@@ -17,6 +17,61 @@ from src.research.evidence import (
 from src.research.registry import RegistryError, content_hash
 
 
+def prepare_opening_source(store, venue, event, receipt, *, as_of):
+    """Authenticate native print identity and migrate only proven old receipts.
+
+    Every source and economic payload is checked before committing any mapping.
+    The venue retains sole authority over consumption, acceptance and aliases.
+    """
+    from src.data.opening_identity import verified_opening_source_identity
+    from src.domain.common import _utc
+    from src.domain.portfolio import ExecutionBar, OpeningEvent
+
+    as_of = _utc(as_of)
+    event = OpeningEvent.from_bar(event) if isinstance(event, ExecutionBar) else OpeningEvent.model_validate(event.model_dump())
+
+    def authenticated(document, *, expected=None):
+        if document.available_at > as_of:
+            raise RegistryError('opening source receipt exceeds migration cutoff')
+        envelope = store.get(document.evidence_id, as_of=as_of)
+        if (document.evidence_hash != envelope.content_hash()
+                or document.observed_at != envelope.record.ingested_at
+                or document.available_at != envelope.record.available_at):
+            raise RegistryError('opening source migration receipt differs from original archive')
+        identity = verified_opening_source_identity(store, document.evidence_id,
+                                                     document.event_id, as_of=as_of)
+        payload = store.normalized(document.evidence_id, as_of=as_of)
+        legacy = envelope.record.provider_version == 'operating-wire-1'
+        rows = payload['execution_bars' if legacy else 'opening_events']
+        rows = [row for row in rows if row['event_id'] == document.event_id]
+        if len(rows) != 1:
+            raise RegistryError('opening receipt lacks its exact archived event')
+        actual = (ExecutionBar if legacy else OpeningEvent).model_validate(rows[0])
+        opening = OpeningEvent.from_bar(actual) if legacy else actual
+        if expected is not None and opening != expected:
+            raise RegistryError('opening event differs from authenticated native print economics')
+        if hasattr(document, 'event_hash') and (
+                document.event_hash not in (actual.content_hash(), opening.content_hash())
+                or document.occurred_at != opening.opened_at):
+            raise RegistryError('committed opening receipt differs from original source economics')
+        if opening.instrument != event.instrument:
+            raise RegistryError('opening migration refers to another instrument')
+        return identity
+
+    if receipt.event_id != event.event_id:
+        raise RegistryError('current opening source receipt identifies another event')
+    identity = authenticated(receipt, expected=event)
+    previous = venue.unbound_opening_receipts(event.instrument)
+    proven = [(old, authenticated(old)) for old in previous]
+    with venue.ledger.atomic():
+        if venue.unbound_opening_receipts(event.instrument) != previous:
+            raise RegistryError('opening receipts changed during source migration')
+        for old, native in proven:
+            venue.bind_opening_source(native, event_id=old.event_id,
+                                      evidence_id=old.evidence_id, evidence_hash=old.evidence_hash)
+    return identity
+
+
 def _source(store,source):
     envelope=store.get(source.evidence_id,as_of=source.available_at)
     if content_hash(store.raw(source.evidence_id))!=envelope.record.raw_hash:
