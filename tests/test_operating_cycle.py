@@ -483,6 +483,12 @@ def runtime(archive, tmp_path_factory):
             data_snapshot_hash="0" * 64,
             training_frame_hash="0" * 64,
             training_snapshot=train,
+            training_numeric_sources=tuple(
+                s
+                for s in archive.numeric
+                if archive.store.get(s.evidence_id, as_of=archive.dates[-1]).record.available_at
+                <= train.context.as_of
+            ),
             training_universe=training_universe,
             training_universe_sources=(
                 SourceBinding(
@@ -1022,10 +1028,12 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
         scheduled_for=at,
         economic_sources=tuple(sources),
         macro_dataset=plan.macro_dataset,
+        contextual_sources=plan.numeric_sources,
     )
     assert prepared.inputs.context.as_of == at
     assert prepared.inputs.context.run_id == context.run_id
     assert prepared.models == plan.models  # Training identity is never restamped.
+    assert prepared.numeric_sources == plan.numeric_sources
     assert prepared.inputs.snapshot.content_hash() == market.content_hash()
     assert prepared.inputs.snapshot.content_hash() != plan.inputs.snapshot.content_hash()
     assert all(r.observed_at == at == r.available_at for r in prepared.inputs.receipts)
@@ -1046,6 +1054,28 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
             scheduled_for=at,
             economic_sources=tuple(sources[:-1]),
             macro_dataset=plan.macro_dataset,
+            contextual_sources=plan.numeric_sources,
+        )
+    with pytest.raises(ValueError, match="explicit contextual source whitelist"):
+        service.prepare(
+            template,
+            refresh_run_id=requested.run_id,
+            run_id="missing-contextual",
+            scheduled_for=at,
+            economic_sources=tuple(sources),
+            macro_dataset=plan.macro_dataset,
+        )
+    with pytest.raises(ValueError, match="frozen evidence envelope"):
+        service.prepare(
+            template,
+            refresh_run_id=requested.run_id,
+            run_id="corrupt-contextual",
+            scheduled_for=at,
+            economic_sources=tuple(sources),
+            macro_dataset=plan.macro_dataset,
+            contextual_sources=(
+                plan.numeric_sources[0].model_copy(update={"envelope_hash": "0" * 64}),
+            ),
         )
 
 
@@ -1555,3 +1585,48 @@ def test_partial_resume_rechecks_freshness_before_any_mutation_but_completed_rep
     )
     assert len(runtime.calls) == calls
     assert runtime.service.run(plan, now=late) == result
+
+
+def test_training_whitelist_is_independent_of_current_sources_and_cannot_discover_ambient_data(
+    runtime,
+):
+    from src.operations.cycle import contextual_fields
+
+    plan = runtime.plan()
+    spec = next(s for s in plan.strategies if s.model_name and contextual_fields(s))
+    recipe = next(r for r in plan.models if r.strategy == spec.name)
+    subset = plan.model_copy(update={"strategies": (spec,), "models": (recipe,)})
+    corrupted_current = (plan.numeric_sources[0].model_copy(update={"envelope_hash": "0" * 64}),)
+    changed = subset.model_copy(update={"numeric_sources": corrupted_current})
+    original = runtime.service.materialize_features(changed, training=True)[spec.name]
+    assert original.snapshot_hash == recipe.data_snapshot_hash
+    assert training_frame_hash(original, recipe.fitted_at) == recipe.training_frame_hash
+    empty_current = subset.model_copy(update={"numeric_sources": ()})
+    with pytest.raises(ValueError, match="explicit frozen training/current"):
+        runtime.service.materialize_features(empty_current)
+    empty_train = recipe.model_copy(update={"training_numeric_sources": ()})
+    with pytest.raises(ValueError, match="explicit frozen training/current"):
+        runtime.service.materialize_features(
+            subset.model_copy(update={"models": (empty_train,)}), training=True
+        )
+    damaged = recipe.model_copy(
+        update={
+            "training_numeric_sources": (
+                recipe.training_numeric_sources[0].model_copy(update={"envelope_hash": "0" * 64}),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="frozen evidence envelope"):
+        runtime.service.materialize_features(
+            subset.model_copy(update={"models": (damaged,)}), training=True
+        )
+    bar_spec = next(s for s in plan.strategies if s.model_name and not contextual_fields(s))
+    bar_recipe = next(r for r in plan.models if r.strategy == bar_spec.name).model_copy(
+        update={"training_numeric_sources": ()}
+    )
+    bars_only = plan.model_copy(
+        update={"strategies": (bar_spec,), "models": (bar_recipe,), "numeric_sources": ()}
+    )
+    data = runtime.service.materialize_features(bars_only, training=True)[bar_spec.name]
+    assert data.snapshot_hash == bar_recipe.data_snapshot_hash
+    assert training_frame_hash(data, bar_recipe.fitted_at) == bar_recipe.training_frame_hash

@@ -134,6 +134,7 @@ class ModelRecipe(VersionedContract):
     training_snapshot: MarketSnapshot
     training_universe: UniverseEligibility
     training_universe_sources: tuple[SourceBinding, ...] = Field(min_length=1)
+    training_numeric_sources: tuple[FrozenEvidence, ...] = ()
     training_universe_policy: Literal["eligible-at-fit-1"] = "eligible-at-fit-1"
     fitted_at: UtcTimestamp
     label_horizon: int = Field(default=1, ge=1, le=252)
@@ -145,6 +146,10 @@ class ModelRecipe(VersionedContract):
     def parameters_unique(self):
         if len(dict(self.parameters)) != len(self.parameters):
             raise ValueError("duplicate estimator parameter")
+        if len({s.evidence_id for s in self.training_numeric_sources}) != len(
+            self.training_numeric_sources
+        ):
+            raise ValueError("duplicate frozen training numeric source")
         if self.training_snapshot.context.as_of > self.fitted_at:
             raise ValueError("training source cutoff exceeds the approved fit cutoff")
         if (

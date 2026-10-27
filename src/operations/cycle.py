@@ -101,6 +101,41 @@ def training_frame_hash(dataset: FeatureDataset, fitted_at) -> str:
     )
 
 
+def contextual_fields(spec):
+    """External numeric inputs required by exact bounded feature expressions."""
+    required = set().union(*(set(f.required_fields) for f in spec.features))
+    for feature in spec.features:
+        tree = ast.parse(
+            re.sub(r"\$([A-Za-z][A-Za-z0-9_]*)", r"\1", feature.expression), mode="eval"
+        )
+        calls = {
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        required |= (
+            {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            - calls
+            - {"np", "numpy", "df"}
+        )
+        required |= {
+            str(n.slice.value)
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+        }
+    required -= {
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "vwap",
+        "market_type",
+        "available_at",
+    }
+    return required
+
+
 def _frame(frame):
     # Missing scores are explicitly null, never a neutral score or a zero.
     return {
@@ -216,6 +251,7 @@ class PaperCycleService:
         scheduled_for,
         economic_sources,
         macro_dataset,
+        contextual_sources: tuple[FrozenEvidence, ...] = (),
     ) -> PaperCyclePlan:
         """Build a current plan from an authoritative refresh and archived arrays.
 
@@ -329,18 +365,10 @@ class PaperCycleService:
             )
             refs.append((names[kind], self.registry.archive_contract(bound)))
         self._verify_inputs(inputs, dict(refs), sources["venue_rules"])
-        numeric = {}
-        for binding in template.numeric_bindings:
-            query = self.evidence.query(
-                as_of=completed,
-                kind=binding.kind,
-                instrument_id=binding.source_instrument_id,
-                current_revisions_only=False,
-            )
-            for envelope in query.records:
-                numeric[envelope.record.evidence_id] = FrozenEvidence(
-                    evidence_id=envelope.record.evidence_id, envelope_hash=envelope.content_hash()
-                )
+        numeric = tuple(FrozenEvidence.model_validate(v) for v in contextual_sources)
+        if any(contextual_fields(spec) for spec in template.strategies) and not numeric:
+            raise ValueError("explicit contextual source whitelist required; no ambient discovery")
+        verify_frozen_evidence(self.evidence, numeric, as_of=completed)
         documents = set()
         for instrument in template.instruments:
             for kind in sorted(set().union(*ROLE_KINDS.values())):
@@ -361,7 +389,7 @@ class PaperCycleService:
             macro_recipe=template.macro_recipe,
             macro_dataset=macro_dataset,
             numeric_bindings=template.numeric_bindings,
-            numeric_sources=tuple(numeric[k] for k in sorted(numeric)),
+            numeric_sources=numeric,
             allocation=template.allocation,
             desk_evidence_ids=tuple(sorted(documents)),
             max_source_chars=template.max_source_chars,
@@ -386,10 +414,7 @@ class PaperCycleService:
         self, plan: PaperCyclePlan, *, training=False
     ) -> dict[str, FeatureDataset]:
         """Public deterministic preparation API for exact recipe/frame approvals."""
-        records = verify_frozen_evidence(
-            self.evidence, plan.numeric_sources, as_of=plan.inputs.context.as_of
-        )
-        reads = _FeatureReads(self.evidence, records)
+        read_caches = {}
         result = {}
         recipes = {r.strategy: r for r in plan.models}
         for spec in plan.strategies:
@@ -409,36 +434,29 @@ class PaperCycleService:
                 sorted((b.closed_at, b.instrument.instrument_id) for b in bars),
                 names=["datetime", "instrument"],
             )
-            required = set().union(*(set(f.required_fields) for f in spec.features))
-            for feature in spec.features:
-                tree = ast.parse(
-                    re.sub(r"\$([A-Za-z][A-Za-z0-9_]*)", r"\1", feature.expression), mode="eval"
+            required = contextual_fields(spec)
+            pinned_sources = (
+                recipes[spec.name].training_numeric_sources if training else plan.numeric_sources
+            )
+            source_context = (
+                source.context.model_copy(update={"as_of": recipes[spec.name].fitted_at})
+                if training
+                else plan.inputs.context
+            )
+            if required and not pinned_sources:
+                raise ValueError("explicit frozen training/current numeric sources required")
+            cache_key = (
+                source_context.as_of,
+                tuple((s.evidence_id, s.envelope_hash) for s in pinned_sources),
+            )
+            if cache_key not in read_caches:
+                read_caches[cache_key] = _FeatureReads(
+                    self.evidence,
+                    verify_frozen_evidence(
+                        self.evidence, pinned_sources, as_of=source_context.as_of
+                    ),
                 )
-                calls = {
-                    n.func.id
-                    for n in ast.walk(tree)
-                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                }
-                required |= (
-                    {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-                    - calls
-                    - {"np", "numpy", "df"}
-                )
-                required |= {
-                    str(n.slice.value)
-                    for n in ast.walk(tree)
-                    if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
-                }
-            required -= {
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "vwap",
-                "market_type",
-                "available_at",
-            }
+            reads = read_caches[cache_key]
             bindings = tuple(
                 b
                 for b in plan.numeric_bindings
@@ -449,9 +467,9 @@ class PaperCycleService:
                 materialize_evidence_fields(
                     reads,
                     index,
-                    source.context,
+                    source_context,
                     bindings,
-                    allowed_evidence_ids=frozenset(s.evidence_id for s in plan.numeric_sources),
+                    allowed_evidence_ids=frozenset(s.evidence_id for s in pinned_sources),
                     availability_policy=(
                         recipes[spec.name].training_availability_policy
                         if training
