@@ -83,7 +83,9 @@ def _source(store,source):
     return envelope,value if isinstance(value,list) else [value]
 
 
-def verify_paper_provenance(registry,store:EvidenceStore,inputs,references,*,receipts,rule_sources=()):
+def verify_paper_provenance(registry,store:EvidenceStore,inputs,references,*,receipts,rule_sources=(),
+                            income_policy=None,required_started_at=None,required_ended_at=None,
+                            income_authorities=()):
     if inputs.context.mode!='paper' or inputs.account.mode!='paper' or inputs.context.account_id!=inputs.account.account_id:
         raise RegistryError('observed receipt settlement requires the matching explicit paper account')
     if inputs.snapshot.context.as_of>inputs.context.as_of:
@@ -160,4 +162,11 @@ def verify_paper_provenance(registry,store:EvidenceStore,inputs,references,*,rec
         values.extend(rows)
     if not rule_sources or values!=[r.model_dump(mode='json') for r in inputs.rules]:
         raise RegistryError('paper venue rules do not match exact source bindings')
+    if getattr(inputs, 'income_policy', None) is not None or income_policy is not None:
+        from src.operations.income import verify_income_provenance
+        checked.update(verify_income_provenance(registry,store,inputs,references,
+            income_policy=income_policy,required_started_at=required_started_at,
+            required_ended_at=required_ended_at,income_authorities=income_authorities))
+    elif income_authorities or required_started_at is not None or required_ended_at is not None:
+        raise RegistryError('income authority/window requires an explicit income policy')
     return checked

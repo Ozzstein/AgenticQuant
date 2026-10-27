@@ -48,6 +48,51 @@ Offline tests cover real SQLite/restart receipts, actual FMP adapter parsing wit
 an HTTP boundary fixture, measured availability, durable caps, generic MCP
 permissions, actual process termination and missing credential redaction.
 
+## Income source admission
+
+Operating refresh permits two additional closed GET operations:
+`alpaca_cash_dividend_sources` and `alpaca_account_dividend_sources`. Both require
+an explicit instrument and `started_at`/`ended_at`; the account operation also
+requires the exact canonical account and provider account UUID. Request budgets,
+worker deadlines, actual capture clocks and immutable raw bytes apply unchanged.
+The final `economic_bundle` may take explicit `income_ids` from preceding task
+receipts. It appends the five canonical income source arrays, including sourced
+empty arrays, and the completed-refresh reader independently reparses them.
+
+`verify_paper_provenance` accepts `income_policy`, `required_started_at`,
+`required_ended_at`, and `income_authorities`. The cycle owns the required interval
+from the previous committed account anchor (or account opening) through the actual
+cutoff. Income-aware inputs bind `cash_dividends`, `dividend_payments`,
+`dividend_distributions`, `action_coverage`, and `paper_dividend_policies` with
+same-named `_id` artifact references. Each source pointer names its exact array.
+
+`src.operations.income` uses a closed native parser allowlist. It rejects arbitrary
+normalized authority claims, altered arrays, account/scope substitutions, future
+availability and gaps in the required interval. Alpaca's process-date corporate
+actions and creation-date activities currently establish observations and unknown
+coverage only. Neither payable dates nor net dividend activities authorize an
+inferred payment, zero deductions, or complete effective-event coverage. This
+path intentionally blocks fresh income-aware cycles with only those sources.
+Legacy immutable completed receipts remain distinct from new admissions.
+
+Positive income source acceptance remains unfinished. The source review considered
+[IBKR accruals](https://www.ibkrguides.com/reportingreference/reportguide/change%20in%20dividend%20accrualsfq.htm)
+and [Statement of Funds](https://www.ibkrguides.com/reportingreference/reportguide/statement%20of%20fundsfq.htm):
+an accrual reversal can mean correction, cancellation or payout, and a cash ledger
+alone does not establish exact action/component linkage. DTCC's
+[published message specifications](https://www.dtcc.com/products-and-services/asset-services/corporate-actions-processing/ca-documentation)
+are a candidate for event/payment authority; no DTCC parser, stream completeness,
+subscription access or account-level deduction applicability is claimed. An XML
+message name or a fabricated fixture is not sufficient evidence. A supported
+positive wire parser and its coverage authority must land before this gate opens.
+
+Verification: 36 offline tests passed in 5.48 seconds across root income proof,
+actual native adapter parsing, bounded operating refresh, source artifacts and
+opening migration. HTTP wires are synthetic; no source verifier is replaced.
+Tests prove rejection of unsupported income authority, not positive income-window
+acceptance. Separately, 13 source/ledger checks passed in 1.69 seconds including
+the sleeve-publication fence preventing retroactive dividend mutations.
+
 Operational opening prints use `verify_paper_provenance(..., receipts=inputs.receipts,
 rule_sources=plan.rule_sources)`. Exact source envelopes bind actual archive
 observation/availability clocks and opening quantities. Only this paper-only path

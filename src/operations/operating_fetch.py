@@ -72,15 +72,28 @@ def load_operating_sources(operations, store, refresh_run_id):
         (kind, tuple(SourceBinding.model_validate(v) for v in sources))
         for kind, sources in value["economic_sources"]
     )
-    versions={tuple('opening_events' if k=='execution_bars' else k for k in KINDS),
-              tuple('execution_bars' if k=='opening_events' else k for k in KINDS)}
-    if tuple(kind for kind, _ in bindings) not in versions or any(not sources for _, sources in bindings):
+    from src.operations.income import INCOME_KINDS, _parsed_capture
+
+    versions = {
+        tuple("opening_events" if k == "execution_bars" else k for k in KINDS),
+        tuple("execution_bars" if k == "opening_events" else k for k in KINDS),
+    }
+    versions |= {(*version, *INCOME_KINDS) for version in tuple(versions)}
+    if tuple(kind for kind, _ in bindings) not in versions or any(
+        not sources for _, sources in bindings
+    ):
         raise OperationError("economic bundle source kinds or coverage differ")
-    for _, sources in bindings:
+    for kind, sources in bindings:
         for source in sources:
             if source.available_at > envelope.record.available_at:
                 raise OperationError("economic source was unavailable at bundle capture")
             store.get(source.evidence_id, as_of=source.available_at)
+            if kind in INCOME_KINDS:
+                if source.pointer != "/" + kind:
+                    raise OperationError("income bundle requires the exact parsed canonical array")
+                actual, _ = _parsed_capture(store, source.evidence_id, as_of=context.as_of)
+                if actual.record.available_at != source.available_at:
+                    raise OperationError("income bundle source eligibility differs")
     return bindings
 
 
@@ -91,6 +104,14 @@ OPERATIONS = {
     "alpaca_trades": ("start", "end", "calendar_id", "feed", "symbol_asof", "max_pages"),
     "alpaca_reference": ("asset_id", "bar_ids", "calendar_id"),
     "alpaca_corporate_actions": ("start", "end", "calendar_id", "max_pages"),
+    "alpaca_cash_dividend_sources": ("started_at", "ended_at", "max_pages"),
+    "alpaca_account_dividend_sources": (
+        "started_at",
+        "ended_at",
+        "max_pages",
+        "account_id",
+        "provider_account_id",
+    ),
     "kraken_bars": ("market_id", "start", "end"),
     "kraken_reference": ("market_id", "bar_ids", "fx_evidence_id"),
     "kraken_trades": ("market_id", "start", "end", "calendar_id", "max_pages", "fx_evidence_id"),
@@ -108,6 +129,7 @@ OPERATIONS = {
         "calendar_ids",
         "print_ids",
         "action_ids",
+        "income_ids",
     ),
 }
 
@@ -165,6 +187,7 @@ def fetch_operating(task, context, store):
             if operation == "current_universe":
                 result = capture.current_universe(instruments, context, **arguments)
             else:
+                income_ids = arguments.pop("income_ids", None)
                 cutoff = capture.now()
                 snapshot = EvidenceService(store).market_snapshot(
                     instruments,
@@ -173,6 +196,32 @@ def fetch_operating(task, context, store):
                     price_basis="raw",
                 )
                 bindings = economic_sources(store, snapshot, context=context, **arguments)
+                if income_ids is not None:
+                    from src.operations.income import INCOME_KINDS, _parsed_capture
+                    from src.research.evidence import SourceBinding
+
+                    if not income_ids or len(set(income_ids)) != len(income_ids):
+                        raise ProviderError("operating", "explicit_unique_income_sources_required")
+                    income_sources = [
+                        _parsed_capture(store, key, as_of=capture.now())[0] for key in income_ids
+                    ]
+                    bindings = (
+                        *bindings,
+                        *(
+                            (
+                                kind,
+                                tuple(
+                                    SourceBinding(
+                                        evidence_id=source.record.evidence_id,
+                                        pointer="/" + kind,
+                                        available_at=source.record.available_at,
+                                    )
+                                    for source in income_sources
+                                ),
+                            )
+                            for kind in INCOME_KINDS
+                        ),
+                    )
                 ids = tuple(dict.fromkeys(b.evidence_id for _, values in bindings for b in values))
                 sources = tuple(store.get(i, as_of=capture.now()) for i in ids)
                 for identity in ids:
@@ -195,7 +244,19 @@ def fetch_operating(task, context, store):
                 result = capture.result((bundle,))
         else:
             family, method = operation.split("_", 1)
-            if family == "alpaca":
+            if operation in ("alpaca_cash_dividend_sources", "alpaca_account_dividend_sources"):
+                from src.data.adapters.dividends import AlpacaDividendAdapter
+
+                adapter = AlpacaDividendAdapter(
+                    store,
+                    os.getenv("ALPACA_API_KEY", ""),
+                    os.getenv("ALPACA_API_SECRET", ""),
+                    data_http=transports.make("alpaca", "https://data.alpaca.markets"),
+                    trading_http=transports.make("alpaca", "https://paper-api.alpaca.markets"),
+                )
+                for key in ("started_at", "ended_at"):
+                    arguments[key] = datetime.fromisoformat(arguments[key])
+            elif family == "alpaca":
                 adapter = AlpacaOperatingAdapter(
                     store,
                     os.getenv("ALPACA_API_KEY", ""),

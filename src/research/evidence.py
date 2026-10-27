@@ -27,7 +27,9 @@ class SourceBinding(VersionedContract):
 
 class BoundArtifact(VersionedContract):
     kind: Literal["universe_history", "availability_audit", "calendar", "corporate_actions",
-                  "execution_bars", "opening_events", "opening_liquidity", "instrument_metadata"]
+                  "execution_bars", "opening_events", "opening_liquidity", "instrument_metadata",
+                  "cash_dividends", "dividend_payments", "dividend_distributions",
+                  "action_coverage", "paper_dividend_policies"]
     inputs_hash: Sha256
     value_json: NonEmptyString
     sources: tuple[SourceBinding, ...] = Field(min_length=1)
@@ -78,7 +80,7 @@ def expected_artifacts(inputs: ResearchInputs) -> dict:
                            ("calendar", "calendar_version", "session", "session_open", "session_close")})
                  for b in events}
     kind='opening_events' if getattr(inputs,'opening_events',()) else 'execution_bars'
-    return {
+    result = {
         "universe_history": [u.model_dump(mode="json") for u in inputs.universes],
         "availability_audit": [r.model_dump(mode="json") for r in inputs.snapshot.evidence],
         "calendar": [json.loads(v) for v in sorted(calendars)],
@@ -89,6 +91,13 @@ def expected_artifacts(inputs: ResearchInputs) -> dict:
                               for b in events],
         "instrument_metadata": [m.model_dump(mode="json") for m in inputs.metadata],
     }
+    # Legacy immutable inputs retain their original seven-artifact convention.
+    # An income-aware input must bind even empty arrays to actual source bytes.
+    if getattr(inputs, 'income_policy', None) is not None:
+        for name in ('cash_dividends', 'dividend_payments', 'dividend_distributions',
+                     'action_coverage', 'paper_dividend_policies'):
+            result[name] = [item.model_dump(mode='json') for item in getattr(inputs, name)]
+    return result
 
 
 def verify_market_snapshot(store: EvidenceStore, snapshot: MarketSnapshot) -> None:
@@ -115,6 +124,8 @@ def _verify_provenance(registry,store,inputs,references,*,paper_execution_receip
              "calendar": "calendar_artifact_id", "corporate_actions": "corporate_actions_id",
              "execution_bars": "execution_bars_id", "opening_events": "opening_events_id", "opening_liquidity": "opening_liquidity_id",
              "instrument_metadata": "instrument_metadata_id"}
+    names.update({name: name+'_id' for name in ('cash_dividends', 'dividend_payments',
+                  'dividend_distributions', 'action_coverage', 'paper_dividend_policies')})
     checked = {}
     for kind, expected in expected_artifacts(inputs).items():
         key = references.get(names[kind])
