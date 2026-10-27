@@ -1,5 +1,7 @@
 """Pinned native adaptation checks; Docker/provider execution is separate acceptance."""
 import copy
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -7,7 +9,7 @@ import pytest
 import yaml
 from jinja2 import Environment, StrictUndefined
 
-from src.research.native import NativeRequest, NativeSupervisor
+from src.research.native import NativeKnowledgeRef, NativeRequest, NativeSupervisor
 from src.research.native_runtime.entrypoint import main
 from src.research.native_runtime.overlay import prepare_overlay
 
@@ -106,3 +108,36 @@ def test_receipt_enforces_models_caps_scope_expiry_and_faults():
         node[path[-1]] = value
         with pytest.raises(ValueError):
             NativeSupervisor.verify_receipt(req,changed,now=now)
+
+
+def test_exact_native_knowledge_bytes_are_staged_without_host_deserialization(tmp_path):
+    import pickle
+    marker=tmp_path/'must-not-execute'
+    class Untrusted:
+        def __reduce__(self):
+            return (eval,(f"__import__('pathlib').Path({str(marker)!r}).write_text('unsafe')",))
+    payload=pickle.dumps(Untrusted())
+    supervisor=NativeSupervisor(tmp_path/'jobs')
+    source=supervisor.root/'prior'
+    (source/'knowledge').mkdir(parents=True)
+    (source/'knowledge'/'factor.pkl').write_bytes(payload)
+    previous=request().model_copy(update={'run_id':'prior'})
+    (source/'request.json').write_text(previous.model_dump_json())
+    def h(raw):
+        return hashlib.sha256(raw).hexdigest()
+    result=dict(run_id='prior',status='discovery_complete',request_hash=previous.content_hash(),
+        upstream_revision='484776c211e4fbbeef03e0ec00d6bbee7362a4f4',gateway_audit_error=None,
+        gateway_final_receipt={'fixture':'offline'},files={'knowledge/factor.pkl':h(payload),
+        'request.json':h((source/'request.json').read_bytes())})
+    (source/'result.json').write_text(json.dumps(result))
+    ref=NativeKnowledgeRef(source_run='prior',source_result_hash=h((source/'result.json').read_bytes()),
+                           artifact='factor',artifact_hash=h(payload))
+    req=request().model_copy(update={'knowledge':(ref,)})
+    work=supervisor.root/'next'
+    work.mkdir()
+    command=supervisor.command(req,work,tmp_path/'bearer')
+    assert (work/'knowledge-input'/'factor.pkl').read_bytes()==payload and not marker.exists()
+    assert f'type=bind,src={work}/knowledge-input,dst=/work/knowledge-input,readonly' in command
+    (source/'knowledge'/'factor.pkl').write_bytes(b'tampered')
+    with pytest.raises(ValueError,match='bytes changed'):
+        supervisor.knowledge_bytes(ref)

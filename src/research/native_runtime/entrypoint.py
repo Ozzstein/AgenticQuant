@@ -42,6 +42,14 @@ def worker():
         'OMP_NUM_THREADS': str(request['cpus']), 'OPENBLAS_NUM_THREADS': str(request['cpus']),
         'MKL_NUM_THREADS': str(request['cpus']), 'NUMEXPR_NUM_THREADS': str(request['cpus']),
     })
+    for kind in ('factor','model'):
+        prefix=kind.upper()+'_COSTEER_'
+        os.environ[prefix+'NEW_KNOWLEDGE_BASE_PATH']=f'/work/knowledge/{kind}.pkl'
+        previous=work/'knowledge-input'/(kind+'.pkl')
+        if previous.is_file():
+            os.environ[prefix+'KNOWLEDGE_BASE_PATH']=str(previous)
+        else:
+            os.environ.pop(prefix+'KNOWLEDGE_BASE_PATH',None)
     for family in ('QLIB_FACTOR_', 'QLIB_MODEL_', 'QLIB_QUANT_'):
         for segment in ('train','valid','test'):
             for position, suffix in enumerate(('start','end')):

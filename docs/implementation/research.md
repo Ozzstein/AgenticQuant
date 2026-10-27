@@ -85,6 +85,18 @@ restart, mount/network drift and failure cleanup; Docker uses explicit boundary
 fixtures. Docker execution, native workflow acceptance and authenticated provider
 usage remain unverified on this host because the Docker engine is unavailable.
 
+`NativeRequest.knowledge` optionally pins one factor and one model CoSTEER file
+from prior completed native runs. Each `NativeKnowledgeRef` binds `source_run`,
+the exact source `result.json` SHA-256, `artifact` (`factor` or `model`) and its
+SHA-256. The supervisor checks the prior request/result/actual file identities,
+copies only those bytes into a read-only input mount, and sets the pinned native
+CoSTEER settings to save new knowledge under `/work/knowledge/`. No host process
+deserializes native pickle files. Source knowledge remains discovery provenance,
+not independent performance or activation evidence. A malicious-pickle sentinel
+test confirms host staging only copies bytes; changed source files are rejected.
+The 23 native/deployment tests pass offline; actual CoSTEER workflow reuse still
+requires the unavailable Docker/provider acceptance run.
+
 ## Registered strategy, paired regime and copilot integration
 
 `rd-agent register --kind strategy|regime` parses the owned `StrategyExperimentPlan` or `RegimeExperimentPlan`. Actual fresh models, frozen contextual evidence, causal HMM observations and holdings-aware callbacks feed the same ledger engine. `ResearchRunner` binds the callback benchmark to the original ledger through `ledger_path`, preserves the opportunity artifact, and supplies durable cost artifacts to evaluation.

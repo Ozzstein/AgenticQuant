@@ -21,7 +21,7 @@ import httpx
 from pydantic import Field, model_validator
 
 from src.data.qlib_us import USQlibScenario, verify_bundle
-from src.domain.common import NonEmptyString, VersionedContract
+from src.domain.common import NonEmptyString, Sha256, VersionedContract
 from src.research.native_runtime.overlay import UPSTREAM_REVISION
 
 COMMANDS = ('fin_factor', 'fin_model', 'fin_quant', 'fin_factor_report', 'general_model', 'ui', 'health_check')
@@ -31,6 +31,13 @@ class NativeBudgetLimits(VersionedContract):
     requests: int = Field(gt=0)
     tokens: int = Field(gt=0)
     cost_usd: Decimal = Field(gt=0)
+
+
+class NativeKnowledgeRef(VersionedContract):
+    source_run: str = Field(pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$')
+    source_result_hash: Sha256
+    artifact: Literal['factor','model']
+    artifact_hash: Sha256
 
 
 class NativeRequest(VersionedContract):
@@ -56,6 +63,7 @@ class NativeRequest(VersionedContract):
     document: str | None = None
     ui_source_run: str | None = None
     ui_port: int = Field(default=19899, ge=1024, le=65535)
+    knowledge: tuple[NativeKnowledgeRef,...] = ()
 
     @model_validator(mode='after')
     def explicit_bounds(self):
@@ -74,6 +82,10 @@ class NativeRequest(VersionedContract):
             raise ValueError('invalid native UI source run identity')
         if any(not model.startswith('openai/') for model in (self.chat_model,self.embedding_model)):
             raise ValueError('native LiteLLM models require the explicit openai/ adapter prefix')
+        if len({item.artifact for item in self.knowledge}) != len(self.knowledge):
+            raise ValueError('one exact inherited knowledge artifact per coder required')
+        if any(item.source_run == self.run_id for item in self.knowledge):
+            raise ValueError('native knowledge must come from a distinct prior run')
         return self
 
     def native_args(self) -> list[str]:
@@ -174,6 +186,16 @@ class NativeSupervisor:
                    '--mount',f'type=bind,src={token.resolve()},dst=/run/gateway-token,readonly']
         for name in ('request.json','scenario.json','admission.json'):
             command += ['--mount',f'type=bind,src={work/name},dst=/work/{name},readonly']
+        if request.knowledge:
+            directory=work/'knowledge-input'
+            directory.mkdir()
+            for reference in request.knowledge:
+                payload=self.knowledge_bytes(reference)
+                with (directory/(reference.artifact+'.pkl')).open('xb') as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            command += ['--mount',f'type=bind,src={directory},dst=/work/knowledge-input,readonly']
         if request.document:
             source = Path(request.document).resolve()
             if not source.exists() or ',' in str(source):
@@ -210,6 +232,36 @@ class NativeSupervisor:
                 shutil.copyfile(source,destination)
             command += ['--publish',f'127.0.0.1:{request.ui_port}:19899']
         return [*command,request.image]
+
+    def knowledge_bytes(self, reference: NativeKnowledgeRef) -> bytes:
+        """Verify exact prior bytes; pickle deserialization is container-only."""
+        root=self.root/reference.source_run
+        result_path=root/'result.json'
+        if root.is_symlink() or result_path.is_symlink():
+            raise ValueError('native source run must be an ordinary owned output directory')
+        raw=result_path.read_bytes()
+        if hashlib.sha256(raw).hexdigest()!=reference.source_result_hash:
+            raise ValueError('native knowledge source result changed')
+        result=json.loads(raw)
+        request_path=root/'request.json'
+        if request_path.is_symlink() or hashlib.sha256(request_path.read_bytes()).hexdigest()!=result['files'].get('request.json'):
+            raise ValueError('native knowledge source request changed')
+        payload=json.loads(request_path.read_bytes())
+        payload.pop('native_args',None)
+        request=NativeRequest.model_validate(payload)
+        if (result.get('run_id')!=reference.source_run or result.get('status')!='discovery_complete'
+                or result.get('request_hash')!=request.content_hash()
+                or result.get('upstream_revision')!=UPSTREAM_REVISION
+                or result.get('gateway_audit_error') or not result.get('gateway_final_receipt')):
+            raise ValueError('native knowledge requires a complete audited source run')
+        name='knowledge/'+reference.artifact+'.pkl'
+        path=root/name
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+            raise ValueError('native knowledge artifact is absent or escaped its run')
+        data=path.read_bytes()
+        if hashlib.sha256(data).hexdigest()!=reference.artifact_hash or result['files'].get(name)!=reference.artifact_hash:
+            raise ValueError('native knowledge artifact bytes changed')
+        return data
 
     def run(self, request: NativeRequest, *, gateway_token_path: str | Path) -> dict:
         token = Path(gateway_token_path).absolute()
