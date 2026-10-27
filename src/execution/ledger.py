@@ -617,6 +617,8 @@ class PortfolioLedger:
         as_of = _utc(as_of)
         if coverage.available_at > as_of or coverage.ended_at > as_of:
             raise LedgerError("action coverage cannot use future source availability/window")
+        if coverage.account_id is not None and coverage.account_id != account:
+            raise LedgerError("action coverage belongs to a different account")
         with self.atomic():
             self.spec(account)
             return self.record_event(

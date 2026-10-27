@@ -409,6 +409,7 @@ class ActionCoverage(VersionedContract):
     """Documented source scope; a process-date query is not economic coverage."""
 
     coverage_id: NonEmptyString
+    account_id: NonEmptyString | None = None
     instrument_ids: tuple[NonEmptyString, ...]
     venue: NonEmptyString
     scope: Literal[
@@ -428,6 +429,8 @@ class ActionCoverage(VersionedContract):
 
     @model_validator(mode="after")
     def declared_coverage(self):
+        if self.scope == "custodial-credit-ledger" and self.account_id is None:
+            raise ValueError("custodial credit coverage requires its exact account identity")
         if self.started_at >= self.ended_at or not self.instrument_ids or not self.event_types:
             raise ValueError(
                 "explicit nonempty action coverage window, instruments and types required"
@@ -440,7 +443,16 @@ class ActionCoverage(VersionedContract):
             raise ValueError("complete action coverage cannot retain gaps")
         return self
 
-    def require_complete(self, *, instrument_ids, started_at, ended_at, as_of, scope, event_types):
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.account_id is None:
+            result.pop("account_id", None)
+        return result
+
+    def require_complete(
+        self, *, instrument_ids, started_at, ended_at, as_of, scope, event_types, account_id=None
+    ):
         if (
             self.completeness != "complete"
             or self.gaps
@@ -451,6 +463,11 @@ class ActionCoverage(VersionedContract):
             or self.ended_at < ended_at
             or not set(instrument_ids) <= set(self.instrument_ids)
             or not set(event_types) <= set(self.event_types)
+            or (self.account_id is not None and self.account_id != account_id)
+            or (
+                scope == "custodial-credit-ledger"
+                and (account_id is None or self.account_id is None)
+            )
         ):
             raise ValueError("source does not establish required economic action coverage")
 
