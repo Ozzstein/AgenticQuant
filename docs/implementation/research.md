@@ -163,6 +163,25 @@ bounded local subprocesses; Docker/provider interfaces remain explicit fixtures.
 
 ## Registered strategy, paired regime and copilot integration
 
+`ResearchInputs` carries an explicit
+`income_policy='source-confirmed-replay-distribution-1'`, exact `cash_dividends`,
+`dividend_distributions` and `action_coverage`. Replay and walk-forward receive the
+actual notices; each cost or benchmark account sizes its own retained entitlement.
+`income_replay_kwargs(start=...)` excludes pre-OOS entitlements from a newly opened
+OOS book. The evaluator independently compares retained term/distribution hashes
+and requires `income_source_contents` before certification. Posted broker-account
+amounts and local-paper policy records are not historical sizing inputs.
+
+Legacy input JSON omits all new fields and preserves its original identity. Such
+runs remain executable diagnostics; missing income authority cannot certify them.
+The current native Alpaca parser still proves gaps only. Neither synthetic ledger
+tests nor source-shaped complete flags admit a positive historical income source.
+The callback strategy adapter's OOS forwarding is a separate integration step.
+Coordinator checks: 30 offline research/input/actual-ledger/source/operating-income
+tests passed in 33.68s, including exact 8,880 NAV and separately retained fee/tax
+postings in the synthetic arithmetic fixture. No genuine historical source or
+positive complete-coverage acceptance is claimed.
+
 `rd-agent register --kind strategy|regime` parses the owned `StrategyExperimentPlan` or `RegimeExperimentPlan`. Actual fresh models, frozen contextual evidence, causal HMM observations and holdings-aware callbacks feed the same ledger engine. `ResearchRunner` binds the callback benchmark to the original ledger through `ledger_path`, preserves the opportunity artifact, and supplies durable cost artifacts to evaluation.
 
 The evaluator independently re-executes strategy/regime recipes from frozen sources, refits actual models, and compares all results, including folds, decisions, fills, NAV and opportunity bytes. Only verified filesystem placement may differ. `Evaluation.execution_verification_hash` archives that proof. A regime experiment runs its declared candidate and baseline in the same trial, with separate ledgers and identical numeric model bytes. `paired_evaluation_hash` binds both results, the original baseline ledger, common valuation intervals and recomputed excess returns. Its significance test uses those paired excess returns. Missing baseline proof, nonpositive improvement or incomplete windows blocks activation. An incomplete development run can still be inspected and reproduced without being certified.

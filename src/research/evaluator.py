@@ -169,6 +169,12 @@ class ExperimentEvaluator:
             actions = [a for a in inputs.actions if a.effective_at >= start]
             require(result.manifest["actions_hash"] == canonical_hash([a.model_dump(mode="json") for a in actions]),
                     "OOS corporate actions differ")
+            income = inputs.income_replay_kwargs(start=start)
+            for name in ('cash_dividends', 'dividend_distributions'):
+                actual = [v.model_dump(mode='json') for v in income.get(name, [])]
+                expected_hash = canonical_hash(actual) if actual else None
+                require(result.manifest.get(name + '_hash') == expected_hash,
+                        'OOS retained income terms or distributions differ')
             require(all(trial.evaluation_start <= pd.Timestamp(t) < trial.evaluation_end
                         for t in dates), "decisions outside preregistered interval")
             return data
@@ -185,6 +191,12 @@ class ExperimentEvaluator:
             require(all(result.manifest["provenance"].get(k) == v for k, v in refs.items()), "source references changed")
             return verify_provenance(self.registry, self.evidence_store, inputs, refs)
         verify("source_contents", source_proof)
+
+        def income_source_proof():
+            from src.research.income import verify_research_income_provenance
+            return verify_research_income_provenance(
+                self.registry, self.evidence_store, inputs, dict(plan.provenance))
+        verify('income_source_contents', income_source_proof)
 
         def actual_models():
             hashes = []

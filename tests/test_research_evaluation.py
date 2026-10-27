@@ -39,6 +39,7 @@ def test_actual_outcome_cannot_promote_without_source_cost_benchmark_holdout(tmp
     assert evaluation.actual_model_hashes
     assert evaluation.sharpe == result.metrics.sharpe_ratio
     assert any('source_contents' in item for item in evaluation.diagnostics)
+    assert any('income_source_contents' in item for item in evaluation.diagnostics)
     assert any('trial_registry_contents' in item for item in evaluation.diagnostics)
     archived = json.loads(runner.registry.blob(evaluation.validation_hash))
     assert archived['overall'] == 'NOT RELIABLE'

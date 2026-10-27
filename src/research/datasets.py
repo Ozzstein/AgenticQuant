@@ -1,15 +1,20 @@
 """Explicit historical inputs shared by custom research and the replay engine."""
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from src.data.features.dataset import FeatureDataset, feature_dataset
 from src.domain.common import RunContext, VersionedContract
 from src.domain.market import FeatureSpec, MarketSnapshot
 from src.domain.portfolio import (
     AccountSpec,
+    ActionCoverage,
+    CashDividend,
     CorporateAction,
+    DividendDistribution,
     ExecutionBar,
     FillPolicy,
     InstrumentRisk,
@@ -66,9 +71,23 @@ class ResearchInputs(VersionedContract):
     initial_train_months: int = Field(default=12, ge=1)
     label_horizon: int = Field(default=1, ge=1, le=252)
     synthetic: bool = False
+    income_policy: Literal['source-confirmed-replay-distribution-1'] | None = None
+    cash_dividends: tuple[CashDividend, ...] = ()
+    dividend_distributions: tuple[DividendDistribution, ...] = ()
+    action_coverage: tuple[ActionCoverage, ...] = ()
+
+    @model_serializer(mode='wrap')
+    def preserve_legacy_identity(self, handler):
+        value = handler(self)
+        if self.income_policy is None:
+            for name in ('income_policy', 'cash_dividends', 'dividend_distributions', 'action_coverage'):
+                value.pop(name, None)
+        return value
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.income_policy is None and (self.cash_dividends or self.dividend_distributions or self.action_coverage):
+            raise ValueError('research income requires an explicit distribution policy')
         if self.context.mode != "backtest" or self.context.account_id != self.account.account_id:
             raise ValueError("research needs a separate matching backtest account")
         if self.snapshot.context.as_of > self.context.as_of:
@@ -80,6 +99,21 @@ class ResearchInputs(VersionedContract):
         for u in self.universes:
             if u.data_snapshot_id not in self.context.data_snapshot_ids:
                 raise ValueError("universe snapshot is not bound to the run")
+        terms = {(t.action_id, t.content_hash()): t for t in self.cash_dividends}
+        if len(terms) != len(self.cash_dividends) or len({d.distribution_id for d in self.dividend_distributions}) != len(self.dividend_distributions):
+            raise ValueError('research income terms and notices must have unique identities')
+        instruments = {b.instrument.instrument_id: b.instrument for b in self.bars}
+        for term in self.cash_dividends:
+            if instruments.get(term.instrument.instrument_id) != term.instrument:
+                raise ValueError('research dividend instrument differs from actual execution universe')
+            if term.available_at > term.entitlement_at or term.entitlement_at > self.context.as_of:
+                raise ValueError('research dividend terms were unavailable before entitlement')
+        for notice in self.dividend_distributions:
+            if (notice.action_id, notice.terms_hash) not in terms or notice.available_at > self.context.as_of:
+                raise ValueError('research distribution requires exact eligible retained terms')
+        for coverage in self.action_coverage:
+            if coverage.account_id not in (None, self.account.account_id):
+                raise ValueError('research coverage belongs to another account')
         return self
 
     def materialize(self, specs: tuple[FeatureSpec, ...]) -> FeatureDataset:
@@ -91,7 +125,22 @@ class ResearchInputs(VersionedContract):
                 "metadata": list(self.metadata), "universes": list(self.universes),
                 "actions": list(self.actions), "fill_policy": self.fill_policy,
                 "risk_policy": self.risk_policy, "topk": self.topk,
-                "samples_per_year": self.samples_per_year, "valuation_calendar": self.valuation_calendar}
+                "samples_per_year": self.samples_per_year, "valuation_calendar": self.valuation_calendar,
+                **self.income_replay_kwargs()}
+
+    def income_replay_kwargs(self, *, start=None) -> dict:
+        """Actual notices size each simulation's own original entitlement.
+
+        An OOS book starts empty. Earlier entitlements cannot be invented or
+        carried from training ownership into that new book.
+        """
+        if self.income_policy is None:
+            return {}
+        terms = [t for t in self.cash_dividends if start is None or t.entitlement_at >= start]
+        identities = {(t.action_id, t.content_hash()) for t in terms}
+        return {'cash_dividends': terms,
+                'dividend_distributions': [d for d in self.dividend_distributions
+                                          if (d.action_id, d.terms_hash) in identities]}
 
     def split_manifest(self) -> dict:
         return {"walk_months": self.walk_months, "embargo_days": self.embargo_days,

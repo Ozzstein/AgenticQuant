@@ -96,7 +96,8 @@ def expected_artifacts(inputs: ResearchInputs) -> dict:
     if getattr(inputs, 'income_policy', None) is not None:
         for name in ('cash_dividends', 'dividend_payments', 'dividend_distributions',
                      'action_coverage', 'paper_dividend_policies'):
-            result[name] = [item.model_dump(mode='json') for item in getattr(inputs, name)]
+            if hasattr(inputs, name):
+                result[name] = [item.model_dump(mode='json') for item in getattr(inputs, name)]
     return result
 
 
@@ -115,7 +116,11 @@ def verify_market_snapshot(store: EvidenceStore, snapshot: MarketSnapshot) -> No
 
 def verify_provenance(registry: ResearchRegistry, store: EvidenceStore, inputs: ResearchInputs,
                       references: dict[str, str]) -> dict[str, str]:
-    return _verify_provenance(registry,store,inputs,references)
+    checked = _verify_provenance(registry,store,inputs,references)
+    if getattr(inputs, 'income_policy', None) is not None:
+        from src.research.income import verify_research_income_provenance
+        checked.update(verify_research_income_provenance(registry,store,inputs,references))
+    return checked
 
 
 def _verify_provenance(registry,store,inputs,references,*,paper_execution_receipts=None):
