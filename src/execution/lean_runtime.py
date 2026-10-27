@@ -313,6 +313,22 @@ class LeanAlgorithmPort:
             raise LedgerError("LEAN queried ticket has another client identity")
         return payload
 
+    def lookup_broker_order(self, broker_order_id):
+        """Actual imported runtime ticket, located only by its original native ID."""
+        matches = [
+            order
+            for order in self.algorithm.Transactions.GetOrders()
+            if broker_order_id in [str(value) for value in order.BrokerId]
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise LedgerError("native broker identity maps to multiple actual LEAN tickets")
+        ticket = self.algorithm.Transactions.GetOrderTicket(int(matches[0].Id))
+        if ticket is None:
+            return None
+        return self._ticket(ticket)
+
     def cancel(self, ticket_id, client_id):
         ticket = self.algorithm.Transactions.GetOrderTicket(ticket_id)
         if (

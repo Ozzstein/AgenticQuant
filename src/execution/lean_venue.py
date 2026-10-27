@@ -162,7 +162,7 @@ class LeanVenue:
             raise LedgerError("LEAN receipt lacks its immutable runtime/deployment binding")
         return value
 
-    def _latest(self, kind, as_of, client=None):
+    def _latest(self, kind, as_of, client=None, *, required=True):
         for row in self.ledger.db.execute(
             "SELECT id FROM events WHERE account=? AND id LIKE ? ORDER BY rowid DESC",
             (self.account_id, "lean-" + kind + ":%"),
@@ -172,7 +172,9 @@ class LeanVenue:
                 client is None or value.get("client_order_id") == client
             ):
                 return value, row[0]
-        raise LedgerError("actual LEAN receipt unavailable before cutoff")
+        if required:
+            raise LedgerError("actual LEAN receipt unavailable before cutoff")
+        return None
 
     def capture(self):
         binding = self._runtime_binding()
@@ -302,6 +304,27 @@ class LeanVenue:
                 raise LedgerError(
                     "LEAN native open orders differ from actual runtime broker identities"
                 )
+            canonical_clients = []
+            for order in payload["open_orders"]:
+                if len(order["broker_ids"]) != 1:
+                    raise LedgerError("LEAN open order requires a unique original native binding")
+                native_key = "lean-native-order:" + digest(
+                    [self._native_reader().venue, order["broker_ids"][0]]
+                )
+                retained = self.ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?",
+                    (self.account_id, native_key),
+                ).fetchone()
+                if retained is None:
+                    raise LedgerError(
+                        "LEAN unowned native open order requires explicit reconciliation"
+                    )
+                old = json.loads(retained[0])
+                intent = self.ledger.order(self.account_id, old["intent_id"])["intent"]
+                self._original_native_binding(
+                    intent, old["client_order_id"], datetime.fromisoformat(payload["observed_at"])
+                )
+                canonical_clients.append(old["client_order_id"])
             if (
                 not 0
                 <= (
@@ -324,7 +347,9 @@ class LeanVenue:
             cash_base=cash,
             available_cash_base=available,
             quantities={key: decimal(value) for key, value in payload["quantities"].items()},
-            open_client_order_ids=tuple(payload["open_client_order_ids"]),
+            open_client_order_ids=tuple(
+                canonical_clients if self.mode == "live" else payload["open_client_order_ids"]
+            ),
             evidence_id=identity,
         )
 
@@ -429,6 +454,19 @@ class LeanVenue:
         )
 
     def lookup(self, intent, client_order_id, venue_order_id, as_of):
+        bound = self.ledger.db.execute(
+            "SELECT * FROM lean_ticket_bindings WHERE account=? AND intent=?",
+            (self.account_id, intent.intent_id),
+        ).fetchone()
+        if (
+            self.mode == "live"
+            and bound
+            and (self.runtime is None or bound["runtime"] != self._runtime_binding()["runtime_id"])
+        ):
+            report = self._recover_native(intent, client_order_id, as_of)
+            if venue_order_id is not None and report.venue_order_id != venue_order_id:
+                raise LedgerError("LEAN original native ticket identity changed")
+            return report
         if self.runtime is None:
             candidates = [
                 self._read(row[0], "ticket")
@@ -479,6 +517,56 @@ class LeanVenue:
             or bound["runtime"] != binding["runtime_id"]
             or venue_order_id != bound["runtime"] + ":" + str(bound["ticket"])
         ):
+            if (
+                self.mode == "live"
+                and bound
+                and venue_order_id == bound["runtime"] + ":" + str(bound["ticket"])
+            ):
+                original, _ = self._original_native_binding(intent, client_order_id, as_of)
+                actual = self.runtime.lookup_broker_order(original["broker_order_id"])
+                if (
+                    actual is None
+                    or actual["runtime_id"] != binding["runtime_id"]
+                    or actual["broker_ids"] != [original["broker_order_id"]]
+                ):
+                    raise LedgerError(
+                        "restarted LEAN cancellation lacks the actual imported native ticket"
+                    )
+                self._validate_ticket_intent(intent, actual)
+                source = self._record("recovered-ticket", actual)
+                alias = {
+                    "intent_hash": intent.content_hash(),
+                    "original_binding": original,
+                    "runtime_id": actual["runtime_id"],
+                    "ticket_id": actual["ticket_id"],
+                    "client_order_id": actual["client_order_id"],
+                    "source": source,
+                }
+                alias_key = "lean-runtime-alias:" + digest(
+                    [actual["runtime_id"], actual["ticket_id"]]
+                )
+                with self.ledger.atomic():
+                    prior = self.ledger.db.execute(
+                        "SELECT payload FROM events WHERE account=? AND id=?",
+                        (self.account_id, alias_key),
+                    ).fetchone()
+                    if prior is None:
+                        self.ledger.record_event(self.account_id, alias_key, canonical(alias))
+                    else:
+                        retained = json.loads(prior[0])
+                        if {key: value for key, value in retained.items() if key != "source"} != {
+                            key: value for key, value in alias.items() if key != "source"
+                        }:
+                            raise LedgerError("LEAN imported runtime ticket identity changed")
+                        first = self._read(retained["source"], "recovered-ticket")
+                        if any(
+                            first[key] != actual[key]
+                            for key in ("runtime_id", "ticket_id", "client_order_id", "broker_ids")
+                        ):
+                            raise LedgerError("LEAN original imported ticket receipt differs")
+                        self._validate_ticket_intent(intent, first)
+                self.runtime.cancel(actual["ticket_id"], actual["client_order_id"])
+                return self._recover_native(intent, client_order_id, as_of)
             raise LedgerError("LEAN cancellation requires exact original runtime ticket")
         self.runtime.cancel(bound["ticket"], client_order_id)
         report = self.lookup(intent, client_order_id, venue_order_id, as_of)
@@ -503,22 +591,10 @@ class LeanVenue:
             or attempt["client_order_id"] != client
         ):
             raise LedgerError("LEAN ticket runtime/intent differs from original submission claim")
+        if payload["client_order_id"] != client:
+            raise LedgerError("LEAN ticket client differs from exact canonical intent")
+        self._validate_ticket_intent(intent, payload)
         signed = intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
-        if (
-            payload["client_order_id"] != client
-            or payload["instrument_id"] != intent.instrument.instrument_id
-            or decimal(payload["quantity"]) != signed
-            or payload["order_type"]
-            != {"market": "Market", "limit": "Limit", "stop": "StopMarket"}[intent.order_type]
-        ):
-            raise LedgerError("LEAN ticket differs from exact canonical intent")
-        if (
-            intent.order_type == "limit"
-            and decimal(payload["limit_price"]) != intent.limit_price
-            or intent.order_type == "stop"
-            and decimal(payload["stop_price"]) != intent.stop_price
-        ):
-            raise LedgerError("LEAN ticket price differs")
         ticket, runtime = payload["ticket_id"], payload["runtime_id"]
         if type(ticket) is not int or ticket < 1:
             raise LedgerError("actual positive LEAN ticket ID required")
@@ -701,6 +777,128 @@ class LeanVenue:
             fills=tuple(fills),
             executions_complete=complete,
             evidence_id=evidence,
+        )
+
+    @staticmethod
+    def _validate_ticket_intent(intent, payload):
+        signed = intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
+        if (
+            payload["instrument_id"] != intent.instrument.instrument_id
+            or decimal(payload["quantity"]) != signed
+            or payload["order_type"]
+            != {"market": "Market", "limit": "Limit", "stop": "StopMarket"}[intent.order_type]
+        ):
+            raise LedgerError("LEAN ticket differs from exact canonical intent")
+        if (
+            intent.order_type == "limit"
+            and decimal(payload["limit_price"]) != intent.limit_price
+            or intent.order_type == "stop"
+            and decimal(payload["stop_price"]) != intent.stop_price
+        ):
+            raise LedgerError("LEAN ticket price differs")
+
+    def _original_native_binding(self, intent, client, as_of):
+        retained = self._latest("native-report", _utc(as_of), client, required=False)
+        if retained is not None:
+            proof = retained[0]
+            source = self._read(proof["ticket_source"], "ticket")
+        else:
+            # A crash/read failure can occur after retaining the original native
+            # ID but before the first native report. The original admitted ticket
+            # still binds that exact ID; a new process must never invent a ticket.
+            source, ticket_source = self._latest("ticket", _utc(as_of), client)
+            if len(source["broker_ids"]) != 1:
+                raise LedgerError("LEAN original ticket lacks a unique native order identity")
+            proof = {
+                "ticket_source": ticket_source,
+                "native_binding": "lean-native-order:"
+                + digest([self._native_reader().venue, source["broker_ids"][0]]),
+            }
+        original = self.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?",
+            (self.account_id, proof["native_binding"]),
+        ).fetchone()
+        bound = self.ledger.db.execute(
+            "SELECT * FROM lean_ticket_bindings WHERE account=? AND intent=?",
+            (self.account_id, intent.intent_id),
+        ).fetchone()
+        attempt = self.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?",
+            (self.account_id, "lean-submit-attempt:" + intent.intent_id),
+        ).fetchone()
+        if original is None or bound is None or attempt is None:
+            raise LedgerError("LEAN original native submission authority is incomplete")
+        original, attempt = json.loads(original[0]), json.loads(attempt[0])
+        expected = {
+            "deployment_hash": self.deployment.content_hash(),
+            "venue": self._native_reader().venue,
+            "broker_order_id": original["broker_order_id"],
+            "runtime_id": bound["runtime"],
+            "ticket_id": bound["ticket"],
+            "intent_hash": intent.content_hash(),
+            "intent_id": intent.intent_id,
+            "client_order_id": client,
+        }
+        if (
+            original != expected
+            or proof["native_binding"]
+            != "lean-native-order:" + digest([original["venue"], original["broker_order_id"]])
+            or source["broker_ids"] != [original["broker_order_id"]]
+            or source["runtime_id"] != bound["runtime"]
+            or source["ticket_id"] != bound["ticket"]
+            or source["client_order_id"] != client
+            or bound["client"] != client
+            or attempt["runtime_id"] != bound["runtime"]
+            or attempt["intent_hash"] != intent.content_hash()
+            or attempt["client_order_id"] != client
+        ):
+            raise LedgerError("LEAN original native order binding differs from retained submission")
+        self._validate_ticket_intent(intent, source)
+        return original, proof["ticket_source"]
+
+    def _recover_native(self, intent, client, as_of):
+        original, source = self._original_native_binding(intent, client, as_of)
+        reader = self._native_reader()
+        native = reader.read_native_order(intent, original["broker_order_id"])
+        if native is None or native.venue_order_id != original["broker_order_id"]:
+            raise LedgerError("LEAN original native order remains unavailable")
+        key = "lean-native-order:" + digest([reader.venue, original["broker_order_id"]])
+        prior = self.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id=?",
+            (self.account_id, key + ":client"),
+        ).fetchone()
+        if prior is None:
+            if self._latest("native-report", _utc(as_of), client, required=False) is not None:
+                raise LedgerError("LEAN original native client binding is missing")
+            with self.ledger.atomic():
+                self.ledger.record_event(
+                    self.account_id,
+                    key + ":client",
+                    canonical({"native_client": native.client_order_id}),
+                )
+        elif json.loads(prior[0]) != {"native_client": native.client_order_id}:
+            raise LedgerError("LEAN original native client identity changed during recovery")
+        proof = {
+            "runtime_id": self.runtime.identity()["runtime_id"]
+            if self.runtime
+            else original["runtime_id"],
+            "observed_at": native.observed_at.isoformat(),
+            "client_order_id": client,
+            "ticket_source": source,
+            "native_binding": key,
+            "recovery_policy": "original-native-order-history-1",
+            "native_report": native.model_dump(mode="json"),
+        }
+        return VenueOrderReport(
+            venue="lean",
+            client_order_id=client,
+            venue_order_id=original["runtime_id"] + ":" + str(original["ticket_id"]),
+            observed_at=native.observed_at,
+            status=native.status,
+            cumulative_quantity=native.cumulative_quantity,
+            fills=native.fills,
+            executions_complete=native.executions_complete,
+            evidence_id=self._record("native-report", proof),
         )
 
     def _native_report(self, intent, client, payload, evidence, cumulative, complete):

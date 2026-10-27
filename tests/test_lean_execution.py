@@ -77,7 +77,11 @@ class RuntimeFixture:
             ],
             "open_client_order_ids": opened,
             "open_orders": [
-                {"client_order_id": client, "ticket_id": 1, "broker_ids": ["native-fixture-ticket"]}
+                {
+                    "client_order_id": client,
+                    "ticket_id": self.ticket["ticket_id"],
+                    "broker_ids": list(self.ticket["broker_ids"]),
+                }
                 for client in opened
             ],
         }
@@ -123,10 +127,15 @@ class RuntimeFixture:
             self._event(len(self.ticket["events"]) + 1, "0", "0", "0", "Canceled")
         )
 
+    def lookup_broker_order(self, broker_order_id):
+        if self.ticket is None or broker_order_id not in self.ticket["broker_ids"]:
+            return None
+        return self.lookup(self.ticket["client_order_id"], self.ticket["ticket_id"])
+
     def _event(self, identity, quantity, price, fee, status):
         return {
             "event_id": identity,
-            "ticket_id": 1,
+            "ticket_id": self.ticket["ticket_id"] if self.ticket else 1,
             "instrument_id": self.instrument.instrument_id,
             "occurred_at": self.at.isoformat(),
             "status": status,
@@ -511,7 +520,7 @@ def test_native_decimal_refuses_loss_and_cancel_keeps_original_tag():
     assert calls == [()]
 
 
-def test_live_native_execution_proof_overrides_lean_fee_model_and_binds_postings(tmp_path):
+def setup_live(tmp_path, *, runtime=None, wire=None):
     import httpx
 
     from src.execution.alpaca_venue import AlpacaVenue
@@ -524,8 +533,8 @@ def test_live_native_execution_proof_overrides_lean_fee_model_and_binds_postings
             request.url = request.url.copy_with(host="paper-api.alpaca.markets")
             return super().handle(request)
 
-    runtime, execution, adapter, order = setup(tmp_path, mode="live")
-    wire = LiveWire()
+    runtime, execution, adapter, order = setup(tmp_path, mode="live", runtime=runtime)
+    wire = wire or LiveWire()
     native = AlpacaVenue(
         execution.ledger,
         order.account_id,
@@ -563,6 +572,11 @@ def test_live_native_execution_proof_overrides_lean_fee_model_and_binds_postings
         return copy.deepcopy(runtime.ticket)
 
     runtime.submit = submit
+    return runtime, execution, adapter, order, wire, native
+
+
+def test_live_native_execution_proof_overrides_lean_fee_model_and_binds_postings(tmp_path):
+    runtime, execution, adapter, order, wire, native = setup_live(tmp_path)
     try:
         assert admit(runtime, execution, adapter, order)["state"] == "new"
         runtime.at += timedelta(seconds=1)
@@ -603,6 +617,189 @@ def test_live_native_execution_proof_overrides_lean_fee_model_and_binds_postings
             adapter._balances(proof, key)
     finally:
         native.close()
+
+
+def test_live_restart_recovers_original_native_partial_history_without_new_submit(tmp_path):
+    runtime, execution, adapter, order, wire, native = setup_live(tmp_path)
+    try:
+        assert admit(runtime, execution, adapter, order)["state"] == "new"
+        original_venue_id = execution.state(order.intent_id)["venue_id"]
+        runtime.at += timedelta(seconds=1)
+        runtime.add("3", "100", "0")
+        wire.add_fill("native-first", "3", "100", 2)
+        wire.order.update(filled_qty="3", status="partially_filled")
+        wire.cash, wire.positions = "99700", [{"symbol": "A", "side": "long", "qty": "3"}]
+        assert execution.reconcile_all(as_of=runtime.at)[0]["state"] == "partial"
+        first = execution.ledger.fills(order.account_id)[0]
+        native.close()
+        execution.ledger.close()
+        runtime.runtime_id = "fixture-restarted-live-runtime"
+        runtime.ticket.update(
+            runtime_id=runtime.runtime_id,
+            ticket_id=25,
+            client_order_id="imported-native-tag",
+            events=[],
+            filled_quantity="0",
+        )
+        runtime, execution, adapter, order, wire, native = setup_live(
+            tmp_path, runtime=runtime, wire=wire
+        )
+        runtime.at += timedelta(seconds=1)
+        assert execution.reconcile_all(as_of=runtime.at)[0]["state"] == "partial"
+        balances = adapter.capture()
+        assert balances.open_client_order_ids == (execution.state(order.intent_id)["client_id"],)
+        assert execution.reconcile_balances(as_of=runtime.at)["reconciled"]
+        assert execution.ledger.fills(order.account_id) == [first]
+        runtime.at += timedelta(seconds=1)
+        wire.add_fill("native-second", "7", "90", 4)
+        wire.order.update(filled_qty="10", status="filled")
+        wire.cash, wire.positions = "99070", [{"symbol": "A", "side": "long", "qty": "10"}]
+        runtime.cash, runtime.held, runtime.price = D(99070), D(10), D(90)
+        runtime.ticket["status"] = "Filled"
+        assert execution.reconcile_all(as_of=runtime.at)[0]["state"] == "filled"
+        assert execution.state(order.intent_id)["venue_id"] == original_venue_id
+        adapter.capture()
+        assert execution.reconcile_balances(as_of=runtime.at)["reconciled"]
+        fills = execution.ledger.fills(order.account_id)
+        assert fills[0] == first
+        assert {fill.fill_id for fill in fills} == {"alpaca:native-first", "alpaca:native-second"}
+        assert execution.ledger.reconcile(order.account_id)["reconciled"]
+        assert len([row for row in runtime.calls if row[0] == "submit"]) == 1
+        assert all(method == "GET" for method, *_ in wire.calls)
+    finally:
+        native.close()
+
+
+def test_live_restarted_cancel_requires_exact_imported_ticket_and_retains_first_alias(tmp_path):
+    runtime, execution, adapter, order, wire, native = setup_live(tmp_path)
+    try:
+        admit(runtime, execution, adapter, order)
+        runtime.runtime_id = "fixture-new-runtime-for-cancel"
+        runtime.at += timedelta(seconds=1)
+        runtime.ticket.update(
+            runtime_id=runtime.runtime_id,
+            ticket_id=88,
+            client_order_id="native-import-tag",
+            events=[],
+            quantity="9",
+        )
+        assert execution.cancel(order.intent_id, as_of=runtime.at)["state"] == "cancel_pending"
+        assert not any(call[0] == "cancel" for call in runtime.calls)
+        assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+        runtime.ticket["quantity"] = "10"
+        # The first cancellation loses its acknowledgement. A later identical
+        # retry keeps the original immutable imported-ticket receipt.
+        original_cancel = runtime.cancel
+        calls = []
+
+        def cancel(ticket, client):
+            assert (ticket, client) == (88, "native-import-tag")
+            calls.append((ticket, client))
+            if len(calls) == 1:
+                raise RuntimeError("fixture cancellation acknowledgement lost")
+            original_cancel(ticket, client)
+            wire.order["status"] = "canceled"
+
+        runtime.cancel = cancel
+        assert execution.cancel(order.intent_id, as_of=runtime.at)["state"] == "cancel_pending"
+        first_alias = execution.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id LIKE 'lean-runtime-alias:%'",
+            (order.account_id,),
+        ).fetchone()[0]
+        runtime.at += timedelta(seconds=1)
+        assert execution.cancel(order.intent_id, as_of=runtime.at)["state"] == "cancelled"
+        retained = execution.ledger.db.execute(
+            "SELECT payload FROM events WHERE account=? AND id LIKE 'lean-runtime-alias:%'",
+            (order.account_id,),
+        ).fetchall()
+        assert [row[0] for row in retained] == [first_alias]
+        assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+        assert not execution.ledger.fills(order.account_id)
+        assert len(calls) == 2
+        assert len([row for row in runtime.calls if row[0] == "submit"]) == 1
+    finally:
+        native.close()
+
+
+def test_live_restart_rejects_changed_original_native_binding_before_query(tmp_path):
+    runtime, execution, adapter, order, wire, native = setup_live(tmp_path)
+    try:
+        admit(runtime, execution, adapter, order)
+        row = execution.ledger.db.execute(
+            "SELECT id,payload FROM events WHERE account=? AND id LIKE 'lean-native-order:%' "
+            "AND id NOT LIKE '%:client'",
+            (order.account_id,),
+        ).fetchone()
+        changed = json.loads(row["payload"])
+        changed["broker_order_id"] = "different-native-order"
+        with execution.ledger.atomic():
+            execution.ledger.db.execute(
+                "UPDATE events SET payload=? WHERE account=? AND id=?",
+                (json.dumps(changed), order.account_id, row["id"]),
+            )
+        runtime.runtime_id = "fixture-restarted-live-runtime"
+        runtime.at += timedelta(seconds=1)
+        calls = len(wire.calls)
+        assert execution.reconcile_all(as_of=runtime.at)[0]["state"] == "ambiguous"
+        assert len(wire.calls) == calls
+        assert not execution.ledger.fills(order.account_id)
+        assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+    finally:
+        native.close()
+
+
+@pytest.mark.parametrize("retain_binding", [True, False])
+def test_live_restart_after_first_native_read_failure_needs_original_binding(
+    tmp_path, retain_binding
+):
+    runtime, execution, adapter, order, wire, native = setup_live(tmp_path)
+    try:
+        wire.missing = True
+        assert admit(runtime, execution, adapter, order)["state"] == "ambiguous"
+        assert execution.state(order.intent_id)["venue_id"] is None
+        assert not execution.ledger.fills(order.account_id)
+        if not retain_binding:
+            with execution.ledger.atomic():
+                execution.ledger.db.execute(
+                    "DELETE FROM events WHERE account=? AND id LIKE 'lean-native-order:%'",
+                    (order.account_id,),
+                )
+        wire.missing = False
+        runtime.runtime_id = "fixture-restarted-after-read-failure"
+        runtime.at += timedelta(seconds=1)
+        runtime.ticket = None  # No substitute runtime-local history is needed or invented.
+        calls = len(wire.calls)
+        expected = "new" if retain_binding else "ambiguous"
+        assert execution.reconcile_all(as_of=runtime.at)[0]["state"] == expected
+        if retain_binding:
+            assert execution.state(order.intent_id)["venue_id"] == "fixture-lean-process-1:1"
+        else:
+            assert len(wire.calls) == calls
+        assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+        assert len([row for row in runtime.calls if row[0] == "submit"]) == 1
+    finally:
+        native.close()
+
+
+def test_imported_native_ticket_lookup_requires_unique_actual_broker_id():
+    from types import SimpleNamespace as NS
+
+    from src.execution.lean_runtime import LeanAlgorithmPort
+
+    orders = [NS(Id=51, BrokerId=["original-native"]), NS(Id=52, BrokerId=["another"])]
+    tickets = {51: {"ticket_id": 51}, 52: {"ticket_id": 52}}
+    port = object.__new__(LeanAlgorithmPort)
+    port.algorithm = NS(
+        Transactions=NS(
+            GetOrders=lambda: orders, GetOrderTicket=lambda identity: tickets.get(identity)
+        )
+    )
+    port._ticket = lambda ticket: ticket
+    assert port.lookup_broker_order("original-native") == {"ticket_id": 51}
+    assert port.lookup_broker_order("not-present") is None
+    orders.append(NS(Id=53, BrokerId=["original-native"]))
+    with pytest.raises(LedgerError, match="multiple actual LEAN tickets"):
+        port.lookup_broker_order("original-native")
 
 
 def test_live_local_packet_identity_rejects_custom_jobs_alt_auth_and_networks():
