@@ -23,7 +23,9 @@ from src.core.walk_forward import WalkForwardRunner, reconstruct_oos_inputs
 from src.domain.common import RunContext
 from src.domain.portfolio import (
     AccountSpec,
+    CashDividend,
     CorporateAction,
+    DividendDistribution,
     ExecutionBar,
     FillPolicy,
     InstrumentRisk,
@@ -54,6 +56,10 @@ def load_inputs(path: Path) -> tuple[dict, dict]:
         "signals": [RankedSignal.model_validate(s) for s in raw.get("signals", [])],
         "targets": [PortfolioTarget.model_validate(t) for t in raw.get("targets", [])],
         "actions": [CorporateAction.model_validate(a) for a in raw.get("actions", [])],
+        "cash_dividends": [CashDividend.model_validate(t) for t in raw.get("cash_dividends", [])],
+        "dividend_distributions": [
+            DividendDistribution.model_validate(t) for t in raw.get("dividend_distributions", [])
+        ],
         "fill_policy": FillPolicy.model_validate(raw.get("fill_policy", {})),
         "risk_policy": RiskPolicy.model_validate(raw.get("risk_policy", {})),
         "topk": raw.get("topk", 30),
@@ -96,6 +102,8 @@ def _run_pipeline(input_path: Path, ledger: Path, artifact_dir: Path) -> ReplayR
             "metadata",
             "universes",
             "actions",
+            "cash_dividends",
+            "dividend_distributions",
             "topk",
             "fill_policy",
             "risk_policy",

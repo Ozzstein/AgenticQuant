@@ -17,6 +17,9 @@ from src.domain.common import _utc
 from src.domain.portfolio import (
     AccountFee,
     CorporateAction,
+    DividendEntitlement,
+    DividendPayment,
+    DividendReceivable,
     Fill,
     Holding,
     OrderIntent,
@@ -178,6 +181,10 @@ class SleeveBook:
             "flow": dict.fromkeys(cash, ZERO),
             "fees": dict.fromkeys(cash, ZERO),
             "realized": dict.fromkeys(cash, ZERO),
+            "taxes": dict.fromkeys(cash, ZERO),
+            "dividends": {},
+            "dividend_allocations": {},
+            "receivables": {},
             "turnover": defaultdict(lambda: defaultdict(lambda: ZERO)),
             "last": dict.fromkeys(cash, None),
             "allocated": defaultdict(lambda: defaultdict(lambda: ZERO)),
@@ -204,11 +211,17 @@ class SleeveBook:
                 journal_id = (
                     "fill:" + payload["fill_id"] if row["kind"] == "fill" else payload["journal_id"]
                 )
-                source, source_cash, action_realized, source_fees, source_realized = contexts[
-                    journal_id
-                ]
+                source, source_cash, action_realized, source_fees, source_realized, source_taxes = (
+                    contexts[journal_id]
+                )
                 if payload != self._economic_payload(
-                    source, state, source_cash, action_realized, source_fees, source_realized
+                    source,
+                    state,
+                    source_cash,
+                    action_realized,
+                    source_fees,
+                    source_realized,
+                    source_taxes,
                 ):
                     raise LedgerError(
                         "sleeve economics differ from deterministic source allocation"
@@ -228,7 +241,19 @@ class SleeveBook:
                         state["opened"][name].pop(key, None)
                     if D(amount) and row["kind"] in ("fill", "internal_transfer"):
                         state["last"][name] = at
-            for field in ("flow", "fees", "realized"):
+            if "dividend_entitlement" in payload:
+                entry = DividendEntitlement.model_validate(payload["dividend_entitlement"])
+                state["dividends"][entry.action_id] = entry
+                state["dividend_allocations"][entry.action_id] = payload["dividend_allocations"]
+                state["receivables"][entry.action_id] = {}
+            for action, amounts in payload.get("receivables", {}).items():
+                for name, amount in amounts.items():
+                    previous = state["receivables"][action].get(name, ZERO)
+                    value = exact_sum([previous, D(amount)])
+                    if value < 0:
+                        raise LedgerError("sleeve dividend receivable cannot be negative")
+                    state["receivables"][action][name] = value
+            for field in ("flow", "fees", "realized", "taxes"):
                 for name, amount in payload.get(field, {}).items():
                     state[field][name] = exact_sum([state[field][name], D(amount)])
             for name, amount in payload.get("turnover", {}).items():
@@ -296,11 +321,22 @@ class SleeveBook:
     def _source_context(self):
         contexts, basis, cash = {}, defaultdict(lambda: ZERO), ZERO
         held = defaultdict(lambda: ZERO)
-        total_fees, total_realized = ZERO, ZERO
+        total_fees, total_realized, total_taxes = ZERO, ZERO, ZERO
         for row in self.ledger.db.execute(
             "SELECT * FROM journal WHERE account=? ORDER BY sequence", (self.account_id,)
         ):
-            cash += D(row["cash_delta"])
+            if row["kind"] in ("dividend_entitlement", "dividend_payment"):
+                cash = exact_sum([cash, D(row["cash_delta"])])
+            elif row["kind"] in ("deposit", "fill", "account_fee"):
+                cash += D(row["cash_delta"])
+            elif row["kind"] in ("dividend", "delist"):
+                action = CorporateAction.model_validate_json(row["payload"])
+                if held[action.instrument.instrument_id]:
+                    cash += D(row["cash_delta"])
+                elif D(row["cash_delta"]):
+                    raise LedgerError("action cash without historical sleeve ownership")
+            elif D(row["cash_delta"]):
+                raise LedgerError("nonmonetary sleeve source cannot change cash")
             realized = ZERO
             if row["kind"] == "fill":
                 fill = Fill.model_validate_json(row["payload"])
@@ -337,11 +373,37 @@ class SleeveBook:
                 realized = fee.amount.copy_negate()
                 total_fees += fee.amount
                 total_realized += realized
-            contexts[row["id"]] = (dict(row), cash, realized, total_fees, total_realized)
+            elif row["kind"] == "dividend_entitlement":
+                entry = DividendEntitlement.model_validate_json(row["payload"])
+                realized = entry.gross_amount
+                total_realized = exact_sum([total_realized, realized])
+            elif row["kind"] == "dividend_payment":
+                payment = DividendPayment.model_validate_json(row["payload"])
+                realized = exact_sum(
+                    [payment.fee.copy_negate(), payment.withholding_tax.copy_negate()]
+                )
+                total_realized = exact_sum([total_realized, realized])
+                total_fees = exact_sum([total_fees, payment.fee])
+                total_taxes = exact_sum([total_taxes, payment.withholding_tax])
+            contexts[row["id"]] = (
+                dict(row),
+                cash,
+                realized,
+                total_fees,
+                total_realized,
+                total_taxes,
+            )
         return contexts
 
     def _economic_payload(
-        self, journal, state, canonical_cash, action_realized, canonical_fees, canonical_realized
+        self,
+        journal,
+        state,
+        canonical_cash,
+        action_realized,
+        canonical_fees,
+        canonical_realized,
+        canonical_taxes,
     ):
         kind = journal["kind"]
         payload = {"cash": {}, "quantities": {}}
@@ -409,6 +471,10 @@ class SleeveBook:
             payload["cash"] = {key: str(value.copy_negate()) for key, value in amounts.items()}
             payload["fees"] = {key: str(value) for key, value in amounts.items()}
             payload["realized"] = dict(payload["cash"])
+        elif kind in ("dividend_entitlement", "dividend_payment"):
+            from src.execution.dividend_projection import economic_payload
+
+            payload = economic_payload(self, journal, state)
         else:
             action = CorporateAction.model_validate_json(journal["payload"])
             key = action.instrument.instrument_id
@@ -435,6 +501,7 @@ class SleeveBook:
             ("cash", canonical_cash),
             ("fees", canonical_fees),
             ("realized", canonical_realized),
+            ("taxes", canonical_taxes),
         ):
             projected = exact_sum(
                 [*state[field].values(), *(D(v) for v in payload.get(field, {}).values())]
@@ -458,13 +525,27 @@ class SleeveBook:
             ):
                 kind = journal["kind"]
                 if (
-                    kind not in ("fill", "split", "dividend", "delist", "account_fee")
+                    kind
+                    not in (
+                        "fill",
+                        "split",
+                        "dividend",
+                        "delist",
+                        "account_fee",
+                        "dividend_entitlement",
+                        "dividend_payment",
+                    )
                     or "source:" + journal["id"] in known
                 ):
                     continue
-                _, canonical_cash, action_realized, canonical_fees, canonical_realized = contexts[
-                    journal["id"]
-                ]
+                (
+                    _,
+                    canonical_cash,
+                    action_realized,
+                    canonical_fees,
+                    canonical_realized,
+                    canonical_taxes,
+                ) = contexts[journal["id"]]
                 payload = self._economic_payload(
                     journal,
                     state,
@@ -472,6 +553,7 @@ class SleeveBook:
                     action_realized,
                     canonical_fees,
                     canonical_realized,
+                    canonical_taxes,
                 )
                 at = datetime.fromisoformat(journal["at"])
                 self._event(
@@ -479,12 +561,25 @@ class SleeveBook:
                 )
                 state = self._state()
             actual_account = self.ledger._account(self.account_id)
-            for field in ("fees", "realized"):
-                if exact_sum(state[field].values()) != D(actual_account[field]):
+            for field in ("fees", "realized", "taxes"):
+                if exact_sum(state[field].values()) != (
+                    D(actual_account[field]) if field in actual_account.keys() else ZERO
+                ):
                     raise LedgerError("projected sleeve " + field + " does not reconcile")
             actual = D(actual_account["cash"])
             if exact_sum(state["cash"].values()) != actual:
                 raise LedgerError("projected sleeve cash does not reconcile to canonical cash")
+            actual_receivables = {
+                r.entitlement.action_id: r.outstanding
+                for r in self.ledger.dividend_receivables(self.account_id)
+            }
+            projected_receivables = {
+                key: exact_sum(amounts.values())
+                for key, amounts in state["receivables"].items()
+                if exact_sum(amounts.values())
+            }
+            if actual_receivables != projected_receivables:
+                raise LedgerError("projected sleeve receivables differ from canonical entitlements")
             projected_quantities = defaultdict(lambda: ZERO)
             for positions in state["quantities"].values():
                 for key, qty in positions.items():
@@ -500,6 +595,29 @@ class SleeveBook:
                     "projected sleeve ownership does not reconcile to canonical holdings"
                 )
             return state
+
+    def accrue_dividend(self, action_id, *, at):
+        with self.ledger.atomic():
+            self.sync()
+            result = self.ledger.accrue_dividend(self.account_id, action_id, at=at)
+            self.sync()
+            return result
+
+    def apply_dividend_payment(self, payment, *, as_of):
+        with self.ledger.atomic():
+            self.sync()
+            result = self.ledger.apply_dividend_payment(payment, as_of=as_of)
+            self.sync()
+            return result
+
+    def apply_dividend_distribution(self, distribution, *, as_of):
+        with self.ledger.atomic():
+            self.sync()
+            result = self.ledger.apply_dividend_distribution(
+                self.account_id, distribution, as_of=as_of
+            )
+            self.sync()
+            return result
 
     def apply_account_fee(
         self, fee: AccountFee, amounts: dict[str, D], *, attribution_source_hash: str
@@ -801,7 +919,13 @@ class SleeveBook:
                 for name, amount in partition(order["reserved"], remaining).items():
                     reserved[name] = exact_sum([reserved[name], amount])
             nav = {
-                name: exact_sum([state["cash"][name], *(p.market_value for p in positions[name])])
+                name: exact_sum(
+                    [
+                        state["cash"][name],
+                        *(p.market_value for p in positions[name]),
+                        *(amounts.get(name, ZERO) for amounts in state["receivables"].values()),
+                    ]
+                )
                 for name in names
             }
             rounding = exact_sum([canonical.nav, exact_sum(nav.values()).copy_negate()])
@@ -855,6 +979,17 @@ class SleeveBook:
                     fees=state["fees"][name],
                     turnover_today=state["turnover"][at.date().isoformat()][name],
                     positions=tuple(positions[name]),
+                    receivables=tuple(
+                        DividendReceivable(
+                            entitlement=DividendEntitlement.model_validate(
+                                state["dividend_allocations"][action][name]
+                            ),
+                            outstanding=amounts[name],
+                        )
+                        for action, amounts in sorted(state["receivables"].items())
+                        if amounts.get(name, ZERO) > 0
+                    ),
+                    withholding_taxes=state["taxes"][name],
                 )
                 output[name] = SleeveSnapshot(
                     portfolio=leaf,

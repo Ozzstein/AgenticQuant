@@ -9,7 +9,7 @@ weekdays. The simulator executes only at observed session/bar opens.
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Annotated, Literal
 
 from pydantic import Field, model_serializer, model_validator
@@ -19,6 +19,27 @@ from src.domain.common import Instrument, NonEmptyString, Sha256, UtcTimestamp, 
 Positive = Annotated[Decimal, Field(gt=0)]
 NonNegative = Annotated[Decimal, Field(ge=0)]
 Fraction = Annotated[Decimal, Field(ge=0, le=1)]
+
+
+def exact_decimal_sum(values):
+    values = list(values)
+    if not values:
+        return Decimal(0)
+    precision = (
+        max(v.adjusted() for v in values)
+        - min(v.as_tuple().exponent for v in values)
+        + len(str(len(values)))
+        + 3
+    )
+    with localcontext() as ctx:
+        ctx.prec = max(28, precision)
+        return sum(values, Decimal(0))
+
+
+def exact_decimal_product(left: Decimal, right: Decimal):
+    with localcontext() as ctx:
+        ctx.prec = max(28, len(left.as_tuple().digits) + len(right.as_tuple().digits) + 2)
+        return left * right
 
 
 class _FrozenDict(dict):
@@ -174,6 +195,12 @@ class ExecutionBar(VersionedContract):
 
 
 class CorporateAction(VersionedContract):
+    """Legacy immediate-effective-cash-1 action, not provider ex/pay terms.
+
+    Provider cash dividends must use CashDividend and an actual payment event.
+    This closed schema rejects the additional entitlement/payment fields.
+    """
+
     action_id: NonEmptyString
     instrument: Instrument
     effective_at: UtcTimestamp
@@ -187,6 +214,211 @@ class CorporateAction(VersionedContract):
         if self.kind == "split" and self.value <= 0:
             raise ValueError("split ratio must be positive")
         return self
+
+
+class CashDividend(VersionedContract):
+    """Immutable ordinary cash-dividend terms with explicit ownership evidence."""
+
+    action_id: NonEmptyString
+    revision_id: NonEmptyString
+    supersedes_hash: Sha256 | None = None
+    instrument: Instrument
+    ex_at: UtcTimestamp
+    entitlement_at: UtcTimestamp
+    record_date: date | None
+    payable_date: date | None
+    published_at: UtcTimestamp | None
+    available_at: UtcTimestamp
+    cash_per_unit: Positive
+    currency: NonEmptyString
+    convention: Literal["pre-ex-beneficial-ownership-1"]
+    entitlement_source_id: NonEmptyString
+    entitlement_source_hash: Sha256
+    source_id: NonEmptyString
+    source_hash: Sha256
+
+    @model_validator(mode="after")
+    def causal_terms(self):
+        if self.instrument.asset_class == "crypto":
+            raise ValueError("cash-dividend convention does not establish protocol entitlements")
+        if self.ex_at != self.entitlement_at:
+            raise ValueError("supported ordinary dividend requires explicit pre-ex ownership")
+        if self.published_at is not None and self.published_at > self.available_at:
+            raise ValueError("availability cannot precede known publication")
+        return self
+
+
+class DividendEntitlement(VersionedContract):
+    account_id: NonEmptyString
+    action_id: NonEmptyString
+    terms_hash: Sha256
+    instrument: Instrument
+    at: UtcTimestamp
+    quantity: NonNegative
+    gross_amount: NonNegative
+    currency: NonEmptyString
+    ownership_hash: Sha256
+    # Only sleeve projections set this; the account entitlement is authoritative.
+    parent_entitlement_hash: Sha256 | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.parent_entitlement_hash is None:
+            result.pop("parent_entitlement_hash", None)
+        return result
+
+
+class DividendReceivable(VersionedContract):
+    entitlement: DividendEntitlement
+    outstanding: NonNegative
+
+    @model_validator(mode="after")
+    def no_invented_income(self):
+        if self.outstanding > self.entitlement.gross_amount:
+            raise ValueError("receivable exceeds original entitlement")
+        return self
+
+
+class DividendPayment(VersionedContract):
+    payment_id: NonEmptyString
+    account_id: NonEmptyString
+    action_id: NonEmptyString
+    terms_hash: Sha256
+    entitlement_hash: Sha256
+    origin: Literal["posted-account", "replay-distribution"]
+    effective_date: date
+    observed_at: UtcTimestamp
+    available_at: UtcTimestamp
+    currency: NonEmptyString
+    gross_amount: NonNegative
+    net_amount: NonNegative
+    fee: NonNegative
+    withholding_tax: NonNegative
+    fee_source_hash: Sha256 | None
+    tax_source_hash: Sha256 | None
+    source_id: NonEmptyString
+    source_hash: Sha256
+
+    @model_validator(mode="after")
+    def reconciled_payment(self):
+        if self.gross_amount != exact_decimal_sum(
+            [self.net_amount, self.fee, self.withholding_tax]
+        ):
+            raise ValueError("actual gross payment must equal net cash plus explicit fee/tax")
+        if self.observed_at > self.available_at or self.effective_date > self.observed_at.date():
+            raise ValueError("payment requires causal occurrence/receipt/availability")
+        if (self.fee and self.fee_source_hash is None) or (
+            self.withholding_tax and self.tax_source_hash is None
+        ):
+            raise ValueError("actual deductions require explicit source bindings")
+        return self
+
+
+class DividendDistribution(VersionedContract):
+    """Actual published per-unit distribution, sized from each replay's entitlement."""
+
+    distribution_id: NonEmptyString
+    action_id: NonEmptyString
+    terms_hash: Sha256
+    effective_date: date
+    observed_at: UtcTimestamp
+    available_at: UtcTimestamp
+    currency: NonEmptyString
+    gross_per_unit: Positive
+    net_per_unit: NonNegative
+    fee_per_unit: NonNegative
+    withholding_per_unit: NonNegative
+    fee_source_hash: Sha256 | None
+    tax_source_hash: Sha256 | None
+    source_id: NonEmptyString
+    source_hash: Sha256
+
+    def payment(self, entitlement: DividendEntitlement) -> DividendPayment:
+        return DividendPayment(
+            payment_id="distribution:" + self.distribution_id,
+            account_id=entitlement.account_id,
+            action_id=self.action_id,
+            terms_hash=self.terms_hash,
+            entitlement_hash=entitlement.content_hash(),
+            origin="replay-distribution",
+            effective_date=self.effective_date,
+            observed_at=self.observed_at,
+            available_at=self.available_at,
+            currency=self.currency,
+            gross_amount=exact_decimal_product(entitlement.quantity, self.gross_per_unit),
+            net_amount=exact_decimal_product(entitlement.quantity, self.net_per_unit),
+            fee=exact_decimal_product(entitlement.quantity, self.fee_per_unit),
+            withholding_tax=exact_decimal_product(entitlement.quantity, self.withholding_per_unit),
+            fee_source_hash=self.fee_source_hash,
+            tax_source_hash=self.tax_source_hash,
+            source_id=self.source_id,
+            source_hash=self.source_hash,
+        )
+
+    @model_validator(mode="after")
+    def exact_distribution(self):
+        if self.gross_per_unit != exact_decimal_sum(
+            [self.net_per_unit, self.fee_per_unit, self.withholding_per_unit]
+        ):
+            raise ValueError("distribution rates require actual reconciled gross/net/deductions")
+        if self.observed_at > self.available_at or self.effective_date > self.observed_at.date():
+            raise ValueError("distribution notice has invalid availability")
+        if (self.fee_per_unit and self.fee_source_hash is None) or (
+            self.withholding_per_unit and self.tax_source_hash is None
+        ):
+            raise ValueError("distribution deductions require explicit source bindings")
+        return self
+
+
+class ActionCoverage(VersionedContract):
+    """Documented source scope; a process-date query is not economic coverage."""
+
+    coverage_id: NonEmptyString
+    instrument_ids: tuple[NonEmptyString, ...]
+    venue: NonEmptyString
+    scope: Literal[
+        "effective-event-stream",
+        "provider-process-date-query",
+        "custodial-credit-ledger",
+        "protocol-state-events",
+    ]
+    started_at: UtcTimestamp
+    ended_at: UtcTimestamp
+    available_at: UtcTimestamp
+    event_types: tuple[NonEmptyString, ...]
+    completeness: Literal["complete", "partial", "unknown"]
+    gaps: tuple[NonEmptyString, ...]
+    source_id: NonEmptyString
+    source_hash: Sha256
+
+    @model_validator(mode="after")
+    def declared_coverage(self):
+        if self.started_at >= self.ended_at or not self.instrument_ids or not self.event_types:
+            raise ValueError(
+                "explicit nonempty action coverage window, instruments and types required"
+            )
+        if len(set(self.instrument_ids)) != len(self.instrument_ids) or len(
+            set(self.event_types)
+        ) != len(self.event_types):
+            raise ValueError("duplicate action coverage identities")
+        if self.completeness == "complete" and self.gaps:
+            raise ValueError("complete action coverage cannot retain gaps")
+        return self
+
+    def require_complete(self, *, instrument_ids, started_at, ended_at, as_of, scope, event_types):
+        if (
+            self.completeness != "complete"
+            or self.gaps
+            or self.available_at > as_of
+            or self.scope != scope
+            or scope == "provider-process-date-query"
+            or self.started_at > started_at
+            or self.ended_at < ended_at
+            or not set(instrument_ids) <= set(self.instrument_ids)
+            or not set(event_types) <= set(self.event_types)
+        ):
+            raise ValueError("source does not establish required economic action coverage")
 
 
 class Holding(VersionedContract):
@@ -221,6 +453,12 @@ class PortfolioSnapshot(VersionedContract):
     turnover_today: NonNegative
     positions: tuple[Holding, ...] = ()
     sleeves: dict[str, "SleeveSnapshot"] = Field(default_factory=dict)
+    receivables: tuple[DividendReceivable, ...] = ()
+    withholding_taxes: NonNegative = Decimal(0)
+
+    @property
+    def receivable_balance(self):
+        return exact_decimal_sum(r.outstanding for r in self.receivables)
 
     @model_validator(mode="after")
     def immutable_sleeves(self):
@@ -232,6 +470,10 @@ class PortfolioSnapshot(VersionedContract):
         result = handler(self)
         if not self.sleeves:
             result.pop("sleeves", None)
+        if not self.receivables:
+            result.pop("receivables", None)
+        if not self.withholding_taxes:
+            result.pop("withholding_taxes", None)
         return result
 
 

@@ -149,6 +149,19 @@ def reconstruct_oos_inputs(
         "actions": [
             a for a in original_inputs.get("actions") or [] if a.effective_at > account.opened_at
         ],
+        "cash_dividends": [
+            t
+            for t in original_inputs.get("cash_dividends") or []
+            if t.entitlement_at > account.opened_at
+        ],
+        "dividend_distributions": [
+            d
+            for d in original_inputs.get("dividend_distributions") or []
+            if any(
+                t.action_id == d.action_id and t.entitlement_at > account.opened_at
+                for t in original_inputs.get("cash_dividends") or []
+            )
+        ],
         "fill_policy": FillPolicy.model_validate(manifest["fill_policy"]),
         "risk_policy": RiskPolicy.model_validate(manifest["risk_policy"]),
         "topk": manifest["topk"],
@@ -198,6 +211,8 @@ class WalkForwardRunner:
         valuation_times=None,
         provenance=None,
         actions=None,
+        cash_dividends=None,
+        dividend_distributions=None,
     ):
         if mode != "expanding":
             raise BacktestError("only expanding walk-forward is implemented")
@@ -471,6 +486,15 @@ class WalkForwardRunner:
                 signals=signals,
                 topk=topk,
                 actions=[a for a in (actions or []) if a.effective_at >= oos_start],
+                cash_dividends=[t for t in cash_dividends or [] if t.entitlement_at >= oos_start],
+                dividend_distributions=[
+                    d
+                    for d in dividend_distributions or []
+                    if any(
+                        t.action_id == d.action_id and t.entitlement_at >= oos_start
+                        for t in cash_dividends or []
+                    )
+                ],
                 fill_policy=fill_policy or FillPolicy(equity_cost_bps=D(str(cost_bps))),
                 risk_policy=risk_policy,
                 samples_per_year=samples_per_year,

@@ -19,12 +19,14 @@ from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer, model_validator
 
 from src.domain.common import RunContext, Sha256, UtcTimestamp, VersionedContract, _utc
 from src.domain.portfolio import (
     AccountSpec,
+    CashDividend,
     CorporateAction,
+    DividendDistribution,
     ExecutionBar,
     FillPolicy,
     InstrumentRisk,
@@ -120,6 +122,14 @@ class ReplayResult(BaseModel):
     cross_sectional_ic: dict[str, float | None] = Field(default_factory=dict)
     reconciliation: dict
     diagnostics: list[str] = Field(default_factory=list)
+    economic_events: list[dict] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if not self.economic_events:
+            result.pop("economic_events", None)
+        return result
 
 
 class ReplayArtifact(BaseModel):
@@ -251,7 +261,29 @@ def recorded_replay_inputs(ledger: PortfolioLedger, result: ReplayResult) -> dic
         )
     if "sleeve_capital" in manifest:
         inputs["sleeve_capital"] = {k: D(v) for k, v in manifest["sleeve_capital"].items()}
+    for name, contract in (
+        ("cash_dividends", CashDividend),
+        ("dividend_distributions", DividendDistribution),
+    ):
+        if name + "_hash" in manifest:
+            inputs[name] = records("input:" + name + ":", contract)
     return inputs
+
+
+def recorded_income_events(ledger: PortfolioLedger, account_id: str) -> list[dict]:
+    return [
+        {
+            "id": row["id"],
+            "kind": row["kind"],
+            "at": row["at"],
+            "payload": json.loads(row["payload"]),
+            "cash_delta": row["cash_delta"],
+        }
+        for row in ledger.db.execute(
+            "SELECT * FROM journal WHERE account=? AND kind IN ('dividend_entitlement','dividend_payment') ORDER BY sequence",
+            (account_id,),
+        )
+    ]
 
 
 def replay_request_manifest(manifest: dict) -> dict:
@@ -307,6 +339,7 @@ def _same_replay_economics(left: ReplayResult, right: ReplayResult) -> bool:
         "trades",
         "decisions",
         "reconciliation",
+        "economic_events",
     )
     return all(getattr(left, field) == getattr(right, field) for field in fields)
 
@@ -314,10 +347,14 @@ def _same_replay_economics(left: ReplayResult, right: ReplayResult) -> bool:
 def verify_decision_trace(ledger: PortfolioLedger, result: ReplayResult, inputs: dict) -> None:
     records = recorded_decisions(ledger, result)
     if "decision_recipe_hash" not in result.manifest:
-        if "sleeve_capital" in result.manifest:
+        if (
+            "sleeve_capital" in result.manifest
+            or "cash_dividends_hash" in result.manifest
+            or result.economic_events
+        ):
             reproduced = PortfolioReplay(":memory:").run(**inputs)
             if not _same_replay_economics(reproduced, result):
-                raise BacktestError("sleeve target replay does not reproduce exact economics")
+                raise BacktestError("sleeve/income replay does not reproduce exact economics")
         return
     if [r.target for r in records if r.target is not None] != inputs["targets"]:
         raise BacktestError("generated target events differ from recorded callback outputs")
@@ -397,6 +434,11 @@ def require_matching_inputs(result: ReplayResult, inputs: dict) -> None:
         "valuation_calendar": inputs.get("valuation_calendar", "declared-equity-sessions"),
     }
     times = inputs.get("valuation_times")
+    for name in ("cash_dividends", "dividend_distributions"):
+        if name + "_hash" in result.manifest or inputs.get(name):
+            expected[name + "_hash"] = canonical_hash(
+                [item.model_dump(mode="json") for item in inputs.get(name) or []]
+            )
     if times is None:
         times = sorted({b.closed_at for b in inputs["bars"]})
     expected["valuation_times"] = [t.isoformat() for t in times]
@@ -478,6 +520,8 @@ class PortfolioReplay:
         decision_times: list[datetime] | None = None,
         decision_recipe_hash: str | None = None,
         sleeve_capital: dict[str, Decimal] | None = None,
+        cash_dividends: list[CashDividend] | None = None,
+        dividend_distributions: list[DividendDistribution] | None = None,
     ) -> ReplayResult:
         if (
             context.mode != "backtest"
@@ -511,6 +555,37 @@ class PortfolioReplay:
         if topk < 1 or samples_per_year <= 0:
             raise BacktestError("topk and annualization must be positive")
         signals, targets, actions = signals or [], targets or [], actions or []
+        cash_dividends = [CashDividend.model_validate(t.model_dump()) for t in cash_dividends or []]
+        dividend_distributions = [
+            DividendDistribution.model_validate(t.model_dump())
+            for t in dividend_distributions or []
+        ]
+        if len({(t.action_id, t.revision_id) for t in cash_dividends}) != len(
+            cash_dividends
+        ) or len({t.distribution_id for t in dividend_distributions}) != len(
+            dividend_distributions
+        ):
+            raise BacktestError("duplicate dividend terms/distribution identities")
+        if any(
+            t.entitlement_at < account.opened_at
+            or t.available_at > t.entitlement_at
+            or t.entitlement_at > context.as_of
+            for t in cash_dividends
+        ):
+            raise BacktestError(
+                "dividend terms require actual causal entitlement inside evaluation"
+            )
+        if any(
+            a.kind == "dividend"
+            and any(
+                a.instrument == t.instrument and a.effective_at == t.entitlement_at
+                for t in cash_dividends
+            )
+            for a in actions
+        ):
+            raise BacktestError(
+                "immediate cash and ex/pay dividend conventions cannot be double counted"
+            )
         policy, risk = fill_policy or FillPolicy(), risk_policy or RiskPolicy()
         bars = sorted(bars, key=lambda b: (b.opened_at, b.instrument.instrument_id))
         if len({b.event_id for b in bars}) != len(bars):
@@ -532,6 +607,10 @@ class PortfolioReplay:
             raise BacktestError(
                 "daily metrics require an explicit one-observation-per-day valuation schedule"
             )
+        if any(t.entitlement_at > times[-1] for t in cash_dividends) or any(
+            d.available_at > times[-1] for d in dividend_distributions
+        ):
+            raise BacktestError("income events require a subsequent explicit valuation observation")
         if account.opened_at > bars[0].opened_at or max(b.closed_at for b in bars) > context.as_of:
             raise BacktestError("market data outside account/run clock")
         identities = {}
@@ -631,6 +710,14 @@ class PortfolioReplay:
                 decision_recipe_hash=decision_recipe_hash,
                 decision_times=[at.isoformat() for at in decision_times],
             )
+        for name, values in (
+            ("cash_dividends", cash_dividends),
+            ("dividend_distributions", dividend_distributions),
+        ):
+            if values:
+                manifest[name + "_hash"] = canonical_hash(
+                    [v.model_dump(mode="json") for v in values]
+                )
         if sleeve_capital is not None:
             manifest["sleeve_capital"] = {
                 k: str(D(str(v))) for k, v in sorted(sleeve_capital.items())
@@ -711,6 +798,8 @@ class PortfolioReplay:
                     ("metadata", metadata),
                     ("universe", universes),
                     ("action", actions),
+                    ("cash_dividends", cash_dividends),
+                    ("dividend_distributions", dividend_distributions),
                 ):
                     for record in records:
                         ledger.record_event(
@@ -732,6 +821,12 @@ class PortfolioReplay:
                 timeline[b.closed_at]["closes"].append(b)
             for a in actions:
                 timeline[a.effective_at]["actions"].append(a)
+            for terms in cash_dividends:
+                timeline[max(account.opened_at, terms.available_at)]["dividend_terms"].append(terms)
+                if terms.action_id not in timeline[terms.entitlement_at]["entitlements"]:
+                    timeline[terms.entitlement_at]["entitlements"].append(terms.action_id)
+            for notice in dividend_distributions:
+                timeline[notice.available_at]["dividend_distributions"].append(notice)
             for t in times:
                 timeline[t]["valuation"] = True
             for at, group in signal_groups.items():
@@ -753,6 +848,25 @@ class PortfolioReplay:
                     # same boundary. Signals at that boundary cannot fill that open.
                     for b in event["closes"]:
                         engine.close_bar(b)
+                    for terms in event["dividend_terms"]:
+                        ledger.register_cash_dividend(account.account_id, terms, as_of=at)
+                    for action_id in event["entitlements"]:
+                        from src.execution.dividends import current_terms
+
+                        if (
+                            current_terms(ledger, account.account_id, action_id).entitlement_at
+                            != at
+                        ):
+                            continue  # A source-backed pre-entitlement revision changed the boundary.
+                        if sleeve_book is not None:
+                            sleeve_book.accrue_dividend(action_id, at=at)
+                        else:
+                            ledger.accrue_dividend(account.account_id, action_id, at=at)
+                    for notice in event["dividend_distributions"]:
+                        if sleeve_book is not None:
+                            sleeve_book.apply_dividend_distribution(notice, as_of=at)
+                        else:
+                            ledger.apply_dividend_distribution(account.account_id, notice, as_of=at)
                     for a in event["actions"]:
                         ledger.corporate_action(account.account_id, a)
                     # Mark all simultaneous opens before evaluating portfolio risk.
@@ -906,6 +1020,7 @@ class PortfolioReplay:
                 trades=trades,
                 decisions=decisions,
                 reconciliation=reconciliation,
+                economic_events=recorded_income_events(ledger, account.account_id),
                 diagnostics=[
                     f"{sum(o['outcome'].startswith('rejected') for d in decisions for o in d['orders'])} order intents rejected by deterministic risk; inspect decisions"
                 ]

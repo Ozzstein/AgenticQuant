@@ -16,11 +16,13 @@ from src.core.backtester import (
     canonical_hash,
     load_replay_artifact,
     performance_metrics,
+    recorded_income_events,
     recorded_replay_inputs,
     require_matching_inputs,
     verify_decision_trace,
 )
 from src.domain.common import Sha256, VersionedContract
+from src.domain.portfolio import DividendPayment, exact_decimal_sum
 from src.execution.ledger import PortfolioLedger
 from src.utils.exceptions import BacktestError
 from src.utils.schemas import CheckResult, CheckVerdict, ValidationReport
@@ -105,10 +107,12 @@ class ValidationSuite:
             )
             require([float(s.nav) for s in snapshots] == result.equity_curve, "NAV curve mismatch")
             for snapshot in snapshots:
+                nav = snapshot.cash + sum((p.market_value for p in snapshot.positions), Decimal(0))
+                if snapshot.receivables:
+                    nav = exact_decimal_sum([nav, snapshot.receivable_balance])
                 require(
-                    snapshot.cash + sum((p.market_value for p in snapshot.positions), Decimal(0))
-                    == snapshot.nav,
-                    "cash + holdings != NAV",
+                    nav == snapshot.nav,
+                    "cash + holdings + nonspendable receivables != NAV",
                 )
                 require(snapshot.reserved_cash <= snapshot.cash, "over-reserved cash")
             computed = performance_metrics(result.equity_curve, result.manifest["samples_per_year"])
@@ -134,6 +138,25 @@ class ValidationSuite:
                 )
             require(result.metrics.total_trades == len(result.trades), "trade count mismatch")
             fees = sum((Decimal(trade["fee"]) for trade in result.trades), Decimal(0))
+            taxes = Decimal(0)
+            if result.economic_events:
+                # Match the canonical chronological Decimal accumulation order,
+                # including deductions that are not a trading fill.
+                fees = Decimal(0)
+                entries = [(t["executed_at"], 1, t) for t in result.trades]
+                entries += [
+                    (e["at"], 0, e)
+                    for e in result.economic_events
+                    if e["kind"] == "dividend_payment"
+                ]
+                for _, kind, entry in sorted(entries, key=lambda e: (e[0], e[1])):
+                    if kind:
+                        fees += Decimal(entry["fee"])
+                    else:
+                        payment = DividendPayment.model_validate(entry["payload"])
+                        fees = exact_decimal_sum([fees, payment.fee])
+                        taxes = exact_decimal_sum([taxes, payment.withholding_tax])
+            require(taxes == snapshots[-1].withholding_taxes, "withholding tax mismatch")
             require(
                 fees == snapshots[-1].fees
                 and math.isclose(float(fees), result.metrics.fees, rel_tol=1e-12, abs_tol=1e-12),
@@ -215,6 +238,10 @@ class ValidationSuite:
                 require(
                     expected_trades == result.trades,
                     "persisted full fill/order/economic content differs",
+                )
+                require(
+                    recorded_income_events(ledger, result.account_id) == result.economic_events,
+                    "persisted entitlement/payment journal content differs",
                 )
                 check(
                     "durable_accounting",

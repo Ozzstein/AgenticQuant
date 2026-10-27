@@ -20,12 +20,17 @@ from src.domain.common import Instrument, _utc
 from src.domain.portfolio import (
     AccountFee,
     AccountSpec,
+    ActionCoverage,
     CorporateAction,
+    DividendEntitlement,
+    DividendPayment,
+    DividendReceivable,
     Fill,
     Holding,
     OrderIntent,
     PortfolioSnapshot,
     PriceMark,
+    exact_decimal_sum,
 )
 
 D = Decimal
@@ -92,7 +97,20 @@ class PortfolioLedger:
         CREATE TABLE IF NOT EXISTS runs (
             account TEXT NOT NULL REFERENCES accounts(id), id TEXT NOT NULL, payload TEXT NOT NULL,
             PRIMARY KEY(account,id));
+        CREATE TABLE IF NOT EXISTS dividend_terms (
+            account TEXT NOT NULL REFERENCES accounts(id), action TEXT NOT NULL,
+            revision TEXT NOT NULL, terms_hash TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY(account,action,revision), UNIQUE(account,terms_hash));
+        CREATE TABLE IF NOT EXISTS dividend_entitlements (
+            account TEXT NOT NULL REFERENCES accounts(id), action TEXT NOT NULL,
+            payload TEXT NOT NULL, outstanding TEXT NOT NULL, PRIMARY KEY(account,action));
+        CREATE TABLE IF NOT EXISTS dividend_payments (
+            account TEXT NOT NULL REFERENCES accounts(id), id TEXT NOT NULL,
+            payload TEXT NOT NULL, PRIMARY KEY(account,id));
         """)
+        with self.atomic():
+            if "taxes" not in {row[1] for row in self.db.execute("PRAGMA table_info(accounts)")}:
+                self.db.execute("ALTER TABLE accounts ADD COLUMN taxes TEXT NOT NULL DEFAULT '0'")
 
     @contextmanager
     def atomic(self):
@@ -126,7 +144,7 @@ class PortfolioLedger:
                     raise LedgerError("account already exists with different initial conditions")
                 return
             self.db.execute(
-                "INSERT INTO accounts VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO accounts(id,spec,cash,realized,fees,peak,last_at) VALUES (?,?,?,?,?,?,?)",
                 (
                     spec.account_id,
                     spec.model_dump_json(),
@@ -326,7 +344,7 @@ class PortfolioLedger:
                 if self.spec(fill.account_id).mode == "backtest" or booked_at < fill.executed_at:
                     raise LedgerError("operational receipt must follow actual execution")
                 latest = self.db.execute(
-                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist','account_fee') ORDER BY sequence DESC LIMIT 1",
+                    "SELECT at FROM journal WHERE account=? AND kind IN ('fill','split','dividend','delist','account_fee','dividend_entitlement','dividend_payment') ORDER BY sequence DESC LIMIT 1",
                     (fill.account_id,),
                 ).fetchone()
                 if latest and datetime.fromisoformat(latest[0]) > fill.executed_at:
@@ -544,7 +562,10 @@ class PortfolioLedger:
                         opened_at=self.position_opened_at(account, h["instrument"]),
                     )
                 )
+            receivables = self.dividend_receivables(account)
             nav = D(row["cash"]) + sum((p.market_value for p in positions), ZERO)
+            if receivables:
+                nav = exact_decimal_sum([nav, *(r.outstanding for r in receivables)])
             peak = max(D(row["peak"]), nav)
             turnover = sum(
                 (
@@ -567,6 +588,8 @@ class PortfolioLedger:
                 fees=D(row["fees"]),
                 turnover_today=turnover,
                 positions=tuple(positions),
+                receivables=tuple(receivables),
+                withholding_taxes=D(row["taxes"]) if "taxes" in row.keys() else ZERO,
             )
             if persist:
                 existing = self.db.execute(
@@ -582,6 +605,43 @@ class PortfolioLedger:
                     (account, at.isoformat(), snap.model_dump_json()),
                 )
             return snap
+
+    def register_cash_dividend(self, account, terms, *, as_of):
+        from src.execution.dividends import register_terms
+
+        return register_terms(self, account, terms, as_of=as_of)
+
+    def record_action_coverage(self, account, coverage: ActionCoverage, *, as_of):
+        """Retain actual coverage/gaps; recording is not proof of completeness."""
+        coverage = ActionCoverage.model_validate(coverage.model_dump())
+        as_of = _utc(as_of)
+        if coverage.available_at > as_of or coverage.ended_at > as_of:
+            raise LedgerError("action coverage cannot use future source availability/window")
+        with self.atomic():
+            self.spec(account)
+            return self.record_event(
+                account, "action-coverage:" + coverage.coverage_id, coverage.model_dump_json()
+            )
+
+    def accrue_dividend(self, account, action_id, *, at):
+        from src.execution.dividends import accrue
+
+        return accrue(self, account, action_id, at=at)
+
+    def apply_dividend_payment(self, payment, *, as_of):
+        from src.execution.dividends import apply_payment
+
+        return apply_payment(self, payment, as_of=as_of)
+
+    def apply_dividend_distribution(self, account, distribution, *, as_of):
+        from src.execution.dividends import apply_distribution
+
+        return apply_distribution(self, account, distribution, as_of=as_of)
+
+    def dividend_receivables(self, account) -> list[DividendReceivable]:
+        from src.execution.dividends import receivables
+
+        return receivables(self, account)
 
     def position_opened_at(self, account: str, instrument_id: str) -> datetime | None:
         """Derive holding age from actual economics visible in this transaction.
@@ -712,11 +772,30 @@ class PortfolioLedger:
 
     def reconcile(self, account: str) -> dict:
         """Independently replay persisted economic fills/actions to check cash/basis."""
+        from src.execution.dividends import (
+            current_terms,
+            expected_entitlement,
+            verify_payment,
+            verify_projections,
+        )
+
         cash, positions, realized, fees = ZERO, {}, ZERO, ZERO
+        accrued, payments, outstanding, taxes = {}, {}, {}, ZERO
         for row in self.db.execute(
             "SELECT * FROM journal WHERE account=? ORDER BY sequence", (account,)
         ):
-            cash += D(row["cash_delta"])
+            if row["kind"] in ("dividend_entitlement", "dividend_payment"):
+                cash = exact_decimal_sum([cash, D(row["cash_delta"])])
+            elif row["kind"] in ("deposit", "fill", "account_fee"):
+                cash += D(row["cash_delta"])
+            elif row["kind"] in ("dividend", "delist"):
+                action = CorporateAction.model_validate_json(row["payload"])
+                if positions.get(action.instrument.instrument_id, (ZERO, ZERO))[0]:
+                    cash += D(row["cash_delta"])
+                elif D(row["cash_delta"]):
+                    raise LedgerError("action cash without historical ownership")
+            elif D(row["cash_delta"]):
+                raise LedgerError("nonmonetary journal entry cannot change cash")
             if row["kind"] == "fill":
                 f = Fill.model_validate_json(row["payload"])
                 intent = self.order(account, f.intent_id)["intent"]
@@ -737,6 +816,42 @@ class PortfolioLedger:
                     raise LedgerError("account fee cash entry differs from its source")
                 realized -= fee.amount
                 fees += fee.amount
+            elif row["kind"] == "dividend_entitlement":
+                entry = DividendEntitlement.model_validate_json(row["payload"])
+                terms = current_terms(self, account, entry.action_id)
+                if (
+                    entry != expected_entitlement(self, account, terms)
+                    or entry.account_id != account
+                    or row["at"] != entry.at.isoformat()
+                    or terms.available_at > entry.at
+                    or D(row["cash_delta"]) != 0
+                    or entry.action_id in accrued
+                ):
+                    raise LedgerError(
+                        "dividend entitlement differs from historical source ownership"
+                    )
+                accrued[entry.action_id], outstanding[entry.action_id] = entry, entry.gross_amount
+                realized = exact_decimal_sum([realized, entry.gross_amount])
+            elif row["kind"] == "dividend_payment":
+                payment = DividendPayment.model_validate_json(row["payload"])
+                verify_payment(self, payment, as_of=payment.available_at)
+                if (
+                    payment.action_id not in accrued
+                    or payment.payment_id in payments
+                    or row["at"] != payment.available_at.isoformat()
+                    or D(row["cash_delta"]) != payment.net_amount
+                    or outstanding[payment.action_id] < payment.gross_amount
+                ):
+                    raise LedgerError("dividend payment journal does not reconcile")
+                outstanding[payment.action_id] = exact_decimal_sum(
+                    [outstanding[payment.action_id], payment.gross_amount.copy_negate()]
+                )
+                realized = exact_decimal_sum(
+                    [realized, payment.fee.copy_negate(), payment.withholding_tax.copy_negate()]
+                )
+                fees = exact_decimal_sum([fees, payment.fee])
+                taxes = exact_decimal_sum([taxes, payment.withholding_tax])
+                payments[payment.payment_id] = payment
             elif row["kind"] in ("split", "dividend", "delist"):
                 a = CorporateAction.model_validate_json(row["payload"])
                 key = a.instrument.instrument_id
@@ -754,21 +869,29 @@ class PortfolioLedger:
         }
         expected = {k: v for k, v in positions.items() if v[0]}
         state = self._account(account)
+        verify_projections(self, account, accrued, payments, outstanding)
         valid = (
             cash == D(state["cash"])
             and stored == expected
             and realized == D(state["realized"])
             and fees == D(state["fees"])
+            and taxes == (D(state["taxes"]) if "taxes" in state.keys() else ZERO)
         )
         if not valid:
             raise LedgerError("ledger reconciliation failed")
-        return {
+        result = {
             "reconciled": True,
             "cash": str(cash),
             "realized_pnl": str(realized),
             "fees": str(fees),
             "positions": len(stored),
         }
+        if accrued:
+            result.update(
+                receivables=str(exact_decimal_sum(outstanding.values())),
+                withholding_taxes=str(taxes),
+            )
+        return result
 
     def save_run(self, account: str, run_id: str, payload: dict):
         with self.atomic():

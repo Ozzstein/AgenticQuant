@@ -427,6 +427,8 @@ def require_matched_replay(baseline: ReplayResult, candidate: ReplayResult, *, c
         "metadata_hash",
         "universe_hash",
         "actions_hash",
+        "cash_dividends_hash",
+        "dividend_distributions_hash",
         "risk_policy",
         "topk",
         "samples_per_year",
@@ -605,6 +607,9 @@ def verify_comparison(
         expected = baseline.timestamps if key == "timestamps" else baseline.manifest[key]
         if comparison.match.get(key) != expected:
             raise BacktestError("benchmark declared match differs from strategy")
+    for key in ("cash_dividends_hash", "dividend_distributions_hash"):
+        if comparison.match.get(key) != baseline.manifest.get(key):
+            raise BacktestError("benchmark dividend input bindings differ from strategy")
     for name, summary_name in (
         ("SPY", "SPY"),
         ("BTC", "BTC"),
@@ -711,6 +716,11 @@ class BenchmarkRunner:
             simulations=n_simulations,
             seed=seed,
             match={
+                **{
+                    key: result.manifest[key]
+                    for key in ("cash_dividends_hash", "dividend_distributions_hash")
+                    if key in result.manifest
+                },
                 "bars_hash": result.manifest["bars_hash"],
                 "metadata_hash": result.manifest["metadata_hash"],
                 "signals_hash": result.manifest["signals_hash"],
@@ -864,6 +874,11 @@ class BenchmarkRunner:
 
 def _callback_match(baseline, opportunities):
     return {
+        **{
+            key: baseline.manifest[key]
+            for key in ("cash_dividends_hash", "dividend_distributions_hash")
+            if key in baseline.manifest
+        },
         **{
             key: baseline.manifest[key]
             for key in (
