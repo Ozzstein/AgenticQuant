@@ -132,3 +132,7 @@ These are local deterministic integration/invariant exercises with synthetic sou
 `blend_sleeves(..., current_weights=..., current_contributions=...)` now requires reconciled actual sleeve ownership when multiple sleeves hold positions. HOLD/ABSTAIN/VETO preserve that actual ownership despite allocation changes; REDUCE cannot increase it. Vetoes suppress proposed additions without shrinking preserved holdings. Context, signal cutoff, universe version and data snapshot must agree before netting. Output attributes retain `context`, `allocations`, `data_snapshot_hash`, `universe_version`, `signal_at`, `strategy_hashes`, `model_artifact_hashes`, each complete `sleeve_provenance`, `contributions` and `vetoed`. No duplicate portfolio schema is introduced.
 
 Verification: `tests/test_feature_fidelity.py tests/test_executable_strategies.py` under `--disable-socket`: **31 passed in 3.81s**, including all baseline expressions, rejected noncausal/unsafe syntax, mismatched sleeve identity, immutable provenance and passive holdings under allocation changes.
+
+## Exact calendar interval follow-up
+
+US calendar construction now pads provider bounds by 14 days before querying the exact requested interval. Single sessions work, single weekends/holidays return an empty mapping, reversed ranges fail for both US and continuous crypto calendars, and actual DST open/close times are retained. `tests/test_market_calendars.py`: **7 passed in 0.69s**, exchange-calendars 4.13.2, `--disable-socket`.
