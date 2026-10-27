@@ -139,7 +139,7 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     observed = dataset.features.index.get_level_values("datetime")
     if current_sampling:
         available = dataset.feature_available_at.reindex(dataset.features.index)
-        candidate = dataset.features.loc[(observed <= date) & available.notna() & (available <= context.as_of)]
+        candidate = dataset.features.loc[(observed <= date) & (available.isna() | (available <= context.as_of))]
         # Choose the latest observed row before screening finite/ADV values;
         # missing essential fields cannot silently fall back to an older row.
         rows = candidate.sort_index().groupby(level="instrument", sort=False).tail(1)
@@ -148,7 +148,7 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     ready = dataset.feature_available_at.reindex(rows.index)
     source_dates = rows.index.get_level_values('datetime')
     result.attrs['feature_observed_ats'] = {key:pd.Timestamp(at).isoformat() for at,key in rows.index if key in eligible}
-    result.attrs['feature_available_ats'] = {key:pd.Timestamp(ready.loc[(at,key)]).isoformat() for at,key in rows.index if key in eligible}
+    result.attrs['feature_available_ats'] = {key:pd.Timestamp(ready.loc[(at,key)]).isoformat() if pd.notna(ready.loc[(at,key)]) else None for at,key in rows.index if key in eligible}
     availability_cutoff = context.as_of if current_sampling else date
     valid = (rows.apply(lambda row: np.isfinite(row.to_numpy(dtype=float)).all(), axis=1)
              & ready.notna() & (ready <= availability_cutoff)

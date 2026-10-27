@@ -391,6 +391,22 @@ def test_latest_available_mixed_closes_keep_sources_and_current_membership():
     altered.feature_available_at.iloc[0]=context.as_of+pd.Timedelta(seconds=1)
     blocked=evaluate_strategy(spec,altered,context,feature_sampling_policy='latest-available-per-instrument-1',**args)
     assert blocked.loc[equity.instrument_id,'action']=='ABSTAIN'
+    previous=close-pd.Timedelta(hours=1)
+    extra=features.loc[[(close,equity.instrument_id)]].copy()
+    extra.index=pd.MultiIndex.from_tuples([(previous,equity.instrument_id)],names=index.names)
+    extended=pd.concat([extra,features]).sort_index()
+    ready=availability.reindex(extended.index)
+    ready.loc[(previous,equity.instrument_id)]=availability.iloc[0]
+    ready.loc[(close,equity.instrument_id)]=pd.NaT
+    incomplete=FeatureDataset(extended,dataset.labels,ready,dataset.label_available_at,'a'*64,dataset.feature_spec_hash)
+    missing=evaluate_strategy(spec,incomplete,context,feature_sampling_policy='latest-available-per-instrument-1',**args)
+    assert missing.loc[equity.instrument_id,'action']=='ABSTAIN'
+    assert missing.attrs['feature_observed_ats'][equity.instrument_id]==close.isoformat()
+    assert missing.attrs['feature_available_ats'][equity.instrument_id] is None
+    ready.loc[(close,equity.instrument_id)]=context.as_of+pd.Timedelta(seconds=1)
+    older=evaluate_strategy(spec,incomplete,context,feature_sampling_policy='latest-available-per-instrument-1',**args)
+    assert older.loc[equity.instrument_id,'action']=='BUY'
+    assert older.attrs['feature_observed_ats'][equity.instrument_id]==previous.isoformat()
     sleeves={'mixed':output,'equity':output.loc[[equity.instrument_id]].copy()}
     sleeves['mixed'].attrs={**output.attrs,'strategy':'mixed'}
     sleeves['equity'].attrs={**output.attrs,'strategy':'equity','signal_at':close.isoformat()}
