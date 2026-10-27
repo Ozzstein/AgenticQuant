@@ -6,6 +6,7 @@ import json
 import math
 import sqlite3
 from decimal import Decimal
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -19,9 +20,26 @@ from src.core.backtester import (
     require_matching_inputs,
     verify_decision_trace,
 )
+from src.domain.common import Sha256, VersionedContract
 from src.execution.ledger import PortfolioLedger
 from src.utils.exceptions import BacktestError
 from src.utils.schemas import CheckResult, CheckVerdict, ValidationReport
+
+
+class AdviceValidationProof(VersionedContract):
+    """Trusted verifier output, never constructed from manifest claims alone.
+
+    The injected application verifier must reexport/recompute authoritative
+    histories and compare actual replay evidence before returning this contract.
+    It is an in-process trust boundary, not a user-supplied approval artifact.
+    """
+
+    implementation: Literal["authoritative-advice-v1"] = "authoritative-advice-v1"
+    manifest_hash: Sha256
+    decision_records_hash: Sha256
+    actual_decision_hashes: tuple[Sha256, ...]
+    # Sorted unique (decision hash, receipt hash, original review snapshot hash).
+    receipt_bindings: tuple[tuple[Sha256, Sha256, Sha256], ...]
 
 
 class ValidationSuite:
@@ -36,6 +54,7 @@ class ValidationSuite:
         cost_results=None,
         cost_artifacts=None,
         benchmark=None,
+        advice_verifier=None,
         _accounting_only=False,
     ) -> ValidationReport:
         checks = []
@@ -229,6 +248,76 @@ class ValidationSuite:
             "Unique positive fills must follow decisions; simulator uses only observed open prices and bounded opening liquidity.",
         )
         provenance = result.manifest.get("provenance", {})
+        advice_requested = provenance.get("advice_policy") is not None
+        if advice_requested:
+            verified, reason = False, "An injected authoritative history verifier is required."
+            try:
+                require(
+                    provenance["advice_policy"] == "historical-advice-current-ledger-sizing-1",
+                    "unsupported advice policy",
+                )
+                require(
+                    not result.walk_forward_results
+                    and not result.cross_sectional_ic
+                    and not provenance.get("folds")
+                    and not provenance.get("oos_signals_artifact"),
+                    "model-free advice cannot claim numerical folds, IC or model OOS signals",
+                )
+                require(
+                    ledger_path is not None
+                    and any(
+                        c.name == "durable_accounting" and c.verdict == CheckVerdict.PASS
+                        for c in checks
+                    ),
+                    "authoritative advice requires independently verified durable replay economics",
+                )
+                require(callable(advice_verifier), reason)
+                proof = advice_verifier(result, ledger_path)
+                require(
+                    isinstance(proof, AdviceValidationProof),
+                    "verifier must return typed AdviceValidationProof",
+                )
+                # Revalidate rather than trust unchecked model_construct/model_copy.
+                proof = AdviceValidationProof.model_validate(proof.model_dump())
+                require(
+                    proof.manifest_hash == canonical_hash(result.manifest),
+                    "advice proof manifest mismatch",
+                )
+                require(
+                    result.decisions
+                    and proof.decision_records_hash == result.manifest.get("decision_records_hash"),
+                    "advice proof requires exact nonempty replay decision trace",
+                )
+                hashes = proof.actual_decision_hashes
+                require(
+                    hashes
+                    and tuple(sorted(set(hashes))) == hashes
+                    and list(hashes) == provenance.get("actual_decision_hashes"),
+                    "advice proof actual decision hashes differ",
+                )
+                bindings = proof.receipt_bindings
+                require(
+                    bindings
+                    and tuple(sorted(set(bindings))) == bindings
+                    and tuple(row[0] for row in bindings) == hashes,
+                    "each unique decision requires one exact sorted receipt/snapshot binding",
+                )
+                require(
+                    {row[0]: row[2] for row in bindings}
+                    == provenance.get("original_review_snapshots"),
+                    "advice proof original review snapshots differ",
+                )
+                verified, reason = (
+                    True,
+                    (
+                        "Injected authoritative verifier recomputed histories and replay; exact manifest, "
+                        "decision trace and sorted receipt/original-snapshot identities agree."
+                    ),
+                )
+            except Exception as exc:
+                # External authority failures are failed evidence, never an approval fallback.
+                reason = f"Authoritative advice proof failed: {type(exc).__name__}: {exc}"
+            check("authoritative_advice_history", verified, reason)
         needed = (
             "universe_history_id",
             "availability_audit_id",
@@ -271,11 +360,12 @@ class ValidationSuite:
             split_valid &= fold.train_rows > 0 and fold.validation_rows > 0 and fold.test_rows > 0
             if i:
                 split_valid &= pd.Timestamp(folds[i - 1].test_end) <= pd.Timestamp(fold.test_start)
-        check(
-            "purged_oos",
-            split_valid,
-            "Requires fresh-model fold artifacts with training/validation separation, label-end purging and nonoverlapping OOS windows.",
-        )
+        if not advice_requested:
+            check(
+                "purged_oos",
+                split_valid,
+                "Requires fresh-model fold artifacts with training/validation separation, label-end purging and nonoverlapping OOS windows.",
+            )
         # Inspect actual holdings. Price-driven drift is reported, not rewritten away.
         caps = result.manifest["risk_policy"]
         breaches = [
@@ -343,17 +433,18 @@ class ValidationSuite:
         ic = float(np.mean(values)) if values else None
         ic_std = float(np.std(values, ddof=1)) if len(values) > 1 else None
         icir = ic / ic_std if ic_std and ic_std > 0 else None
-        check(
-            "factor_ic",
-            ic is not None and ic > 0.03 and icir is not None and icir > 0.5,
-            f"Date-local IC={ic}, ICIR={icir}; required IC>0.03 and ICIR>0.5 (unannualized).",
-        )
-        corr = provenance.get("max_existing_factor_correlation")
-        check(
-            "factor_correlation",
-            isinstance(corr, (float, int)) and math.isfinite(corr) and abs(corr) < 0.7,
-            "Independent existing-factor correlation evidence must be below 0.7; absent is not a pass.",
-        )
+        if not advice_requested:
+            check(
+                "factor_ic",
+                ic is not None and ic > 0.03 and icir is not None and icir > 0.5,
+                f"Date-local IC={ic}, ICIR={icir}; required IC>0.03 and ICIR>0.5 (unannualized).",
+            )
+            corr = provenance.get("max_existing_factor_correlation")
+            check(
+                "factor_correlation",
+                isinstance(corr, (float, int)) and math.isfinite(corr) and abs(corr) < 0.7,
+                "Independent existing-factor correlation evidence must be below 0.7; absent is not a pass.",
+            )
         trial = provenance.get("trial_registry", {})
         count = trial.get("trials", 0)
         registry = (
