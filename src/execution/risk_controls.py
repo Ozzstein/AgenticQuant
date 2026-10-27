@@ -1,22 +1,125 @@
-"""Pre-trade risk controls for order validation."""
-
+"""Deterministic projected exposure checks for the shared execution owner."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from decimal import Decimal
 
-from loguru import logger
-
+from src.domain.portfolio import InstrumentRisk, OrderIntent, PortfolioSnapshot, RiskPolicy
 from src.utils.config import RiskConfig
-from src.utils.schemas import Order, OrderSide, Portfolio, Position
+from src.utils.schemas import Order, OrderSide, Portfolio
+
+D = Decimal
 
 
 @dataclass
 class RiskCheckResult:
-    """Result of running all pre-trade risk checks on a single order."""
-
     passed: bool
     failed_checks: list[str] = field(default_factory=list)
     details: dict[str, str] = field(default_factory=dict)
+
+
+def evaluate_order(
+    intent: OrderIntent,
+    portfolio: PortfolioSnapshot,
+    pending: list[dict],
+    instruments: dict[str, InstrumentRisk],
+    policy: RiskPolicy,
+) -> RiskCheckResult:
+    """Check complete projected exposures, without crediting unfilled sale proceeds.
+
+    Include all resting buys in concentration/cash/turnover. A candidate sale
+    subtracts holdings and is allowed to reduce an existing concentration breach.
+    Existing sell reservations prohibit double selling. ADV is base-currency
+    notional; the order limit is strictly less than the configured participation.
+    """
+    failures = {}
+    def fail(name, detail):
+        failures[name] = detail
+
+    nav = portfolio.nav
+    if nav <= 0 or portfolio.account_id != intent.account_id or portfolio.as_of < intent.decision_at:
+        return RiskCheckResult(False, ["state"], {"state": "invalid NAV/account/decision clock"})
+    marks = {p.instrument.instrument_id: p for p in portfolio.positions}
+    exposures = {k: p.market_value for k, p in marks.items()}
+    identities = {k: p.instrument for k, p in marks.items()}
+    key = intent.instrument.instrument_id
+    identities[key] = intent.instrument
+    value = intent.quantity * intent.reference_price * intent.fx_rate
+    pending_value, reserved_buys, reserved_sells = D(0), D(0), D(0)
+    for o in pending:
+        other = o["intent"]
+        if other.intent_id == intent.intent_id:
+            continue
+        other_key = other.instrument.instrument_id
+        identities[other_key] = other.instrument
+        amount = o["remaining"] * other.reference_price * other.fx_rate
+        pending_value += amount
+        if other.side == "buy":
+            exposures[other_key] = exposures.get(other_key, D(0)) + amount
+            reserved_buys += o["reserved"]
+        elif other_key == key:
+            reserved_sells += o["remaining"]
+    held_qty = marks[key].quantity if key in marks else D(0)
+    current_value = exposures.get(key, D(0))
+    projected_value = current_value + (value if intent.side == "buy" else -value)
+    if intent.side == "sell":
+        if intent.quantity > held_qty - reserved_sells:
+            fail("sufficient_shares", "sale exceeds unreserved holdings")
+        # Use held mark for projected exposure; execution proceeds may differ on gaps.
+        projected_value = current_value - (marks[key].market_value * intent.quantity / held_qty if held_qty else value)
+    exposures[key] = max(D(0), projected_value)
+    meta = instruments.get(key)
+    if meta is None:
+        fail("liquidity", "missing instrument sector/ADV/lot metadata")
+    else:
+        age = (portfolio.as_of - meta.as_of).total_seconds()
+        if not 0 <= age <= policy.max_liquidity_age_seconds:
+            fail("liquidity", "stale/future liquidity metadata")
+        if meta.instrument != intent.instrument:
+            fail("identity", "instrument metadata mismatch")
+        if meta.adv_base < policy.min_adv:
+            fail("liquidity", "ADV below minimum")
+        if value >= meta.adv_base * policy.max_adv_participation:
+            fail("market_impact", "order participation must be strictly below limit")
+        if intent.quantity % meta.lot_size:
+            fail("lot_size", "quantity violates lot size")
+        if value < meta.min_notional:
+            fail("min_notional", "notional below venue minimum")
+    # Costs reduce NAV; never treat them as invested capital.
+    projected_nav = nav - intent.estimated_fee
+    if projected_nav <= 0:
+        fail("cash_buffer", "fees exhaust NAV")
+        projected_nav = nav
+    if intent.side == "buy":
+        if portfolio.cash - reserved_buys - value - intent.estimated_fee < policy.min_cash * projected_nav:
+            fail("cash_buffer", "cash after fees/reservations is below NAV reserve")
+        if nav <= portfolio.high_water_mark * (1 - policy.max_drawdown):
+            fail("drawdown_cb", "drawdown buy halt")
+        for k, exposure in exposures.items():
+            instrument = identities[k]
+            cap = policy.crypto_weight if instrument.asset_class == "crypto" else policy.equity_weight
+            if exposure > projected_nav * cap:
+                fail("position_size", f"projected position exceeds cap: {k}")
+        sectors = {}
+        crypto = D(0)
+        for k, exposure in exposures.items():
+            if not exposure:
+                continue
+            if k not in instruments:
+                fail("sector", f"missing sector for {k}")
+                continue
+            sector = instruments[k].sector
+            sectors[sector] = sectors.get(sector, D(0)) + exposure
+            if identities[k].asset_class == "crypto":
+                crypto += exposure
+        if any(v > policy.sector_weight * projected_nav for v in sectors.values()):
+            fail("sector", "projected sector exposure exceeds cap")
+        if crypto > policy.crypto_total * projected_nav:
+            fail("crypto_total", "projected aggregate crypto exceeds regime limit")
+    if portfolio.turnover_today + pending_value + value > policy.max_daily_turnover * nav:
+        fail("daily_turnover", "filled plus pending plus new turnover exceeds cap")
+    return RiskCheckResult(not failures, list(failures), failures)
 
 
 def check_order(
@@ -28,162 +131,34 @@ def check_order(
     daily_turnover_so_far: float = 0.0,
     peak_nav: float | None = None,
 ) -> RiskCheckResult:
-    """Run all 7 pre-trade risk checks on an order.
+    """Legacy schema adapter; operating execution uses evaluate_order instead.
 
-    Any failed check sets passed=False and appends the check name to failed_checks.
-
-    Args:
-        order: Order to validate.
-        portfolio: Current portfolio state.
-        market_prices: Dict of ticker → price. Include ``{ticker}_adv`` for
-            liquidity and market-impact checks.
-        config: RiskConfig with risk limits.
-        asset_class: ``"EQUITY"`` or ``"CRYPTO"``; crypto gets a tighter 5 %
-            max position weight instead of the equity default.
-        daily_turnover_so_far: USD notional value of orders already placed today.
-        peak_nav: Highest NAV ever (used for drawdown circuit-breaker). If
-            ``None`` the drawdown check is skipped entirely.
-
-    Returns:
-        RiskCheckResult with ``passed=True`` only if every applicable check
-        passes.
+    This adapter fixes sell arithmetic and NAV cash reserves. It cannot certify
+    sector/pending-order exposure because the legacy schema lacks those inputs.
     """
-    failed_checks: list[str] = []
-    details: dict[str, str] = {}
-
-    price = market_prices.get(order.ticker, 0.0)
-    order_value = price * order.quantity
-
-    # ------------------------------------------------------------------
-    # 1. Position-size check
-    # ------------------------------------------------------------------
-    existing_pos: Position | None = portfolio.positions.get(order.ticker)
-    current_pos_value = (existing_pos.quantity * price) if existing_pos else 0.0
-    max_weight = 5.0 if asset_class == "CRYPTO" else config.max_position_weight
-    post_trade_weight_pct = (current_pos_value + order_value) / portfolio.nav * 100
-
-    if post_trade_weight_pct > max_weight:
-        failed_checks.append("position_size")
-        details["position_size"] = (
-            f"{post_trade_weight_pct:.1f}% > {max_weight}%"
-        )
-        logger.warning(
-            "position_size check failed for {}: {:.1f}% > {:.1f}%",
-            order.ticker,
-            post_trade_weight_pct,
-            max_weight,
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Cash-buffer check (BUY only)
-    # ------------------------------------------------------------------
-    if order.side == OrderSide.BUY:
-        order_cost = price * order.quantity
-        available_cash = portfolio.cash * 0.99
-        if order_cost > available_cash:
-            failed_checks.append("cash_buffer")
-            details["cash_buffer"] = (
-                f"order cost ${order_cost:.0f} > available ${available_cash:.0f}"
-            )
-            logger.warning(
-                "cash_buffer check failed for {}: ${:.0f} > ${:.0f}",
-                order.ticker,
-                order_cost,
-                available_cash,
-            )
-
-    # ------------------------------------------------------------------
-    # 3. Sufficient-shares check (SELL only)
-    # ------------------------------------------------------------------
-    if order.side == OrderSide.SELL:
-        current_qty = existing_pos.quantity if existing_pos else 0.0
-        if existing_pos is None or existing_pos.quantity < order.quantity:
-            failed_checks.append("sufficient_shares")
-            details["sufficient_shares"] = (
-                f"need {order.quantity} but have {current_qty}"
-            )
-            logger.warning(
-                "sufficient_shares check failed for {}: need {} but have {}",
-                order.ticker,
-                order.quantity,
-                current_qty,
-            )
-
-    # ------------------------------------------------------------------
-    # 4. Liquidity check
-    # ------------------------------------------------------------------
-    adv_key = f"{order.ticker}_adv"
-    if adv_key in market_prices:
-        adv = market_prices[adv_key]
-        if adv < config.min_liquidity_adv:
-            failed_checks.append("liquidity")
-            details["liquidity"] = (
-                f"ADV ${adv:.0f} < min ${config.min_liquidity_adv:.0f}"
-            )
-            logger.warning(
-                "liquidity check failed for {}: ADV ${:.0f} < min ${:.0f}",
-                order.ticker,
-                adv,
-                config.min_liquidity_adv,
-            )
-
-    # ------------------------------------------------------------------
-    # 5. Market-impact check
-    # ------------------------------------------------------------------
-    if adv_key in market_prices and price > 0:
-        adv = market_prices[adv_key]
-        adv_shares = adv / price
-        max_shares = config.max_market_impact_pct / 100 * adv_shares
-        if order.quantity > max_shares:
-            failed_checks.append("market_impact")
-            details["market_impact"] = (
-                f"order {order.quantity:.0f} shares > 1% ADV ({adv_shares * 0.01:.0f} shares)"
-            )
-            logger.warning(
-                "market_impact check failed for {}: {} shares > 1% ADV ({:.0f} shares)",
-                order.ticker,
-                order.quantity,
-                adv_shares * 0.01,
-            )
-
-    # ------------------------------------------------------------------
-    # 6. Drawdown circuit-breaker (BUY only, only when peak_nav provided)
-    # ------------------------------------------------------------------
-    if order.side == OrderSide.BUY and peak_nav is not None:
-        drawdown = (portfolio.nav - peak_nav) / peak_nav * 100
-        if drawdown < -config.max_drawdown_halt:
-            failed_checks.append("drawdown_cb")
-            details["drawdown_cb"] = (
-                f"drawdown {drawdown:.1f}% exceeds -{config.max_drawdown_halt}% halt"
-            )
-            logger.warning(
-                "drawdown_cb check failed: drawdown {:.1f}% exceeds -{:.1f}% halt",
-                drawdown,
-                config.max_drawdown_halt,
-            )
-
-    # ------------------------------------------------------------------
-    # 7. Daily-turnover check
-    # ------------------------------------------------------------------
-    projected_turnover_pct = (daily_turnover_so_far + order_value) / portfolio.nav * 100
-    if projected_turnover_pct > config.max_daily_turnover:
-        failed_checks.append("daily_turnover")
-        details["daily_turnover"] = (
-            f"turnover {projected_turnover_pct:.1f}% > {config.max_daily_turnover}%"
-        )
-        logger.warning(
-            "daily_turnover check failed: {:.1f}% > {:.1f}%",
-            projected_turnover_pct,
-            config.max_daily_turnover,
-        )
-
-    passed = len(failed_checks) == 0
-    result = RiskCheckResult(passed=passed, failed_checks=failed_checks, details=details)
-    logger.debug(
-        "Risk check for {} {}: passed={}, failed={}",
-        order.side,
-        order.ticker,
-        passed,
-        failed_checks,
-    )
-    return result
+    failures = {}
+    price = market_prices.get(order.ticker, 0)
+    if not all(math.isfinite(v) and v > 0 for v in (price, order.quantity, portfolio.nav)):
+        return RiskCheckResult(False, ["invalid_input"], {"invalid_input": "positive finite price, quantity, NAV required"})
+    value = price * order.quantity
+    existing = portfolio.positions.get(order.ticker)
+    qty = existing.quantity if existing else 0
+    buy = order.side == OrderSide.BUY
+    projected = (qty + order.quantity if buy else qty - order.quantity) * price
+    if buy and projected > portfolio.nav * (0.05 if asset_class.upper() == "CRYPTO" else config.max_position_weight / 100):
+        failures["position_size"] = "projected position exceeds limit"
+    if buy and portfolio.cash - value < portfolio.nav * config.min_cash_pct / 100:
+        failures["cash_buffer"] = "remaining cash below NAV reserve"
+    if not buy and order.quantity > qty:
+        failures["sufficient_shares"] = "sale exceeds holdings"
+    adv = market_prices.get(f"{order.ticker}_adv")
+    if adv is not None:
+        if not math.isfinite(adv) or adv < config.min_liquidity_adv:
+            failures["liquidity"] = "invalid/insufficient ADV"
+        if value >= adv * config.max_market_impact_pct / 100:
+            failures["market_impact"] = "participation must be below limit"
+    if buy and peak_nav is not None and (peak_nav <= 0 or portfolio.nav <= peak_nav * (1 - config.max_drawdown_halt / 100)):
+        failures["drawdown_cb"] = "drawdown buy halt"
+    if daily_turnover_so_far + value > portfolio.nav * config.max_daily_turnover / 100:
+        failures["daily_turnover"] = "turnover exceeds limit"
+    return RiskCheckResult(not failures, list(failures), failures)

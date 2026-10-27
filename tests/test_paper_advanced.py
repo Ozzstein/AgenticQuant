@@ -180,7 +180,7 @@ def test_paper_manual_sell_cancels_contingent() -> None:
     trader = _trader()
     order = _buy_order(ticker="AAPL", qty=10, take_profit_price=220.0, stop_loss_price=180.0)
     trader.execute_order(order, {"AAPL": 200.0})
-    assert "AAPL" in trader._contingent.open_tickers
+    assert "AAPL" in trader.protected_tickers
 
     # Manual close
     sell = Order(
@@ -190,7 +190,7 @@ def test_paper_manual_sell_cancels_contingent() -> None:
         order_type=OrderType.MARKET,
     )
     trader.execute_order(sell, {"AAPL": 210.0})
-    assert "AAPL" not in trader._contingent.open_tickers
+    assert "AAPL" not in trader.protected_tickers
 
 
 # ---------------------------------------------------------------------------
@@ -211,4 +211,4 @@ def test_paper_no_double_fill_after_contingent_fires() -> None:
     # Second snapshot: no position, no entry — must not crash
     trader.snapshot({"AAPL": 230.0})
     assert "AAPL" not in trader.portfolio.positions
-    assert "AAPL" not in trader._contingent.open_tickers
+    assert "AAPL" not in trader.protected_tickers

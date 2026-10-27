@@ -309,6 +309,8 @@ class PortfolioOptimizer:
         max_weight = self._config.risk.max_position_weight / 100.0  # e.g. 0.10
         max_total = 1.0 - self._config.risk.min_cash_pct / 100.0    # e.g. 0.95
 
+        if len(tickers) == 0 or len(weights_raw) != len(tickers) or not np.isfinite(weights_raw).all():
+            raise ValueError("finite aligned optimizer weights required")
         w = np.clip(weights_raw, 0.0, None)  # long-only
         w = np.clip(w, 0.0, max_weight)      # cap per-asset
 
@@ -317,7 +319,7 @@ class PortfolioOptimizer:
             w = w / total * min(total, 1.0)  # renormalize so sum ≤ 1
         else:
             # Degenerate: equal weight
-            w = np.ones(len(tickers)) / len(tickers)
+            w = np.full(len(tickers), min(max_weight, max_total / len(tickers)))
 
         # Enforce max total invested
         if w.sum() > max_total:

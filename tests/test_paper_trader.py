@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.execution.paper_trader import PaperTrader
-from src.utils.schemas import Order, OrderSide, OrderStatus, OrderType
+from src.utils.schemas import Order, OrderSide, OrderStatus
 
 INITIAL_CASH = 100_000.0
 AAPL_PRICE = 200.0
@@ -62,7 +62,7 @@ def test_buy_decreases_cash(trader: PaperTrader) -> None:
 
 
 def test_avg_cost_two_buys(trader: PaperTrader) -> None:
-    """Two buys at different prices — avg_cost must be the weighted average fill."""
+    """Two buys at different prices — avg_cost must be the weighted average fill including entry fees."""
     prices1 = {"AAPL": 100.0}
     prices2 = {"AAPL": 120.0}
 
@@ -73,7 +73,7 @@ def test_avg_cost_two_buys(trader: PaperTrader) -> None:
 
     fill1 = 100.0 * 1.0005
     fill2 = 120.0 * 1.0005
-    expected_avg = (100 * fill1 + 100 * fill2) / 200
+    expected_avg = (100 * fill1 + 100 * fill2 + 2) / 200
 
     assert abs(trader.portfolio.positions["AAPL"].avg_cost - expected_avg) < 0.01
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
@@ -204,4 +205,9 @@ def create_broker(config: AppConfig | None = None) -> BaseBroker:
         return AlpacaTrader(config.alpaca)
 
     initial_cash = config.lean.initial_cash if config.lean.initial_cash > 0 else 100_000.0
-    return PaperTrader(initial_cash=initial_cash, slippage_bps=5, commission_per_share=0.005)
+    return PaperTrader(
+        initial_cash=initial_cash, slippage_bps=5, commission_per_share=0.005,
+        ledger_path=getattr(config, "paper_ledger_path", None) or str(Path(config.output_dir) / "paper-ledger.sqlite3"),
+        account_id=getattr(config, "paper_account_id", "paper:default"),
+        base_currency=getattr(config, "paper_base_currency", "USD"),
+    )
