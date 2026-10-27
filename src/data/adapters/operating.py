@@ -146,6 +146,7 @@ class OperatingCapture:
             raw=raw,
             normalized={
                 "upstream": upstream,
+                **({"source_origin": http.base_url} if timestamp_unit is not None else {}),
                 "request": {
                     "path": path,
                     "params": safe,
@@ -1219,9 +1220,14 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
 
     venue = "binance"
 
-    def __init__(self, store, *, http=None, clock=None):
+    def __init__(self, store, *, http=None, clock=None, network="mainnet"):
+        from src.data.binance_reference import BINANCE_REFERENCE_ORIGINS
+
+        if network not in BINANCE_REFERENCE_ORIGINS:
+            _fail("explicit_binance_network_required")
         super().__init__(store, clock=clock)
-        self.http = http or ReadHTTP("binance", "https://api.binance.com")
+        self.network = network
+        self.http = http or ReadHTTP("binance", BINANCE_REFERENCE_ORIGINS[network][0])
 
     def _get(self, operation, context, instrument, params):
         if operation not in ("exchangeInfo", "klines", "trades"):
@@ -1248,7 +1254,10 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
         return instrument.symbol.replace("/", "")
 
     def _notional_sources(self, instrument, context, average_minutes):
-        from src.data.binance_reference import parse_binance_notional_reference
+        from src.data.binance_reference import (
+            parse_binance_notional_payload,
+            parse_binance_notional_reference,
+        )
 
         symbol = self._symbol(instrument)
 
@@ -1264,12 +1273,16 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
                 allowed_error_statuses=(400,) if operation == "referencePrice" else (),
             )
 
-        source, value = fetch("referencePrice", {"symbol": symbol})
+        source, _ = fetch("referencePrice", {"symbol": symbol})
         sources = [source]
         ids = {}
-        if isinstance(value, dict) and (
-            value.get("referencePrice", object()) is None or value.get("code") == -2043
-        ):
+        native = parse_binance_notional_payload(
+            self.store.raw(source.record.evidence_id),
+            operation="referencePrice",
+            symbol=symbol,
+            timestamp_unit="MILLISECOND",
+        )
+        if native.kind == "reference-absent":
             operation = "avgPrice" if average_minutes else "trades"
             params = {"symbol": symbol, **({} if average_minutes else {"limit": 1})}
             fallback, _ = fetch(operation, params)
@@ -1284,9 +1297,23 @@ class BinanceOperatingAdapter(_CryptoOperatingAdapter):
             actual,
             reference_evidence_id=source.record.evidence_id,
             average_minutes=average_minutes,
+            network=self.network,
             **ids,
         )
         return reference, sources
+
+    @_operation
+    def notional_reference(self, instrument, context, *, average_minutes):
+        """Capture only native reference/window evidence, without bar/FX inputs.
+
+        Returned raw envelopes are the exact IDs for freeze_binance_reference;
+        the caller's subsequent actual cutoff must include these receipts.
+        """
+        _crypto_identity(instrument, self.venue)
+        if type(average_minutes) is not int or average_minutes < 0:
+            _fail("native_notional_window_invalid")
+        _, sources = self._notional_sources(instrument, context, average_minutes)
+        return self.result(sources)
 
     @_operation
     def reference(self, instrument, context, *, bar_ids, fx_evidence_id=None):

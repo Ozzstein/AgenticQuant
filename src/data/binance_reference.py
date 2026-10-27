@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from src.data.adapters.operating import (
     BinanceOperatingAdapter,
@@ -24,7 +24,13 @@ if TYPE_CHECKING:
     from src.execution.venue import VenueNotionalReference
 
 
-def _source(store, key, instrument, context, operation, params):
+BINANCE_REFERENCE_ORIGINS = {
+    "mainnet": ("https://api.binance.com", "https://data-api.binance.vision"),
+    "testnet": ("https://testnet.binance.vision",),
+}
+
+
+def _source(store, key, instrument, context, operation, params, network):
     envelope = store.get(key, as_of=context.as_of)
     meta = verify_operating_capture(store, key, as_of=context.as_of)
     request = meta["request"]
@@ -35,9 +41,10 @@ def _source(store, key, instrument, context, operation, params):
         or request["path"] != "/api/v3/" + operation
         or request["params"] != params
         or envelope.record.source_uri
-        not in tuple(
-            base + "/api/v3/" + operation
-            for base in ("https://api.binance.com", "https://data-api.binance.vision")
+        not in tuple(base + "/api/v3/" + operation for base in BINANCE_REFERENCE_ORIGINS[network])
+        or (
+            "source_origin" in meta
+            and meta["source_origin"] + "/api/v3/" + operation != envelope.record.source_uri
         )
     ):
         _fail("binance_notional_source_identity_differs")
@@ -174,6 +181,7 @@ def parse_binance_notional_reference(
     average_evidence_id: str | None = None,
     last_trade_evidence_id: str | None = None,
     max_age_seconds: int = 30,
+    network: Literal["mainnet", "testnet"] = "mainnet",
 ) -> VenueNotionalReference:
     """Authenticate stored raw bodies; no fetch, caller price or generic fallback.
 
@@ -190,11 +198,18 @@ def parse_binance_notional_reference(
             or average_minutes < 0
             or type(max_age_seconds) is not int
             or not 0 <= max_age_seconds <= 30
+            or network not in BINANCE_REFERENCE_ORIGINS
         ):
             _fail("binance_notional_window_or_age_invalid")
         symbol = BinanceOperatingAdapter._symbol(instrument)
         source, raw, unit = _source(
-            store, reference_evidence_id, instrument, context, "referencePrice", {"symbol": symbol}
+            store,
+            reference_evidence_id,
+            instrument,
+            context,
+            "referencePrice",
+            {"symbol": symbol},
+            network,
         )
         native = parse_binance_notional_payload(
             raw, operation="referencePrice", symbol=symbol, timestamp_unit=unit
@@ -215,7 +230,13 @@ def parse_binance_notional_reference(
             if average_evidence_id is None or last_trade_evidence_id is not None:
                 _fail("binance_exact_average_source_required")
             fallback, raw, unit = _source(
-                store, average_evidence_id, instrument, context, "avgPrice", {"symbol": symbol}
+                store,
+                average_evidence_id,
+                instrument,
+                context,
+                "avgPrice",
+                {"symbol": symbol},
+                network,
             )
             native = parse_binance_notional_payload(
                 raw, operation="avgPrice", symbol=symbol, timestamp_unit=unit
@@ -232,6 +253,7 @@ def parse_binance_notional_reference(
                 context,
                 "trades",
                 {"symbol": symbol, "limit": 1},
+                network,
             )
             native = parse_binance_notional_payload(
                 raw, operation="trades", symbol=symbol, timestamp_unit=unit
