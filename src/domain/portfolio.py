@@ -147,6 +147,9 @@ class ExecutionBar(VersionedContract):
     session_close: UtcTimestamp
     tradable: bool = True
     price_convention: Literal["raw"] = "raw"
+    # Explicit identity of the observed opening print, if different from this
+    # completed bar. Its opening price/size/time must match that event exactly.
+    opening_event_id: NonEmptyString | None = None
 
     @model_validator(mode="after")
     def valid_bar(self):
@@ -161,6 +164,13 @@ class ExecutionBar(VersionedContract):
         if self.instrument.asset_class != "crypto" and self.calendar == "24/7":
             raise ValueError("equities require an explicit exchange session calendar")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        result = handler(self)
+        if self.opening_event_id is None:
+            result.pop("opening_event_id", None)
+        return result
 
 
 class CorporateAction(VersionedContract):
@@ -398,3 +408,49 @@ class UniverseEligibility(VersionedContract):
         if len(set(self.instrument_ids)) != len(self.instrument_ids):
             raise ValueError("duplicate universe member")
         return self
+
+
+class OpeningEvent(VersionedContract):
+    """Actual raw opening print; contains no unobserved completed-bar fields."""
+
+    event_id: NonEmptyString
+    instrument: Instrument
+    opened_at: UtcTimestamp
+    price: Positive
+    opening_volume: NonNegative
+    fx_rate: Positive = Decimal(1)
+    calendar: NonEmptyString
+    calendar_version: NonEmptyString
+    session: date
+    session_open: UtcTimestamp
+    session_close: UtcTimestamp
+    tradable: bool = True
+    price_convention: Literal["raw"] = "raw"
+
+    @model_validator(mode="after")
+    def causal_open(self):
+        if not self.session_open <= self.opened_at < self.session_close:
+            raise ValueError("opening print must be within its declared calendar session")
+        if (self.instrument.asset_class == "crypto") != (self.calendar == "24/7"):
+            raise ValueError("opening print requires its actual equity/crypto calendar")
+        return self
+
+    @classmethod
+    def from_bar(cls, bar: ExecutionBar):
+        """Project only already-declared opening economics of a historical bar."""
+        bar = ExecutionBar.model_validate(bar.model_dump())
+        return cls(
+            event_id=bar.opening_event_id or bar.event_id,
+            instrument=bar.instrument,
+            opened_at=bar.opened_at,
+            price=bar.open,
+            opening_volume=bar.opening_volume,
+            fx_rate=bar.fx_rate,
+            calendar=bar.calendar,
+            calendar_version=bar.calendar_version,
+            session=bar.session,
+            session_open=bar.session_open,
+            session_close=bar.session_close,
+            tradable=bar.tradable,
+            price_convention=bar.price_convention,
+        )

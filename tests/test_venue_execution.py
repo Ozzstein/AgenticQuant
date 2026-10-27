@@ -5,7 +5,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from src.domain.portfolio import AccountSpec, Fill, FillPolicy
+from src.domain.portfolio import AccountSpec, Fill, FillPolicy, OpeningEvent
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.venue import (
     PaperVenue,
@@ -469,7 +469,7 @@ def test_observed_opening_receipt_uses_actual_print_and_frozen_admission_after_c
         ).fetchone()[0]
     )
     assert receipt.occurred_at < receipt.observed_at < receipt.available_at < receipt.as_of
-    assert receipt.event_hash == opening.content_hash()
+    assert receipt.event_hash == OpeningEvent.from_bar(opening).content_hash()
     assert json.loads(receipt.model_dump_json())["evidence_hash"] == "a" * 64
     adapter.advance_close(opening)
     snap = ledger.snapshot(order.account_id, cutoff, 86400)

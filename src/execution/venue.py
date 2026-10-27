@@ -23,7 +23,16 @@ from src.domain.common import (
     VersionedContract,
     _utc,
 )
-from src.domain.portfolio import Fill, FillPolicy, InstrumentRisk, OrderIntent, Positive, RiskPolicy
+from src.domain.portfolio import (
+    ExecutionBar,
+    Fill,
+    FillPolicy,
+    InstrumentRisk,
+    OpeningEvent,
+    OrderIntent,
+    Positive,
+    RiskPolicy,
+)
 from src.execution.ledger import LedgerError, PortfolioLedger
 from src.execution.simulator import PaperExecution
 
@@ -849,9 +858,12 @@ class PaperVenue:
                 eligible.add(key)
         return frozenset(eligible)
 
-    def advance_open(self, bar, metadata):
-        return self.engine.open_bar(
-            bar, metadata, eligible_intent_ids=self.accepted_intent_ids_before(bar.opened_at)
+    def advance_open(self, event: OpeningEvent | ExecutionBar, metadata):
+        execute = (
+            self.engine.open_bar if isinstance(event, ExecutionBar) else self.engine.open_event
+        )
+        return execute(
+            event, metadata, eligible_intent_ids=self.accepted_intent_ids_before(event.opened_at)
         )
 
     def observed_open_receipt(self, event_id: str) -> ObservedOpenReceipt | None:
@@ -874,7 +886,7 @@ class PaperVenue:
 
     def settle_open(
         self,
-        bar,
+        event: OpeningEvent | ExecutionBar,
         metadata_by_intent,
         *,
         available_at,
@@ -888,11 +900,19 @@ class PaperVenue:
         Documentary receipt time can follow occurrence. This cannot change a
         historical research availability gate or rewrite published accounting.
         """
+        completed_bar = None
+        if isinstance(event, ExecutionBar):
+            completed_bar = ExecutionBar.model_validate(event.model_dump())
+            event = OpeningEvent.from_bar(completed_bar)
+        elif isinstance(event, OpeningEvent):
+            event = OpeningEvent.model_validate(event.model_dump())
+        else:
+            raise TypeError("settlement requires an OpeningEvent or ExecutionBar")
         receipt = ObservedOpenReceipt(
             account_id=self.account_id,
-            event_id=bar.event_id,
-            event_hash=bar.content_hash(),
-            occurred_at=bar.opened_at,
+            event_id=event.event_id,
+            event_hash=event.content_hash(),
+            occurred_at=event.opened_at,
             available_at=available_at,
             observed_at=observed_at,
             as_of=as_of,
@@ -902,31 +922,57 @@ class PaperVenue:
                 sorted((key, _metadata_hash(value)) for key, value in metadata_by_intent.items())
             ),
         )
+        if completed_bar is not None and completed_bar.closed_at > receipt.as_of:
+            raise LedgerError("completed execution bar is not yet closed; use an OpeningEvent")
         with self.ledger.atomic():
-            key = "paper-observed-open:" + bar.event_id
+            key = "paper-observed-open:" + event.event_id
             existing = self.ledger.db.execute(
                 "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, key)
             ).fetchone()
             if existing:
                 previous = ObservedOpenReceipt.model_validate_json(existing[0])
+                # Old receipts bound the full completed bar. Retain those exact
+                # bytes, but independently prove its opening-only identity before
+                # accepting a retry through either public input shape.
+                if previous.event_hash != receipt.event_hash:
+                    legacy = self.ledger.db.execute(
+                        "SELECT payload FROM events WHERE account=? AND id=?",
+                        (self.account_id, "open:" + event.event_id),
+                    ).fetchone()
+                    legacy_bar = ExecutionBar.model_validate_json(legacy[0]) if legacy else None
+                    if (
+                        legacy_bar is None
+                        or legacy_bar.content_hash() != previous.event_hash
+                        or OpeningEvent.from_bar(legacy_bar) != event
+                    ):
+                        raise LedgerError("observed opening receipt changed")
+                    receipt = receipt.model_copy(update={"event_hash": previous.event_hash})
                 if (
                     previous.model_dump(exclude={"as_of"}) != receipt.model_dump(exclude={"as_of"})
                     or previous.as_of > receipt.as_of
                 ):
                     raise LedgerError("observed opening receipt changed")
-                return []
+                consumed = self.ledger.db.execute(
+                    "SELECT 1 FROM events WHERE account=? AND id IN (?, ?)",
+                    (self.account_id, "opening-event:" + event.event_id, "open:" + event.event_id),
+                ).fetchone()
+                if consumed is None:
+                    raise LedgerError("observed receipt has no committed opening consumption")
+                if completed_bar is not None:
+                    return self.engine.open_bar(completed_bar, {})
+                return self.engine.open_event(event, {})
             if self.ledger.db.execute(
                 "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
-                (self.account_id, bar.opened_at.isoformat()),
+                (self.account_id, event.opened_at.isoformat()),
             ).fetchone():
                 raise LedgerError("observed opening print conflicts with published NAV")
-            accepted = self.accepted_intent_ids_before(bar.opened_at)
+            accepted = self.accepted_intent_ids_before(event.opened_at)
             expected = {
                 state["intent"].intent_id
                 for state in self.ledger.pending(self.account_id)
                 if state["intent"].intent_id in accepted
-                and state["intent"].instrument == bar.instrument
-                and state["intent"].eligible_at <= bar.opened_at
+                and state["intent"].instrument == event.instrument
+                and state["intent"].eligible_at <= event.opened_at
             }
             if set(metadata_by_intent) != expected:
                 raise LedgerError(
@@ -941,15 +987,23 @@ class PaperVenue:
                     k: v.model_dump(mode="json") for k, v in metadata.items()
                 }:
                     raise LedgerError("opening settlement metadata differs from durable admission")
-                if any(value.as_of > bar.opened_at for value in metadata.values()):
+                if any(value.as_of > event.opened_at for value in metadata.values()):
                     raise LedgerError("opening settlement cannot use future risk metadata")
             self.ledger.record_event(self.account_id, key, receipt.model_dump_json())
-            return self.engine.open_bar(
-                bar, {}, eligible_intent_ids=expected, intent_metadata=metadata_by_intent
+            execute = self.engine.open_bar if completed_bar is not None else self.engine.open_event
+            return execute(
+                completed_bar if completed_bar is not None else event,
+                {},
+                eligible_intent_ids=expected,
+                intent_metadata=metadata_by_intent,
             )
 
     def advance_close(self, bar):
         return self.engine.close_bar(bar)
+
+    def expire_orders(self, *, as_of):
+        """Expire due intents after independently authenticated market-close marks."""
+        return self.engine.expire_orders(as_of=as_of)
 
     def balances(self, as_of):
         quantities = {
