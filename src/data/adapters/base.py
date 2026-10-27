@@ -28,18 +28,22 @@ class FetchResult:
 
 
 class ReadHTTP:
-    """GET-only transport with bounded retry, request count, timeout and rate."""
+    """GET-only transport with bounded decoded responses, retries and rate."""
 
     def __init__(self, provider: str, base_url: str, *, client: httpx.Client | None = None,
                  max_requests: int = 100, attempts: int = 3, timeout: float = 20,
-                 min_interval: float = 0.12, sleep: Callable = time.sleep):
+                 min_interval: float = 0.12, sleep: Callable = time.sleep,
+                 maximum_response_bytes: int = 8 * 1024 * 1024):
         if max_requests < 1 or not 1 <= attempts <= 5 or timeout <= 0 or min_interval < 0:
             raise ValueError("invalid HTTP limits")
+        if type(maximum_response_bytes) is not int or maximum_response_bytes < 1:
+            raise ValueError("maximum_response_bytes must be a positive integer")
         self.provider, self.base_url = provider, base_url.rstrip("/")
         self._owned_client = client is None
         self.client = client or httpx.Client(follow_redirects=False)
         self.max_requests, self.attempts, self.timeout = max_requests, attempts, timeout
         self.min_interval, self.sleep = min_interval, sleep
+        self.maximum_response_bytes = maximum_response_bytes
         self.requests = 0
         self._last = 0.0
 
@@ -65,19 +69,27 @@ class ReadHTTP:
             self.requests += 1
             self._last = time.monotonic()
             try:
-                response = self.client.get(self.base_url + path, params=params, headers=headers, timeout=self.timeout)
+                with self.client.stream("GET", self.base_url + path, params=params,
+                                        headers=headers, timeout=self.timeout) as response:
+                    status = response.status_code
+                    if 200 <= status < 300 or status in allowed_error_statuses:
+                        body = bytearray()
+                        # Content-Length may describe compressed bytes or be
+                        # absent. Count actual decoded bytes before retaining
+                        # each chunk; never archive a truncated success body.
+                        for chunk in response.iter_bytes():
+                            if len(chunk) > self.maximum_response_bytes - len(body):
+                                raise ProviderError(self.provider, "response_bytes_exceeded")
+                            body.extend(chunk)
+                        return bytes(body)
+                    if status not in (429, 500, 502, 503, 504):
+                        code = "credentials_missing_or_rejected" if status == 401 else "entitlement_or_access_denied" if status == 403 else "http_failure"
+                        raise ProviderError(self.provider, code, status)
+                    if attempt + 1 == self.attempts:
+                        raise ProviderError(self.provider, "rate_limited" if status == 429 else "provider_unavailable", status)
             except (httpx.TimeoutException, httpx.NetworkError):
                 if attempt + 1 == self.attempts:
                     raise ProviderError(self.provider, "transport_unavailable") from None
-            else:
-                status = response.status_code
-                if 200 <= status < 300 or status in allowed_error_statuses:
-                    return response.content
-                if status not in (429, 500, 502, 503, 504):
-                    code = "credentials_missing_or_rejected" if status == 401 else "entitlement_or_access_denied" if status == 403 else "http_failure"
-                    raise ProviderError(self.provider, code, status)
-                if attempt + 1 == self.attempts:
-                    raise ProviderError(self.provider, "rate_limited" if status == 429 else "provider_unavailable", status)
             self.sleep(min(2 ** attempt, 4))
         raise ProviderError(self.provider, "provider_unavailable")
 
