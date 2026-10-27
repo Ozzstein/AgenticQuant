@@ -320,3 +320,96 @@ def test_incomplete_window_and_cli_failed_training_are_non_success(tmp_path):
     assert invocation.exit_code == 1, invocation.output
     assert not output.exists()
     assert json.loads((tmp_path / "failed.json.failure.json").read_text())["status"] == "failed"
+
+
+class TemporalRidge:
+    """Real numerical fit with the declared temporal API, registered by test below."""
+
+    def train(
+        self,
+        x,
+        y,
+        *,
+        context,
+        feature_available_at,
+        label_available_at,
+        feature_spec_hash,
+        data_snapshot_hash,
+    ):
+        assert x.index.names == ["datetime", "instrument"]
+        assert x.index.equals(feature_available_at.index) == x.index.equals(
+            label_available_at.index
+        )
+        assert (label_available_at <= context.as_of).all()
+        assert (feature_available_at <= context.as_of).all()
+        self.fit_context = context
+        self.label_times = label_available_at
+        self.feature_times = feature_available_at
+        self.spec_hash, self.data_hash = feature_spec_hash, data_snapshot_hash
+        self.model = Ridge().fit(x, y)
+        self.prediction_contexts = []
+
+    def predict(self, x, *, context, feature_available_at):
+        dates = x.index.get_level_values("datetime")
+        assert dates.nunique() == 1
+        assert (dates > self.fit_context.as_of).all()
+        assert (dates <= context.as_of).all()
+        assert feature_available_at.index.equals(x.index)
+        assert (feature_available_at.to_numpy() <= dates.to_numpy()).all()
+        self.prediction_contexts.append(context)
+        return self.model.predict(x)
+
+
+def test_contextual_metadata_is_purged_aligned_and_prediction_date_local(tmp_path, monkeypatch):
+    import src.core.ensemble as ensemble
+    import src.core.model_zoo as zoo
+
+    # Protocol unit test: numerical fitting is real, registration is test-only.
+    monkeypatch.setattr(zoo, "ModelWrapper", TemporalRidge)
+    monkeypatch.setattr(ensemble, "ModelWrapper", TemporalRidge)
+    x, y, args = wf_case(tmp_path)
+    models = []
+
+    def factory():
+        model = TemporalRidge()
+        models.append(model)
+        return model
+
+    result = WalkForwardRunner().run(
+        x,
+        y,
+        model_factory=factory,
+        feature_spec_hash="a" * 64,
+        data_snapshot_hash="b" * 64,
+        **args,
+    )
+    assert result.metrics.total_trades > 0
+    assert result.manifest["provenance"]["temporal_training"] == "contextual-v1"
+    for fold, model in zip(result.walk_forward_results, models, strict=True):
+        assert (
+            pd.Timestamp(fold.train_end) - pd.Timedelta(microseconds=1) == model.fit_context.as_of
+        )
+        mask = (x.index.get_level_values(0) < pd.Timestamp(fold.train_end)) & (
+            args["label_end_times"] < pd.Timestamp(fold.train_end)
+        )
+        assert model.label_times.equals(
+            args["label_end_times"].loc[mask].rename_axis(["datetime", "instrument"])
+        )
+        assert model.spec_hash == "a" * 64 and model.data_hash == "b" * 64
+        assert all(c.as_of > model.fit_context.as_of for c in model.prediction_contexts)
+
+
+def test_contextual_fit_rejects_unsupported_protocol_and_unpaired_hashes(tmp_path):
+    x, y, args = wf_case(tmp_path)
+    with pytest.raises(BacktestError, match="must be SHA256"):
+        WalkForwardRunner().run(x, y, model_factory=Ridge, feature_spec_hash="a" * 64, **args)
+    with pytest.raises(BacktestError, match="requires ModelWrapper or EnsembleModel"):
+        WalkForwardRunner().run(
+            x,
+            y,
+            model_factory=Ridge,
+            feature_spec_hash="a" * 64,
+            data_snapshot_hash="b" * 64,
+            **args,
+        )
+    assert not (tmp_path / "models" / "result.json").exists()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 from decimal import Decimal as D
@@ -34,6 +35,61 @@ def frame_hash(frame) -> str:
         pd.util.hash_pandas_object(frame, index=True).values.tobytes()
         + str(getattr(frame, "columns", getattr(frame, "name", None))).encode()
     ).hexdigest()
+
+
+def _registered_model(model):
+    """Only these model implementations implement the temporal training API."""
+    from src.core.ensemble import EnsembleModel
+    from src.core.model_zoo import ModelWrapper
+
+    return isinstance(model, (ModelWrapper, EnsembleModel))
+
+
+def _model_rows(value):
+    # The shared feature/model contract uses these level names. Preserve every
+    # value and row identity; the replay's caller-facing index remains unchanged.
+    return value.rename_axis(index=["datetime", "instrument"])
+
+
+def _fit_fold(model, x, y, available, ends, *, fit_context, feature_spec_hash, data_snapshot_hash):
+    contextual = feature_spec_hash is not None
+    if _registered_model(model):
+        parameters = inspect.signature(model.train).parameters
+        temporal = "label_available_at" in parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        if contextual and not temporal:
+            raise BacktestError("registered model lacks the integrated temporal training API")
+        kwargs = {}
+        if temporal:
+            kwargs.update(
+                feature_available_at=_model_rows(available),
+                label_available_at=_model_rows(ends),
+            )
+        if contextual:
+            kwargs.update(
+                context=fit_context,
+                feature_spec_hash=feature_spec_hash,
+                data_snapshot_hash=data_snapshot_hash,
+            )
+        model.train(_model_rows(x), _model_rows(y), **kwargs)
+        return contextual
+    if contextual:
+        raise BacktestError("contextual walk-forward requires ModelWrapper or EnsembleModel")
+    # Explicit generic fit protocol is diagnostic only; no invented provenance.
+    if not callable(getattr(model, "fit", None)):
+        raise BacktestError("unsupported model: require registered temporal model or fit protocol")
+    model.fit(x, y)
+    return False
+
+
+def _predict_fold(model, frame, available, context, contextual):
+    kwargs = {}
+    if _registered_model(model):
+        frame = _model_rows(frame)
+        if contextual:
+            kwargs.update(context=context, feature_available_at=_model_rows(available))
+    return np.asarray(model.predict(frame, **kwargs), dtype=float).reshape(-1)
 
 
 def cross_sectional_ic(predictions: pd.Series, labels: pd.Series) -> dict[str, float | None]:
@@ -123,6 +179,8 @@ class WalkForwardRunner:
         *,
         label_end_times: pd.Series | None = None,
         feature_available_at: pd.Series | None = None,
+        feature_spec_hash: str | None = None,
+        data_snapshot_hash: str | None = None,
         bars=None,
         metadata=None,
         universes=None,
@@ -190,6 +248,12 @@ class WalkForwardRunner:
             raise BacktestError("future feature availability or invalid forward-label horizon")
         if not context.data_snapshot_ids:
             raise BacktestError("walk-forward data snapshot provenance required")
+        if (feature_spec_hash is None) != (data_snapshot_hash is None) or any(
+            value is not None
+            and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value))
+            for value in (feature_spec_hash, data_snapshot_hash)
+        ):
+            raise BacktestError("explicit feature_spec_hash and data_snapshot_hash must be SHA256")
         realized_labels = labels.where(ends <= context.as_of)
         folds = split_folds(
             dates,
@@ -233,13 +297,35 @@ class WalkForwardRunner:
                 if any(model is old for old in models):
                     raise BacktestError("model_factory reused fitted state across folds")
                 models.append(model)
-                if hasattr(model, "train_with_validation"):
-                    model.train_with_validation(x_train, y_train, x_val, y_val)
-                elif hasattr(model, "train"):
-                    model.train(x_train, y_train)
-                else:
-                    model.fit(x_train, y_train)
-                validation_preds = np.asarray(model.predict(x_val), dtype=float).reshape(-1)
+                fit_context = context.model_copy(
+                    update={
+                        "as_of": (
+                            pd.Timestamp(fold["train_end"]) - pd.Timedelta(microseconds=1)
+                        ).to_pydatetime()
+                    }
+                )
+                contextual = _fit_fold(
+                    model,
+                    x_train,
+                    y_train,
+                    feature_available_at.loc[train_mask],
+                    label_end_times.loc[train_mask],
+                    fit_context=fit_context,
+                    feature_spec_hash=feature_spec_hash,
+                    data_snapshot_hash=data_snapshot_hash,
+                )
+                validation_preds = np.concatenate(
+                    [
+                        _predict_fold(
+                            model,
+                            frame,
+                            feature_available_at.loc[frame.index],
+                            context.model_copy(update={"as_of": at.to_pydatetime()}),
+                            contextual,
+                        )
+                        for at, frame in x_val.groupby(level=0, sort=True)
+                    ]
+                )
                 if len(validation_preds) != len(x_val) or not np.isfinite(validation_preds).all():
                     raise BacktestError(f"fold {number} invalid validation predictions")
                 # Serialize the actual fitted model; no invented artifact version.
@@ -259,7 +345,13 @@ class WalkForwardRunner:
                 # Date-local inference prevents transforms that normalize over a future
                 # test batch from changing earlier predictions.
                 for at, frame in features.loc[test_mask].groupby(level=0, sort=True):
-                    output = np.asarray(model.predict(frame), dtype=float).reshape(-1)
+                    output = _predict_fold(
+                        model,
+                        frame,
+                        feature_available_at.loc[frame.index],
+                        context.model_copy(update={"as_of": at.to_pydatetime()}),
+                        contextual,
+                    )
                     if len(output) != len(frame) or not np.isfinite(output).all():
                         raise BacktestError(f"fold {number} invalid OOS predictions at {at}")
                     fold_predictions.append(pd.Series(output, index=frame.index))
@@ -360,6 +452,11 @@ class WalkForwardRunner:
                 "label_end_hash": frame_hash(label_end_times),
                 "universe_version": universe_version,
                 "mode": "expanding",
+                "temporal_training": "contextual-v1"
+                if feature_spec_hash
+                else "diagnostic-unversioned",
+                "feature_spec_hash": feature_spec_hash,
+                "data_snapshot_hash": data_snapshot_hash,
                 "walk_months": walk_months,
                 "model_artifacts": [
                     str((artifacts / f"fold-{i}.joblib").resolve()) for i in range(len(evidence))

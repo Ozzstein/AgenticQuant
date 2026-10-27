@@ -110,6 +110,8 @@ def _run_pipeline(input_path: Path, ledger: Path, artifact_dir: Path) -> ReplayR
         labels,
         label_end_times=ends,
         feature_available_at=available,
+        feature_spec_hash=wf.get("feature_spec_hash"),
+        data_snapshot_hash=wf.get("data_snapshot_hash"),
         model_name=wf.get("model_name", "LightGBM"),
         walk_months=wf.get("walk_months", 6),
         embargo_days=wf.get("embargo_days", 5),

@@ -244,6 +244,18 @@ class ValidationSuite:
             else "Historical universe, availability audit, calendar and corporate-action artifacts referenced; source entitlement/content audit remains external.",
         )
         folds = result.walk_forward_results
+        if provenance.get("oos_signals_artifact"):
+            check(
+                "temporal_training",
+                provenance.get("temporal_training") == "contextual-v1"
+                and all(
+                    isinstance(provenance.get(key), str)
+                    and len(provenance[key]) == 64
+                    and all(c in "0123456789abcdef" for c in provenance[key])
+                    for key in ("feature_spec_hash", "data_snapshot_hash")
+                ),
+                "Certified walk-forward requires explicit feature/snapshot hashes and contextual training; generic/unversioned diagnostic fits cannot qualify. Actual artifact provenance is independently verified by the research evaluator.",
+            )
         split_valid = bool(folds)
         for i, fold in enumerate(folds):
             split_valid &= (
