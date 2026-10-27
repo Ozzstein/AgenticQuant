@@ -1,405 +1,283 @@
-"""LangGraph orchestration graph for the multi-agent trading desk."""
+"""Complete evidence-grounded trading desk; no stub nodes or inferred availability."""
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
 from langgraph.graph import END, START, StateGraph
 
-from src.utils.config import AppConfig, get_config
-from src.utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# State — use fallback if state.py not merged yet
-# ---------------------------------------------------------------------------
-try:
-    from src.agents.state import TradingDeskState
-except ImportError:
-    import operator
-    from typing import Annotated, TypedDict
-
-    from src.utils.schemas import AnalysisResult
-
-    def _merge_reports(a: dict, b: dict) -> dict:
-        return {**a, **b}
-
-    class TradingDeskState(TypedDict):  # type: ignore[no-redef]
-        ticker: str
-        asset_class: str
-        qlib_context: str
-        market_context: str
-        macro_regime: str
-        macro_confidence: float
-        memory_context: str
-        agent_reports: Annotated[dict, _merge_reports]
-        debate_round: int
-        debate_transcript: Annotated[list, operator.add]
-        risk_veto: bool
-        risk_veto_reason: str
-        result: AnalysisResult | None
+from src.agents.budget import AgentCallBudget
+from src.agents.debate import debate_node, debate_router
+from src.agents.earnings_handler import earnings_node
+from src.agents.fundamental import fundamental_node
+from src.agents.macro_regime import macro_regime_node, market_context_node
+from src.agents.memory import load_memory_node, save_memory_node
+from src.agents.risk_manager import risk_manager_node
+from src.agents.sentiment import sentiment_node
+from src.agents.state import TradingDeskState
+from src.agents.strategist import strategist_node
+from src.agents.technical import technical_node
+from src.agents.transcript_nlp import transcript_nlp_node
+from src.decision.service import DecisionService
+from src.decision.store import DecisionStore
+from src.decision.workflows import EvidenceJudgments
+from src.domain.decisions import AgentAction, AgentDecision, DecisionPolicy, DecisionStatus
+from src.utils.config import get_config
 
 
-# ---------------------------------------------------------------------------
-# Node loader helpers — lazy imports with graceful stubs
-# ---------------------------------------------------------------------------
+def build_trading_desk_graph(
+    config=None, *, decision_service=None, policy=None, llm_factory=None, observation_mode="cache"
+):
+    config = config or get_config()
+    service = decision_service or DecisionService(
+        DecisionStore(Path(config.output_dir) / "decisions.sqlite")
+    )
+    policy = policy or DecisionPolicy()
 
+    def environment(state):
+        return {
+            **state,
+            "app_config": config,
+            "llm_factory": llm_factory,
+            "workflow": EvidenceJudgments(
+                service,
+                state["context"],
+                state["instrument"],
+                policy=policy,
+                mode=observation_mode,
+                deadline=state.get("decision_deadline"),
+            ),
+        }
 
-def _load_market_context_node():
-    """Load market_context_node, falling back to a stub."""
-    try:
-        from src.agents.macro_regime import market_context_node
+    def bind(node):
+        def run(state):
+            return node(environment(state))
 
-        return market_context_node
-    except ImportError:
+        return run
 
-        def market_context_node(state):  # type: ignore[misc]
-            return {"market_context": "No market data available"}
+    def prepare(state):
+        # Explicit input contracts; never fabricate a security identity/current date.
+        if state.get("context") is None or state.get("instrument") is None:
+            raise ValueError("graph requires common.RunContext and common.Instrument")
+        return {
+            "decision_deadline": time.monotonic()
+            + getattr(config.agents, "analysis_timeout_seconds", 180),
+            "call_budget": AgentCallBudget(
+                config.agents,
+                state["context"].run_id + "/" + state["instrument"].instrument_id,
+                deadline=time.monotonic() + getattr(config.agents, "analysis_timeout_seconds", 180),
+            ),
+            "new_exposure_blocked": bool(state.get("new_exposure_blocked")),
+            "desk_reports": {},
+            "decision_results": [],
+            "debate_round": 0,
+            "debate_transcript": [],
+            "evidence_issues": (),
+            "risk_veto": bool(state.get("risk_veto")),
+        }
 
-        return market_context_node
+    def evidence_node(state):
+        workflow = environment(state)["workflow"]
+        sources = state.get("sources", ())
+        results = []
+        if state.get("memory_context"):
+            from src.decision.questions import CONFLICT, RELEVANCE
 
-
-def _load_macro_regime_node():
-    """Load macro_regime_node, falling back to a stub."""
-    try:
-        from src.agents.macro_regime import macro_regime_node
-
-        return macro_regime_node
-    except ImportError:
-
-        def macro_regime_node(state):  # type: ignore[misc]
-            return {"macro_regime": "neutral", "macro_confidence": 50.0}
-
-        return macro_regime_node
-
-
-def _load_fundamental_node():
-    """Load fundamental_node, falling back to a stub."""
-    try:
-        from src.agents.fundamental import fundamental_node
-
-        return fundamental_node
-    except ImportError:
-        from src.utils.schemas import AgentReport, Decision
-
-        def fundamental_node(state):  # type: ignore[misc]
-            return {
-                "agent_reports": {
-                    "fundamental": AgentReport(
-                        agent_name="fundamental",
-                        decision=Decision.HOLD,
-                        confidence=50.0,
-                        reasoning="Stub",
-                        data_points={},
-                    )
-                }
-            }
-
-        return fundamental_node
-
-
-def _load_sentiment_node():
-    """Load sentiment_node, falling back to a stub."""
-    try:
-        from src.agents.sentiment import sentiment_node
-
-        return sentiment_node
-    except ImportError:
-        from src.utils.schemas import AgentReport, Decision
-
-        def sentiment_node(state):  # type: ignore[misc]
-            return {
-                "agent_reports": {
-                    "sentiment": AgentReport(
-                        agent_name="sentiment",
-                        decision=Decision.HOLD,
-                        confidence=50.0,
-                        reasoning="Stub",
-                        data_points={},
-                    )
-                }
-            }
-
-        return sentiment_node
-
-
-def _load_technical_node():
-    """Load technical_node, falling back to a stub."""
-    try:
-        from src.agents.technical import technical_node
-
-        return technical_node
-    except ImportError:
-        from src.utils.schemas import AgentReport, Decision
-
-        def technical_node(state):  # type: ignore[misc]
-            return {
-                "agent_reports": {
-                    "technical": AgentReport(
-                        agent_name="technical",
-                        decision=Decision.HOLD,
-                        confidence=50.0,
-                        reasoning="Stub",
-                        data_points={},
-                    )
-                }
-            }
-
-        return technical_node
-
-
-def _load_earnings_node():
-    """Load earnings_node, falling back to a stub."""
-    try:
-        from src.agents.earnings_handler import earnings_node
-
-        return earnings_node
-    except ImportError:
-        from src.utils.schemas import AgentReport, Decision
-
-        def earnings_node(state):  # type: ignore[misc]
-            return {
-                "agent_reports": {
-                    "earnings": AgentReport(
-                        agent_name="earnings",
-                        decision=Decision.HOLD,
-                        confidence=40.0,
-                        reasoning="Stub",
-                        data_points={},
-                    )
-                }
-            }
-
-        return earnings_node
-
-
-def _load_risk_manager_node():
-    """Load risk_manager_node, falling back to a stub."""
-    try:
-        from src.agents.risk_manager import risk_manager_node
-
-        return risk_manager_node
-    except ImportError:
-
-        def risk_manager_node(state):  # type: ignore[misc]
-            return {"risk_veto": False, "risk_veto_reason": "", "agent_reports": {}}
-
-        return risk_manager_node
-
-
-def _load_debate_nodes():
-    """Load debate_node and debate_router, falling back to stubs."""
-    try:
-        from src.agents.debate import debate_node, debate_router
-
-        return debate_node, debate_router
-    except ImportError:
-
-        def debate_node(state):  # type: ignore[misc]
-            return {
-                "debate_round": state.get("debate_round", 0) + 1,
-                "debate_transcript": [],
-            }
-
-        def debate_router(state) -> str:  # type: ignore[misc]
-            return "risk_manager"
-
-        return debate_node, debate_router
-
-
-def _load_strategist_node():
-    """Load strategist_node, falling back to a stub."""
-    try:
-        from src.agents.strategist import strategist_node
-
-        return strategist_node
-    except ImportError:
-        from src.utils.schemas import AnalysisResult, Decision
-
-        def strategist_node(state):  # type: ignore[misc]
-            return {
-                "result": AnalysisResult(
-                    ticker=state["ticker"],
-                    decision=Decision.HOLD,
-                    confidence=50.0,
-                    reasoning="Stub strategist",
+            results.append(
+                workflow.ask(
+                    sources,
+                    (RELEVANCE, CONFLICT),
+                    {
+                        "query": "Relevance of eligible prior analysis to this instrument and current evidence",
+                        "prior_analysis": state["memory_context"],
+                        "reference": state.get("qlib_context", ""),
+                    },
                 )
-            }
+            )
+        for source, result in workflow.retrieve(
+            sources,
+            query="Investment evidence for " + state["instrument"].symbol,
+            reference=state.get("qlib_context", ""),
+        ):
+            results.append(result)
+            if source.kind == "news":
+                results.append(workflow.news(source))
+            elif source.kind == "transcript":
+                results.append(workflow.transcript(source))
+        # Retrieval never suppresses contradictory or uncertain evidence.
+        unavailable = not sources or (
+            policy.activation == "evaluated"
+            and any(
+                r.status != DecisionStatus.OK
+                or any(j.disposition != "accepted" for j in r.judgments)
+                for r in results
+            )
+        )
+        return {
+            "decision_results": results,
+            "new_exposure_blocked": bool(state.get("new_exposure_blocked")) or unavailable,
+        }
 
-        return strategist_node
+    def verify_node(state):
+        workflow = environment(state)["workflow"]
+        checks = []
+        issues = []
+        results = []
+        for role, report in state.get("desk_reports", {}).items():
+            if report.status == "not_applicable":
+                continue
+            if report.status != "ok" or not report.claims:
+                issues.append(role + ": unavailable or uncited report: " + report.reasoning)
+            for claim in report.claims:
+                check = workflow.verify(claim, state.get("sources", ()))
+                checks.append(check)
+                if check.result:
+                    results.append(check.result)
+                if check.status in ("invalid_reference", "quote_missing", "ineligible"):
+                    issues.append(role + ": " + check.status)
+                elif policy.activation == "evaluated" and (
+                    check.status != "supported"
+                    or not check.result
+                    or check.result.judgments[0].disposition != "accepted"
+                ):
+                    issues.append(role + ": unresolved semantic support")
+        discrepancy = workflow.debate(
+            state.get("sources", ()), state.get("desk_reports", {}).values()
+        )
+        results.append(discrepancy)
+        if policy.activation == "evaluated" and (
+            discrepancy.status != DecisionStatus.OK
+            or discrepancy.judgments[0].choice != "consistent"
+            or discrepancy.judgments[0].disposition != "accepted"
+        ):
+            issues.append("unresolved debate discrepancy")
+        return {
+            "citation_checks": tuple(checks),
+            "evidence_issues": tuple(issues),
+            "decision_results": results,
+        }
 
+    def route(state):
+        return debate_router(environment(state))
 
-def _load_memory_nodes():
-    """Load load_memory_node and save_memory_node, falling back to stubs."""
-    try:
-        from src.agents.memory import load_memory_node, save_memory_node
+    def risk(state):
+        return risk_manager_node(
+            environment(
+                {
+                    **state,
+                    "new_exposure_blocked": bool(state.get("new_exposure_blocked"))
+                    or bool(state.get("evidence_issues")),
+                }
+            )
+        )
 
-        return load_memory_node, save_memory_node
-    except ImportError:
-
-        def load_memory_node(state):  # type: ignore[misc]
-            return {"memory_context": ""}
-
-        def save_memory_node(state):  # type: ignore[misc]
-            return {}
-
-        return load_memory_node, save_memory_node
-
-
-# ---------------------------------------------------------------------------
-# Graph builder
-# ---------------------------------------------------------------------------
-
-
-def build_trading_desk_graph(config: AppConfig | None = None):
-    """Build and compile the LangGraph trading desk workflow.
-
-    LangGraph topology::
-
-        START → market_context → macro_regime → load_memory
-          → [fundamental, sentiment, technical, earnings]  (parallel fan-out)
-          → pre_debate  (fan-in barrier)
-          → debate_router → [debate (loop)] or risk_manager
-          → strategist → save_memory → END
-
-    Args:
-        config: Optional AppConfig. Uses get_config() singleton if None.
-
-    Returns:
-        Compiled LangGraph StateGraph ready for ``invoke()``.
-    """
-    if config is None:
-        config = get_config()
-
-    # Resolve TradingDeskState locally (may be the fallback defined at module level)
-    try:
-        from src.agents.state import TradingDeskState as _State
-    except ImportError:
-        _State = TradingDeskState  # type: ignore[misc]
-
-    # Load nodes (lazy, with stubs)
-    market_context_node = _load_market_context_node()
-    macro_regime_node = _load_macro_regime_node()
-    fundamental_node = _load_fundamental_node()
-    sentiment_node = _load_sentiment_node()
-    technical_node = _load_technical_node()
-    earnings_node = _load_earnings_node()
-    risk_manager_node = _load_risk_manager_node()
-    debate_node, debate_router = _load_debate_nodes()
-    strategist_node = _load_strategist_node()
-    load_memory_node, save_memory_node = _load_memory_nodes()
-
-    def pre_debate_node(state: _State) -> dict:  # type: ignore[valid-type]
-        """Pass-through fan-in node: convergence point after parallel analysts."""
-        return {}
-
-    # ------------------------------------------------------------------
-    graph = StateGraph(_State)
-
-    # Register nodes
-    graph.add_node("market_context", market_context_node)
-    graph.add_node("macro_regime", macro_regime_node)
-    graph.add_node("load_memory", load_memory_node)
-    graph.add_node("fundamental", fundamental_node)
-    graph.add_node("sentiment", sentiment_node)
-    graph.add_node("technical", technical_node)
-    graph.add_node("earnings", earnings_node)
-    graph.add_node("pre_debate", pre_debate_node)
-    graph.add_node("debate", debate_node)
-    graph.add_node("risk_manager", risk_manager_node)
-    graph.add_node("strategist", strategist_node)
-    graph.add_node("save_memory", save_memory_node)
-
-    # Sequential start
-    graph.add_edge(START, "market_context")
-    graph.add_edge("market_context", "macro_regime")
-    graph.add_edge("macro_regime", "load_memory")
-
-    # Fan-out: load_memory → all four parallel analysts
-    graph.add_edge("load_memory", "fundamental")
-    graph.add_edge("load_memory", "sentiment")
-    graph.add_edge("load_memory", "technical")
-    graph.add_edge("load_memory", "earnings")
-
-    # Fan-in: all four analysts → pre_debate
-    graph.add_edge("fundamental", "pre_debate")
-    graph.add_edge("sentiment", "pre_debate")
-    graph.add_edge("technical", "pre_debate")
-    graph.add_edge("earnings", "pre_debate")
-
-    # Conditional routing after fan-in (and after each debate round)
+    graph = StateGraph(TradingDeskState)
+    nodes = {
+        "prepare": prepare,
+        "market_context": bind(market_context_node),
+        "macro_regime": bind(macro_regime_node),
+        "load_memory": lambda state: load_memory_node(state, config),
+        "evidence": evidence_node,
+        "fundamental": bind(fundamental_node),
+        "sentiment": bind(sentiment_node),
+        "technical": bind(technical_node),
+        "earnings": bind(earnings_node),
+        "transcript_nlp": bind(transcript_nlp_node),
+        "verify_evidence": verify_node,
+        "debate": bind(debate_node),
+        "risk_manager": risk,
+        "strategist": bind(strategist_node),
+        "save_memory": lambda state: save_memory_node(state, config),
+    }
+    for name, node in nodes.items():
+        graph.add_node(name, node)
+    chain = [START, "prepare", "market_context", "macro_regime", "load_memory", "evidence"]
+    for left, right in zip(chain, chain[1:]):
+        graph.add_edge(left, right)
+    specialists = ["fundamental", "sentiment", "technical", "earnings", "transcript_nlp"]
+    for specialist in specialists:
+        graph.add_edge("evidence", specialist)
+    # Explicit join barrier: verification cannot run on a partial-role subset.
+    graph.add_edge(specialists, "verify_evidence")
     graph.add_conditional_edges(
-        "pre_debate",
-        debate_router,
-        {"debate": "debate", "risk_manager": "risk_manager"},
+        "verify_evidence", route, {"debate": "debate", "risk_manager": "risk_manager"}
     )
-    graph.add_conditional_edges(
-        "debate",
-        debate_router,
-        {"debate": "debate", "risk_manager": "risk_manager"},
-    )
-
-    # Final synthesis → persist to memory
+    graph.add_edge("debate", "verify_evidence")
     graph.add_edge("risk_manager", "strategist")
     graph.add_edge("strategist", "save_memory")
     graph.add_edge("save_memory", END)
-
-    logger.info("Trading desk graph compiled successfully.")
     return graph.compile()
 
 
-# ---------------------------------------------------------------------------
-# High-level convenience function
-# ---------------------------------------------------------------------------
-
-
-def analyze_ticker(
-    ticker: str,
-    asset_class: str = "EQUITY",
-    qlib_context: str = "",
-    config: AppConfig | None = None,
-) -> "AnalysisResult":
-    """Run the full multi-agent analysis pipeline for a ticker.
-
-    Args:
-        ticker: Stock or crypto ticker (e.g., ``"AAPL"``, ``"BTC/USDT"``).
-        asset_class: ``"EQUITY"`` or ``"CRYPTO"``.
-        qlib_context: Optional serialized Qlib alpha scores.
-        config: Optional AppConfig override.
-
-    Returns:
-        AnalysisResult with complete multi-agent decision.
-    """
-    from src.utils.schemas import AnalysisResult, Decision
-
-    graph = build_trading_desk_graph(config)
-
-    initial_state = {
-        "ticker": ticker,
-        "asset_class": asset_class,
+def analyze_instrument(
+    instrument,
+    context,
+    *,
+    sources,
+    hmm_context=None,
+    portfolio_context=None,
+    qlib_context="",
+    config=None,
+    decision_service=None,
+    policy=None,
+    llm_factory=None,
+    observation_mode="cache",
+) -> AgentDecision:
+    config = config or get_config()
+    graph = build_trading_desk_graph(
+        config,
+        decision_service=decision_service,
+        policy=policy,
+        llm_factory=llm_factory,
+        observation_mode=observation_mode,
+    )
+    initial = {
+        "instrument": instrument,
+        "context": context,
+        "sources": tuple(sources),
+        "hmm_context": hmm_context,
+        "portfolio_context": portfolio_context,
+        "ticker": instrument.symbol,
+        "asset_class": instrument.asset_class.upper(),
         "qlib_context": qlib_context,
-        "market_context": "",
-        "macro_regime": "neutral",
-        "macro_confidence": 50.0,
-        "memory_context": "",
         "agent_reports": {},
-        "debate_round": 0,
-        "debate_transcript": [],
+        "desk_reports": {},
         "risk_veto": False,
-        "risk_veto_reason": "",
-        "result": None,
     }
-
     try:
-        final_state = graph.invoke(initial_state)
-        result = final_state.get("result")
-        if result is None:
-            raise ValueError("Graph did not produce a result")
-        return result
-    except Exception as e:
-        logger.error(f"analyze_ticker failed for {ticker}: {e}")
-        return AnalysisResult(
-            ticker=ticker,
-            decision=Decision.HOLD,
-            confidence=0.0,
-            reasoning=f"Analysis pipeline failed: {str(e)[:200]}",
+        final = graph.invoke(initial, {"recursion_limit": 30 + config.agents.max_debate_rounds * 3})
+        decision = final.get("agent_decision")
+        if decision is None:
+            raise ValueError("no desk decision")
+        return decision
+    except Exception as exc:
+        # A hard accounting veto remains visible even if graph execution fails.
+        vetoes = portfolio_context.deterministic_vetoes if portfolio_context else ()
+        veto = bool(vetoes) or bool(hmm_context and hmm_context.regime == "crisis")
+        return AgentDecision(
+            instrument=instrument,
+            context=context,
+            action=AgentAction.VETO if veto else AgentAction.ABSTAIN,
+            risk_veto=veto,
+            new_exposure_blocked=True,
+            reasoning=f"Agent desk unavailable ({type(exc).__name__})",
+            risk_flags=tuple(vetoes),
         )
+
+
+def analyze_ticker(ticker, asset_class="EQUITY", qlib_context="", config=None, **kwargs):
+    """Explicit legacy bridge; requires instrument/context/evidence supplied by caller."""
+    from src.agents.contracts import legacy_analysis
+
+    instrument = kwargs.pop("instrument", None)
+    context = kwargs.pop("context", None)
+    if instrument is None or context is None:
+        raise ValueError(
+            "analyze_ticker requires canonical instrument, context and sources; use analyze_instrument"
+        )
+    if instrument.symbol != ticker or instrument.asset_class.upper() != asset_class.upper():
+        raise ValueError("ticker/asset class disagree with canonical instrument")
+    return legacy_analysis(
+        analyze_instrument(instrument, context, qlib_context=qlib_context, config=config, **kwargs)
+    )

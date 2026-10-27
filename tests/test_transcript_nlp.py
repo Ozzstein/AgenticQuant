@@ -1,200 +1,67 @@
-"""Unit tests for the transcript_nlp analyst node."""
+"""Transcript synthesis uses full-document spans and retains uncertainty."""
+# ruff: noqa: F401, F811
 
-from __future__ import annotations
+import json
 
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-from src.utils.schemas import AgentReport, Decision
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_mock_llm(report: AgentReport) -> MagicMock:
-    """Build a mock LLM whose with_structured_output().invoke() returns *report*."""
-    structured_mock = MagicMock()
-    structured_mock.invoke.return_value = report
-    mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = structured_mock
-    return mock_llm
+from src.agents.transcript_nlp import transcript_nlp_node
+from src.domain.decisions import AgentAction
+from tests.test_agent_desk_invariants import (
+    GenerativeFixture,
+    decision_context,
+    decision_instrument,
+    decision_source,
+    desk_config,
+    desk_hmm,
+    desk_portfolio,
+    desk_sources,
+    desk_state,
+)
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+def test_returns_agent_report(desk_state):
+    result = transcript_nlp_node(desk_state, llm=GenerativeFixture("transcript_nlp", []))
+    report = result["desk_reports"]["transcript_nlp"]
+    assert report.status == "ok" and report.claims and report.reasoning
+    assert report.confidence.analyst_conviction == 0.6
+    assert result["agent_reports"]["transcript_nlp"].confidence == 0
 
 
-@pytest.fixture
-def sample_state() -> dict:
-    """Return a minimal TradingDeskState-compatible dict for AAPL."""
-    return {
-        "ticker": "AAPL",
-        "asset_class": "EQUITY",
-        "qlib_context": "",
-        "market_context": "AAPL: $175.00",
-        "macro_regime": "neutral",
-        "macro_confidence": 60.0,
-        "memory_context": "",
-        "agent_reports": {},
-        "debate_round": 0,
-        "debate_transcript": [],
-        "risk_veto": False,
-        "risk_veto_reason": "",
-        "result": None,
-    }
+def test_degrades_on_llm_failure(desk_state):
+    report = transcript_nlp_node(
+        desk_state, llm=GenerativeFixture("transcript_nlp", [], fail_role="transcript_nlp")
+    )["desk_reports"]["transcript_nlp"]
+    assert report.status == "unavailable" and report.action == AgentAction.ABSTAIN
+    assert "ConnectionError" in report.reasoning
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_handles_missing_transcript(desk_state):
+    calls = []
+    desk_state["sources"] = tuple(s for s in desk_state["sources"] if s.kind != "transcript")
+    report = transcript_nlp_node(desk_state, llm=GenerativeFixture("transcript_nlp", calls))[
+        "desk_reports"
+    ]["transcript_nlp"]
+    assert report.status == "unavailable" and report.action == AgentAction.ABSTAIN and calls == []
 
 
-def test_returns_agent_report(sample_state):
-    """transcript_nlp_node returns a dict with agent_reports['transcript_nlp'] as AgentReport."""
-    mock_report = AgentReport(
-        agent_name="transcript_nlp",
-        decision=Decision.BUY,
-        confidence=72.0,
-        reasoning="Management tone bullish with raised guidance",
-        data_points={
-            "management_sentiment": "bullish",
-            "guidance_direction": "raised",
-            "tone_vs_prior": "improved",
-            "hedging_level": "low",
-            "key_quote": "We are very confident in our full-year outlook.",
-            "transcript_quarter": "Q4 2025",
-        },
+def test_includes_memory_context(desk_state):
+    desk_state["memory_context"] = "Prior analysis: demand weakening"
+    calls = []
+    transcript_nlp_node(desk_state, llm=GenerativeFixture("transcript_nlp", calls))
+    assert json.loads(calls[0][1][-1].content)["memory"] == desk_state["memory_context"]
+
+
+def test_no_memory_context(desk_state):
+    calls = []
+    transcript_nlp_node(desk_state, llm=GenerativeFixture("transcript_nlp", calls))
+    assert json.loads(calls[0][1][-1].content)["memory"] == ""
+
+
+def test_crypto_transcript_not_fabricated(desk_state):
+    desk_state["instrument"] = desk_state["instrument"].model_copy(update={"asset_class": "crypto"})
+    calls = []
+    report = transcript_nlp_node(desk_state, llm=GenerativeFixture("transcript_nlp", calls))[
+        "desk_reports"
+    ]["transcript_nlp"]
+    assert (
+        report.status == "not_applicable" and report.action == AgentAction.ABSTAIN and calls == []
     )
-    mock_llm = _make_mock_llm(mock_report)
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.return_value = "Q4 2025 earnings call transcript: ..."
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        result = transcript_nlp_node(sample_state, llm=mock_llm)
-
-    assert "agent_reports" in result
-    assert "transcript_nlp" in result["agent_reports"]
-    report = result["agent_reports"]["transcript_nlp"]
-    assert isinstance(report, AgentReport)
-    assert report.decision == Decision.BUY
-    assert report.confidence == 72.0
-
-
-def test_degrades_on_llm_failure(sample_state):
-    """transcript_nlp_node returns HOLD with 0.0 confidence when the LLM call raises."""
-    structured_mock = MagicMock()
-    structured_mock.invoke.side_effect = RuntimeError("LLM timeout")
-    mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = structured_mock
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.return_value = "Transcript data"
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        result = transcript_nlp_node(sample_state, llm=mock_llm)
-
-    assert "transcript_nlp" in result["agent_reports"]
-    report = result["agent_reports"]["transcript_nlp"]
-    assert isinstance(report, AgentReport)
-    assert report.decision == Decision.HOLD
-    assert report.confidence == 0.0
-    assert "Analysis failed" in report.reasoning
-
-
-def test_handles_tool_error(sample_state):
-    """transcript_nlp_node returns a valid report even when the transcript tool raises."""
-    mock_report = AgentReport(
-        agent_name="transcript_nlp",
-        decision=Decision.HOLD,
-        confidence=20.0,
-        reasoning="Limited data — transcript unavailable",
-        data_points={"guidance_direction": "not_available"},
-    )
-    mock_llm = _make_mock_llm(mock_report)
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.side_effect = Exception("Service unavailable")
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        result = transcript_nlp_node(sample_state, llm=mock_llm)
-
-    assert "transcript_nlp" in result["agent_reports"]
-    assert isinstance(result["agent_reports"]["transcript_nlp"], AgentReport)
-
-
-def test_includes_memory_context(sample_state):
-    """When memory_context is non-empty it appears in the LLM human message."""
-    sample_state["memory_context"] = "Prior analysis: AAPL was a BUY"
-
-    mock_report = AgentReport(
-        agent_name="transcript_nlp",
-        decision=Decision.BUY,
-        confidence=65.0,
-        reasoning="Consistent with prior analysis",
-        data_points={},
-    )
-    mock_llm = _make_mock_llm(mock_report)
-    structured_mock = mock_llm.with_structured_output.return_value
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.return_value = "Transcript text"
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        transcript_nlp_node(sample_state, llm=mock_llm)
-
-    call_args = structured_mock.invoke.call_args
-    messages = call_args[0][0]
-    human_content = messages[1].content
-    assert "Prior analysis: AAPL was a BUY" in human_content
-
-
-def test_no_memory_context(sample_state):
-    """transcript_nlp_node runs without error when memory_context is empty."""
-    sample_state["memory_context"] = ""
-
-    mock_report = AgentReport(
-        agent_name="transcript_nlp",
-        decision=Decision.HOLD,
-        confidence=50.0,
-        reasoning="No prior context",
-        data_points={},
-    )
-    mock_llm = _make_mock_llm(mock_report)
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.return_value = "Transcript"
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        result = transcript_nlp_node(sample_state, llm=mock_llm)
-
-    assert "transcript_nlp" in result["agent_reports"]
-
-
-def test_agent_name_is_transcript_nlp(sample_state):
-    """The returned AgentReport must have agent_name == 'transcript_nlp'."""
-    mock_report = AgentReport(
-        agent_name="transcript_nlp",
-        decision=Decision.STRONG_BUY,
-        confidence=90.0,
-        reasoning="Exceptional management commentary",
-        data_points={"management_sentiment": "bullish"},
-    )
-    mock_llm = _make_mock_llm(mock_report)
-
-    with patch("src.data.transcript_data.get_earnings_transcript") as mock_tool:
-        mock_tool.invoke.return_value = "Transcript"
-
-        from src.agents.transcript_nlp import transcript_nlp_node
-
-        result = transcript_nlp_node(sample_state, llm=mock_llm)
-
-    assert result["agent_reports"]["transcript_nlp"].agent_name == "transcript_nlp"

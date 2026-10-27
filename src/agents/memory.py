@@ -12,31 +12,7 @@ from src.utils.schemas import AnalysisResult
 if TYPE_CHECKING:
     from src.utils.config import AppConfig
 
-try:
-    from src.agents.state import TradingDeskState
-except ImportError:
-    import operator
-    from typing import Annotated, TypedDict
-
-    from src.utils.schemas import AnalysisResult as _AR
-
-    def _merge_reports(a: dict, b: dict) -> dict:  # type: ignore[return]
-        return {**a, **b}
-
-    class TradingDeskState(TypedDict):  # type: ignore[no-redef]
-        ticker: str
-        asset_class: str
-        qlib_context: str
-        market_context: str
-        macro_regime: str
-        macro_confidence: float
-        memory_context: str
-        agent_reports: Annotated[dict, _merge_reports]
-        debate_round: int
-        debate_transcript: Annotated[list, operator.add]
-        risk_veto: bool
-        risk_veto_reason: str
-        result: _AR | None
+from src.agents.state import TradingDeskState
 
 logger = get_logger(__name__)
 
@@ -91,7 +67,9 @@ class AnalysisMemoryStore:
                 fh.write(line)
         logger.debug("Saved analysis for {} to {}", result.ticker, self._path)
 
-    def retrieve(self, ticker: str, max_n: int | None = None) -> list[AnalysisResult]:
+    def retrieve(
+        self, ticker: str, max_n: int | None = None, *, as_of=None
+    ) -> list[AnalysisResult]:
         """Return past analyses for *ticker*, oldest to newest, sorted by timestamp.
 
         Args:
@@ -129,10 +107,14 @@ class AnalysisMemoryStore:
                     )
                     continue
                 if record.ticker.upper() == ticker_upper:
+                    if as_of is not None:
+                        # Naive legacy dates cannot establish historical availability.
+                        if record.timestamp.tzinfo is None or record.timestamp > as_of:
+                            continue
                     results.append(record)
 
         # Sort by timestamp (ascending) then take the tail to honour limit.
-        results.sort(key=lambda r: r.timestamp)
+        results.sort(key=lambda r: r.timestamp.isoformat())
         return results[-limit:] if limit > 0 else results
 
     def format_memory_context(self, results: list[AnalysisResult]) -> str:
@@ -204,7 +186,23 @@ def load_memory_node(state: TradingDeskState, config: "AppConfig | None" = None)
         max_history=config.memory.max_history,
     )
     ticker = state["ticker"]
-    results = store.retrieve(ticker)
+    context = state.get("context")
+    if context is None:
+        return {"memory_context": ""}
+    # Canonical replay history is read from the append-only decision store below.
+    canonical = DeskMemoryStore(Path(config.memory.store_path).with_suffix(".desk.sqlite"))
+    results = canonical.retrieve(state["instrument"].instrument_id, as_of=context.as_of)
+    if results:
+        return {
+            "memory_context": "\n".join(
+                f"[{r.context.as_of.isoformat()}] {r.action.value}: {r.reasoning}" for r in results
+            )[-_CHAR_BUDGET:]
+        }
+    # Legacy records do not preserve a separate publication/generation timestamp.
+    # They cannot become point-in-time evidence merely from an analysis date.
+    if context.mode in ("backtest", "research"):
+        return {"memory_context": ""}
+    results = store.retrieve(ticker, as_of=context.as_of)
     return {"memory_context": store.format_memory_context(results)}
 
 
@@ -226,6 +224,9 @@ def save_memory_node(state: TradingDeskState, config: "AppConfig | None" = None)
     if not config.memory.enabled:
         return {}
 
+    decision = state.get("agent_decision")
+    if decision is not None:
+        DeskMemoryStore(Path(config.memory.store_path).with_suffix(".desk.sqlite")).save(decision)
     result = state.get("result")
     if result is None:
         return {}
@@ -236,3 +237,53 @@ def save_memory_node(state: TradingDeskState, config: "AppConfig | None" = None)
     )
     store.save(result)
     return {}
+
+
+class DeskMemoryStore:
+    """Durable canonical history with separate decision and publication clocks."""
+
+    def __init__(self, path):
+        import sqlite3
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS desk_history (identity TEXT PRIMARY KEY, instrument TEXT, as_of TEXT, available_at TEXT, payload TEXT)"
+            )
+
+    def save(self, decision, *, available_at=None):
+        import sqlite3
+        from datetime import datetime, timezone
+
+        now = available_at or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("memory availability requires timezone")
+        now = now.astimezone(timezone.utc)
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                "INSERT OR IGNORE INTO desk_history VALUES(?,?,?,?,?)",
+                (
+                    decision.content_hash(),
+                    decision.instrument.instrument_id,
+                    decision.context.as_of.isoformat(),
+                    now.isoformat(),
+                    decision.model_dump_json(),
+                ),
+            )
+
+    def retrieve(self, instrument_id, *, as_of, limit=10):
+        import sqlite3
+        from datetime import timezone
+
+        from src.domain.decisions import AgentDecision
+
+        if as_of.tzinfo is None or limit < 1:
+            raise ValueError("aware as_of and positive history limit required")
+        cutoff = as_of.astimezone(timezone.utc).isoformat()
+        with sqlite3.connect(self.path) as db:
+            rows = db.execute(
+                "SELECT payload FROM desk_history WHERE instrument=? AND as_of<=? AND available_at<=? ORDER BY as_of DESC LIMIT ?",
+                (instrument_id, cutoff, cutoff, limit),
+            ).fetchall()
+        return [AgentDecision.model_validate_json(row[0]) for row in reversed(rows)]

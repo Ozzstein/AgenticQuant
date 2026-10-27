@@ -1,57 +1,43 @@
-"""TradingDeskState TypedDict for the LangGraph agent pipeline."""
-
-from __future__ import annotations
+"""LangGraph state, including immutable evidence and explicit boundary decisions."""
 
 import operator
 from typing import Annotated, TypedDict
 
+from src.domain.decisions import AgentDecision, SpecialistReport
 from src.utils.schemas import AgentReport, AnalysisResult
 
 
-def _merge_reports(
-    a: dict[str, AgentReport], b: dict[str, AgentReport]
-) -> dict[str, AgentReport]:
-    """Merge two agent_reports dicts, b values overwrite a on key conflicts.
-
-    Args:
-        a: Base dict of agent reports.
-        b: New dict of agent reports; its values take precedence on collision.
-
-    Returns:
-        Combined dict containing all keys from both a and b.
-    """
+def _merge_reports(a, b):
     return {**a, **b}
 
 
-class TradingDeskState(TypedDict):
-    """Shared mutable state threaded through the LangGraph trading desk graph.
-
-    Attributes:
-        ticker: Instrument identifier, e.g. "AAPL" or "BTC/USDT".
-        asset_class: Asset classification — "EQUITY" or "CRYPTO".
-        qlib_context: Serialized alpha scores from the quant layer (may be "").
-        market_context: Gathered market data text produced by the market_context node.
-        macro_regime: Current macro regime label — "risk_on", "neutral", "risk_off", or "crisis".
-        macro_confidence: Confidence in the macro regime estimate, range 0-100.
-        memory_context: Formatted prior-analysis history injected by load_memory_node (may be "").
-        agent_reports: Per-agent analysis reports; merged via _merge_reports on fan-in.
-        debate_round: Current debate round counter (starts at 0).
-        debate_transcript: Accumulated debate turn strings, appended each round.
-        risk_veto: True if the Risk Manager node has vetoed the current decision.
-        risk_veto_reason: Explanation for the risk veto (empty string if no veto).
-        result: Final synthesised AnalysisResult, or None if not yet produced.
-    """
-
+class TradingDeskState(TypedDict, total=False):
     ticker: str
     asset_class: str
+    context: object
+    instrument: object
+    sources: tuple
+    hmm_context: object
+    portfolio_context: object
     qlib_context: str
     market_context: str
     macro_regime: str
-    macro_confidence: float
+    macro_confidence: float | None
     memory_context: str
+    app_config: object
+    llm_factory: object
+    workflow: object
+    call_budget: object
+    decision_deadline: float
     agent_reports: Annotated[dict[str, AgentReport], _merge_reports]
+    desk_reports: Annotated[dict[str, SpecialistReport], _merge_reports]
+    decision_results: Annotated[list, operator.add]
+    citation_checks: tuple
+    evidence_issues: tuple
     debate_round: int
     debate_transcript: Annotated[list[str], operator.add]
     risk_veto: bool
     risk_veto_reason: str
+    new_exposure_blocked: bool
+    agent_decision: AgentDecision | None
     result: AnalysisResult | None
