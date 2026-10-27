@@ -243,6 +243,25 @@ class IntradayConfig(BaseModel):
     top_n: int = 5
 
 
+class OperationsConfig(BaseModel):
+    store_path: str = ''
+    evidence_store_path: str = ''
+    research_registry_path: str = ''
+    attribution_path: str = ''
+    poll_seconds: int = Field(default=60,ge=1,le=3600)
+    max_cycle_age_seconds: int = Field(default=3600,ge=1,le=86400)
+    # Only exact declared baselines can bypass learned-candidate activation.
+    approved_baseline_hashes: list[str] = Field(default_factory=list)
+    approved_model_hashes: list[str] = Field(default_factory=list)
+
+    @field_validator('approved_baseline_hashes','approved_model_hashes')
+    @classmethod
+    def exact_artifact_identities(cls, values):
+        if len(values) != len(set(values)) or any(len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for v in values):
+            raise ValueError('approval lists require unique exact SHA256 artifact hashes')
+        return values
+
+
 class AppConfig(BaseSettings):
     """Main application configuration."""
 
@@ -275,6 +294,7 @@ class AppConfig(BaseSettings):
     ccxt: CcxtConfig = Field(default_factory=CcxtConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     intraday: IntradayConfig = Field(default_factory=IntradayConfig)
+    operations: OperationsConfig = Field(default_factory=OperationsConfig)
 
     @model_validator(mode="after")
     def persistent_paper_account(self) -> AppConfig:
@@ -283,6 +303,10 @@ class AppConfig(BaseSettings):
             self.paper_ledger_path = str(Path(self.output_dir) / "paper-ledger.sqlite3")
         if not self.agents.budget_store_path:
             self.agents.budget_store_path = str(Path(self.output_dir) / "agent-budgets.sqlite3")
+        for name,filename in (('store_path','operations.sqlite3'),('evidence_store_path','evidence.sqlite3'),
+                              ('research_registry_path','research.sqlite3'),('attribution_path','strategy-performance.sqlite3')):
+            if not getattr(self.operations,name):
+                setattr(self.operations,name,str(Path(self.output_dir)/filename))
         if self.paper_ledger_path == ":memory:" or not self.paper_ledger_path.strip():
             raise ValueError("paper_ledger_path must identify a persistent database")
         if not self.paper_account_id.strip():

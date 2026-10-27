@@ -1,85 +1,47 @@
-"""Smoke tests for src/dashboard.py — import and data-loading functions only."""
-
-from __future__ import annotations
-
-import json
+"""Actual Streamlit rendering uses read-only views and missing-data states."""
 from pathlib import Path
-from unittest.mock import patch
 
-import pytest
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+from src.operations.reporting import budget_view, system_view
+from src.utils.config import AppConfig
 
 
-def test_dashboard_imports_without_error() -> None:
-    """Importing src.dashboard must not raise any exception."""
-    import src.dashboard  # noqa: F401
-
-    assert True
-
-
-def test_load_portfolio_handles_missing_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_load_portfolio() should return a dict even when the file is missing."""
-    import src.dashboard as dash
-
-    # Clear any cached values before patching paths
-    try:
-        dash._load_portfolio.clear()
-        dash._load_json.clear()
-    except AttributeError:
-        pass
-
-    monkeypatch.setattr(dash, "_ROOT", tmp_path)
-    monkeypatch.setattr(dash, "_OUTPUTS", tmp_path / "outputs")
-    monkeypatch.setattr(dash, "_DATA", tmp_path / "data")
-
-    result = dash._load_portfolio.__wrapped__() if hasattr(dash._load_portfolio, "__wrapped__") else dash._load_portfolio()
-    assert isinstance(result, dict)
+def test_missing_stores_remain_unknown_and_are_not_created(tmp_path):
+    config = AppConfig(output_dir=str(tmp_path/'missing'),_env_file=None)
+    result = system_view(config)
+    assert all(section['status']=='missing' for section in result.values())
+    assert result['budgets']['actual_cost_usd'] is None
+    assert not (tmp_path/'missing').exists()
 
 
-def test_load_audit_files_handles_empty_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_load_audit_files() should return a list even when audit dir is empty."""
-    import src.dashboard as dash
+def test_dashboard_pages_render_without_fabricated_values(tmp_path,monkeypatch):
+    from streamlit.testing.v1 import AppTest
 
-    try:
-        dash._load_audit_files.clear()
-        dash._load_json.clear()
-    except AttributeError:
-        pass
-
-    audit_dir = tmp_path / "data" / "audit"
-    audit_dir.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(dash, "_ROOT", tmp_path)
-    monkeypatch.setattr(dash, "_OUTPUTS", tmp_path / "outputs")
-    monkeypatch.setattr(dash, "_DATA", tmp_path / "data")
-
-    result = dash._load_audit_files.__wrapped__() if hasattr(dash._load_audit_files, "__wrapped__") else dash._load_audit_files()
-    assert isinstance(result, list)
+    from src.utils.config import reset_config
+    monkeypatch.setenv('AIQUANT_OUTPUT_DIR',str(tmp_path/'empty'))
+    reset_config()
+    app = AppTest.from_file(str(Path('src/dashboard.py').resolve())).run(timeout=20)
+    assert not app.exception
+    for name in ('Agent Desk','Backtests & Research','Data & Evidence','Operations','Portfolio'):
+        app.sidebar.radio[0].set_value(name).run(timeout=20)
+        assert not app.exception
+        assert not app.metric  # Absent stores never display measured $0 or NAV.
+    assert not (tmp_path/'empty').exists()
+    reset_config()
 
 
-def test_load_factor_library_handles_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """_load_factor_library() should return a dict even when the file is missing."""
-    import src.dashboard as dash
+def test_budget_report_preserves_unknown_usage_reservation(tmp_path):
+    import time
+    from datetime import datetime, timezone
 
-    try:
-        dash._load_factor_library.clear()
-        dash._load_json.clear()
-    except AttributeError:
-        pass
-
-    monkeypatch.setattr(dash, "_ROOT", tmp_path)
-    monkeypatch.setattr(dash, "_OUTPUTS", tmp_path / "outputs")
-    monkeypatch.setattr(dash, "_DATA", tmp_path / "data")
-
-    result = dash._load_factor_library.__wrapped__() if hasattr(dash._load_factor_library, "__wrapped__") else dash._load_factor_library()
-    assert isinstance(result, dict)
+    from src.agents.budget import AgentCallBudget
+    from src.utils.config import AgentConfig, ModelPricing
+    config = AgentConfig(llm_provider='openai',budget_store_path=str(tmp_path/'budget.db'),
+        pricing=[ModelPricing(provider='openai',model='test-pinned',price_version='fixture',source_uri='https://example.test',
+            effective_at=datetime(2020,1,1,tzinfo=timezone.utc),input_usd_per_million=1,output_usd_per_million=2)])
+    budget = AgentCallBudget(config,'run',deadline=time.monotonic()+30)
+    budget.reserve_bound('test-pinned',100,100)
+    value = budget_view(tmp_path/'budget.db')
+    assert value['calls_with_unknown_usage']==1
+    assert value['uncertain_reserved_cost_usd']=='0.0003'
+    assert value['actual_cost_usd']=='0'
+    assert value['charged_cost_usd']=='0.0003'

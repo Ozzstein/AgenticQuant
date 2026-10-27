@@ -10,6 +10,7 @@ COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev --extra dashboard --extra alpaca --extra qlib
 COPY src/ src/
+COPY scripts/ scripts/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-editable --no-dev --extra dashboard --extra alpaca --extra qlib
 

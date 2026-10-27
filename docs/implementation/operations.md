@@ -1,0 +1,11 @@
+# Operating control and monitoring
+
+The operating store coordinates work; `PortfolioLedger` remains the sole economic authority. `OperationsStore` archives immutable run manifests, exact inputs and stage outputs, commits an attempt before work, and records failed or uncertain completion explicitly. A completed stage replays its verified receipt. A process crash does not authorize repeating an external call: recovery must use the original frozen input and the component's reconciliation API. Kernel process locks serialize work across independent processes.
+
+`ScheduleSupervisor` persists UTC deadlines, uses declared local time zones and actual XNYS session dates, and archives an input bundle before invoking its handler. Missing bundles wait only until the configured deadline, then become missed runs with alerts. Failed or interrupted runs block their schedule until explicit recovery names the exact input hash. Restarting does not erase failures or schedule duplicate successful jobs.
+
+`src.dashboard` and `src.rd_agent_dashboard` are read-only projections of the actual ledger, research registry, evidence archive, operating receipts and `AgentCallBudget`. Unknown usage retains its charged reservation and is displayed separately from cost calculated from reported tokens at configured rates. Missing stores or marks remain unavailable. Research monitoring shows development outcomes and holdout consumption, not holdout measurements in development views. There are no trading or activation controls in the dashboard.
+
+Configuration paths live under `AppConfig.operations` and default to the configured output directory. Explicit approved baseline and model hashes default to empty; file presence and candidate JSON flags never authorize trading. The account uses `paper_ledger_path` and `paper_account_id` consistently.
+
+Verification at this checkpoint: 25 offline tests passed across operating-store subprocess death/restart, cross-process locking, immutable inputs, alert delivery uncertainty, schedule DST/session boundaries/recovery, configuration, and actual Streamlit page rendering. Authenticated notifications, unattended provider refresh, complete cycle composition and external venue operation require their subsequent integration checks; dashboard rendering is not evidence of those executions.
