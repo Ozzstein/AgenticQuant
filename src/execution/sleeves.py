@@ -805,7 +805,20 @@ class SleeveBook:
                 for name in names
             }
             rounding = exact_sum([canonical.nav, exact_sum(nav.values()).copy_negate()])
-            nav[names[-1]] = exact_sum([nav[names[-1]], rounding])
+            # Finite canonical Decimal valuation can differ from exact sums of
+            # its components. Assign that residual only to an economic owner;
+            # an empty sleeve cannot gain funding or acquire a negative NAV.
+            rounding_owner = None
+            if rounding:
+                candidates = [
+                    name
+                    for name in names
+                    if nav[name] > 0 and exact_sum([nav[name], rounding]) >= 0
+                ]
+                if not candidates:
+                    raise LedgerError("no funded sleeve can absorb canonical valuation residual")
+                rounding_owner = candidates[-1]
+                nav[rounding_owner] = exact_sum([nav[rounding_owner], rounding])
             source = [
                 {
                     "id": r["id"],
@@ -849,7 +862,7 @@ class SleeveBook:
                     last_rebalanced_at=state["last"][name],
                     source_hash=source_hash,
                     source_event_ids=tuple(r["id"] for r in state["rows"]),
-                    valuation_rounding=rounding if name == names[-1] else ZERO,
+                    valuation_rounding=rounding if name == rounding_owner else ZERO,
                 )
                 if persist:
                     self.ledger.db.execute(

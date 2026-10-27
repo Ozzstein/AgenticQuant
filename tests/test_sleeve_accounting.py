@@ -37,6 +37,35 @@ def allocated_buy(ledger, book):
     return order
 
 
+@pytest.mark.parametrize(
+    "price", ["101.0000000000000000000000001", "101.0000000000000000000000009"]
+)
+def test_empty_sleeves_never_receive_funded_owners_valuation_residual(tmp_path, price):
+    path = tmp_path / "funded-rounding.sqlite3"
+    ledger = account(path)
+    capital = {"alpha": D(100000), **{f"zero-{i}": D(0) for i in range(5)}}
+    book = SleeveBook(ledger, "backtest:test").initialize(capital)
+    order = intent(qty="100")
+    book.register_intent(order, {"alpha": D(100)}, source_hash="a" * 64, quantity_quantum=D(1))
+    ledger.submit(order)
+    ledger.apply_fill(fill(order))
+    at = T + timedelta(days=1)
+    ledger.mark(order.account_id, [PriceMark(instrument=A, price=D(price), as_of=at)])
+    canonical = ledger.snapshot(order.account_id, at, 0)
+    parts = book.snapshot(at)
+    assert parts["alpha"].valuation_rounding != 0
+    assert parts["alpha"].portfolio.nav == canonical.nav
+    assert exact_sum(p.portfolio.nav for p in parts.values()) == canonical.nav
+    assert all(
+        parts[k].portfolio.nav == parts[k].valuation_rounding == 0 for k in capital if k != "alpha"
+    )
+    ledger.close()
+    ledger = PortfolioLedger(path)
+    assert SleeveBook(ledger, order.account_id).snapshot(at) == parts
+    assert ledger.reconcile(order.account_id)["reconciled"]
+    ledger.close()
+
+
 def test_partial_fill_residual_cash_fee_and_restart(tmp_path):
     path = tmp_path / "sleeves.sqlite3"
     ledger, book = setup(path)
