@@ -10,21 +10,22 @@ from types import SimpleNamespace
 import httpx
 import pandas as pd
 import pytest
-from src.agents.contracts import PortfolioReviewContext, hmm_context_from_result
-from src.agents.history import DeskHistoryStore
-from src.decision.service import DecisionService, OperatingLimits
-from src.decision.store import DecisionStore
-from src.decision.transport import JevHTTPTransport
-from src.domain.decisions import CitedClaim, ConfidenceSemantics, DecisionSource, SpecialistReport
-from src.domain.portfolio import AccountSpec
-from src.execution.ledger import PortfolioLedger
-from src.research.registry import Candidate, PromotionPolicy, RegistryError, Trial
 
+from src.agents.contracts import PortfolioReviewContext, hmm_context_from_result
 from src.agents.graph import analyze_instrument
+from src.agents.history import DeskHistoryStore
 from src.core.backtester import recorded_decisions
 from src.core.benchmark import BenchmarkRunner
 from src.data.evidence.store import canonical_bytes, digest
+from src.decision.service import DecisionService, OperatingLimits
+from src.decision.store import DecisionStore
+from src.decision.transport import JevHTTPTransport
 from src.domain.common import EvidenceRecord
+from src.domain.decisions import CitedClaim, ConfidenceSemantics, DecisionSource, SpecialistReport
+from src.domain.portfolio import AccountSpec
+from src.execution.ledger import PortfolioLedger
+from src.execution.sleeves import SleeveBook
+from src.research.registry import Candidate, PromotionPolicy, RegistryError, Trial
 from src.research.strategy_experiments import (
     HISTORICAL_ADVICE_POLICY,
     AgentHistoryAuthorities,
@@ -85,7 +86,9 @@ def agent_experiment(experiment,tmp_path_factory):  # noqa: F811
     ledger = PortfolioLedger(original_path)
     ledger.create_account(AccountSpec(account_id='paper:observed-advice',mode='paper',base_currency='USD',initial_cash=123456,
                                      opened_at=original.context.as_of-timedelta(days=1)))
+    book = SleeveBook(ledger,'paper:observed-advice').initialize({'observed-alpha':Decimal(100000),'observed-beta':Decimal(23456)})
     snapshot = ledger.snapshot('paper:observed-advice',original.context.as_of,86400)
+    snapshot = snapshot.model_copy(update={'sleeves':book.snapshot(original.context.as_of,86400)})
     ledger.close()
     portfolio = PortfolioReviewContext(as_of=snapshot.as_of,snapshot_id=snapshot.content_hash(),
         portfolio_json=snapshot.model_dump_json(),correlation_json='{"positions":[]}')

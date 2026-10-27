@@ -113,6 +113,31 @@ class StrategyExperimentPlan(VersionedContract):
 
 
 
+def _verify_review_snapshot(ledger, snapshot):
+    """Verify original base economics and exact archived ownership separately."""
+    from src.execution.ledger import LedgerError
+    from src.execution.sleeves import SleeveBook
+
+    try:
+        ledger.reconcile(snapshot.account_id)
+        recorded = [s for s in ledger.history(snapshot.account_id) if s.as_of == snapshot.as_of]
+        # Sleeve reporting is an independently persisted ownership projection.
+        # Removing only this field preserves every canonical economic/clock field.
+        base = snapshot.model_copy(update={'sleeves': {}})
+        if [s.model_copy(update={'sleeves': {}}) for s in recorded] != [base]:
+            raise RegistryError('original advice portfolio differs from persisted authoritative snapshot')
+        if snapshot.sleeves:
+            source_hashes = {s.source_hash for s in snapshot.sleeves.values()}
+            if len(source_hashes) != 1:
+                raise RegistryError('original advice sleeves require one exact historical source observation')
+            observed = SleeveBook(ledger, snapshot.account_id).observation(
+                snapshot.as_of, source_hash=next(iter(source_hashes)))
+            if observed is None or observed != snapshot.sleeves:
+                raise RegistryError('original advice sleeves differ from persisted authoritative observation')
+    except LedgerError:
+        raise RegistryError('original advice portfolio or sleeve authority failed verification') from None
+
+
 def _verify_agent_decisions(registry, store, plan, *, authorities: AgentHistoryAuthorities,
                             observations) -> dict:
     """Read original source/model/budget/history/portfolio authorities; never call an LLM."""
@@ -157,10 +182,7 @@ def _verify_agent_decisions(registry, store, plan, *, authorities: AgentHistoryA
         if cache_key not in portfolios:
             ledger = PortfolioLedger(path,read_only=True)
             try:
-                ledger.reconcile(snapshot.account_id)
-                recorded = [s for s in ledger.history(snapshot.account_id) if s.as_of == snapshot.as_of]
-                if recorded != [snapshot]:
-                    raise RegistryError('original advice portfolio differs from persisted authoritative snapshot')
+                _verify_review_snapshot(ledger, snapshot)
             finally:
                 ledger.close()
             portfolios[cache_key] = snapshot
