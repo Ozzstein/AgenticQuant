@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.utils.config import AppConfig, get_config
+from src.utils.config import get_config
 from src.utils.schemas import (
     MacroRegime,
     SelectionMethod,
@@ -16,7 +16,6 @@ from src.utils.schemas import (
     StrategyAllocation,
     StrategyPerformance,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,7 +59,8 @@ def _make_selector_with_dir(tmp_path: Path):
     selector.strategy_config = selector.config.strategy
     selector.library_dir = tmp_path
     selector.strategies = []
-    selector.load_library()
+    # Explicit test fixture injection for legacy diagnostic selector arithmetic.
+    selector.strategies = [Strategy(**json.loads(path.read_text())) for path in sorted(tmp_path.glob("*.json"))]
     return selector
 
 
@@ -204,14 +204,12 @@ class TestStrategyLibrary:
 
 class TestStrategySelector:
     def test_load_library_from_dir(self, tmp_path):
-        """Selector should load strategies from a custom directory."""
+        """A validated flag in an arbitrary JSON file never activates research."""
         _write_strategy(tmp_path, "strat_a")
-        _write_strategy(tmp_path, "strat_b")
-
         selector = _make_selector_with_dir(tmp_path)
-        assert len(selector.strategies) == 2
-        names = {s.name for s in selector.strategies}
-        assert names == {"strat_a", "strat_b"}
+        selector.load_library()
+        assert "strat_a" not in {strategy.name for strategy in selector.strategies}
+        assert all(not strategy.validated for strategy in selector.strategies)
 
     def test_load_library_missing_dir(self, tmp_path):
         """Selector should return empty list and not raise on missing dir."""
@@ -474,7 +472,6 @@ class TestPipelineStrategyIntegration:
 
     def test_strategy_tracker_attribute_save_load(self, tmp_path):
         """Full round-trip: attribute P&L → save → reload → verify consistency."""
-        from src.core.strategy_tracker import StrategyTracker
 
         # Step 1: create tracker and attribute several days of P&L.
         tracker_a = _make_tracker_with_dir(tmp_path)

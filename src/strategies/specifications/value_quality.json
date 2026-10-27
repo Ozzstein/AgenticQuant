@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "name": "value_quality",
+  "family": "value_quality",
+  "origin": "declared_baseline",
+  "model_name": "CatBoost",
+  "features": [
+    {
+      "schema_version": "1.0",
+      "name": "adv_20",
+      "expression": "Mean(close * volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "pe",
+      "expression": "pe",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "roic",
+      "expression": "roic",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "free_cash_flow",
+      "expression": "free_cash_flow",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "volatility_20",
+      "expression": "Std((close / Ref(close, 1) - 1), 20) * 15.874507866387544",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    }
+  ],
+  "asset_classes": [
+    "equity",
+    "etf"
+  ],
+  "regimes": [
+    "neutral"
+  ],
+  "cadence": "monthly",
+  "top_k": 30,
+  "capital_fraction": 0.95,
+  "position_cap": 0.1,
+  "max_signal_age_seconds": 86400,
+  "min_adv": 1000000.0,
+  "entry_rules": [
+    "0 < PE <= 25",
+    "ROIC >= 0.10 and free cash flow > 0",
+    "positive model prediction; rank quality/value score"
+  ],
+  "exit_rules": [
+    "value/quality screen or prediction fails",
+    "outside selected top 30"
+  ],
+  "sizing": "equal",
+  "max_holding_sessions": null,
+  "parameters": [
+    [
+      "minimum_prediction",
+      0
+    ],
+    [
+      "maximum_pe",
+      25
+    ],
+    [
+      "minimum_roic",
+      0.1
+    ],
+    [
+      "minimum_fcf",
+      0
+    ]
+  ]
+}

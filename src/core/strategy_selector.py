@@ -1,13 +1,11 @@
 """Strategy selection layer for the daily trading pipeline.
 
-Selects or blends trading strategies based on macro regime, historical
-performance, bandit exploration, or manual override.
+Legacy selection diagnostics. Production uses src.strategies.allocation with
+explicit context, evidence-backed HMM and attributed ledger performance.
 """
 
 from __future__ import annotations
 
-import json
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -49,28 +47,17 @@ class StrategySelector:
         Returns:
             List of validated Strategy objects loaded from disk.
         """
-        if not self.library_dir.exists():
-            logger.warning(
-                "Strategy library directory not found: {}. Returning empty list.",
-                self.library_dir,
-            )
-            self.strategies = []
-            return []
+        from src.strategies.specification import baseline_specs
 
-        loaded: list[Strategy] = []
-        for json_path in sorted(self.library_dir.glob("*.json")):
-            try:
-                with open(json_path) as fh:
-                    data = json.load(fh)
-                strategy = Strategy(**data)
-                loaded.append(strategy)
-            except FileNotFoundError:
-                logger.warning("Strategy file disappeared during load: {}", json_path)
-            except Exception as e:
-                logger.warning("Failed to load strategy from {}: {}", json_path, e)
-
-        self.strategies = loaded
-        logger.info("Loaded {} strategies from {}", len(self.strategies), self.library_dir)
+        # Compatibility diagnostics only. Research JSON/YAML files, including
+        # validated:true flags, are never an activation source.
+        self.strategies = [Strategy(
+            name=spec.name, description="Declared code baseline; use evaluate_strategy for runtime",
+            factor_set=[feature.name for feature in spec.features], model=spec.model_name or "none",
+            regime_applicability=list(spec.regimes), rebalance_frequency=spec.cadence,
+            risk_overrides={"position_cap": spec.position_cap, "capital_fraction": spec.capital_fraction},
+            source="declared_code_baseline", validated=False,
+        ) for spec in baseline_specs().values()]
         return self.strategies
 
     # ------------------------------------------------------------------
@@ -366,32 +353,3 @@ class StrategySelector:
         )
 
 
-# ---------------------------------------------------------------------------
-# Standalone smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    from src.utils.schemas import StrategyPerformance
-
-    selector = StrategySelector()
-    logger.info("Loaded {} strategies", len(selector.strategies))
-
-    alloc = selector.select("risk_on")
-    logger.info("Selected: {} via {}", alloc.active_strategy, alloc.selection_method)
-
-    # Test with fake performance data.
-    perf = {
-        s.name: StrategyPerformance(
-            strategy_name=s.name,
-            rolling_sharpe_60d=round(random.uniform(0.2, 1.5), 3),
-            daily_pnl=[random.gauss(50, 200) for _ in range(30)],
-        )
-        for s in selector.strategies
-    }
-    alloc_perf = selector.select("neutral", performances=perf, method="performance_weighted")
-    logger.info("Perf-weighted: {} ({})", alloc_perf.active_strategy, alloc_perf.allocations)
-
-    alloc_bandit = selector.select("neutral", performances=perf, method="bandit")
-    logger.info("Bandit: {}", alloc_bandit.active_strategy)
-
-    logger.info("OK")

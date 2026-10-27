@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.evidence.store import canonical_bytes, digest
+from src.data.features.contextual import EvidenceFields
 from src.data.features.expressions import evaluate_expression
 from src.domain.market import FeatureSpec, MarketSnapshot
 
@@ -31,7 +32,7 @@ class FeatureDataset:
 
 
 def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *, horizon: int = 1,
-                    allow_gaps: bool = False) -> FeatureDataset:
+                    allow_gaps: bool = False, evidence_fields: EvidenceFields | None = None) -> FeatureDataset:
     if horizon < 1 or horizon > 252:
         raise ValueError("label horizon must be 1..252 bars")
     if snapshot.gaps and not allow_gaps:
@@ -55,6 +56,15 @@ def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *,
     if not rows:
         raise ValueError("no eligible bars")
     frame = pd.DataFrame(rows).set_index(["datetime", "instrument"]).sort_index()
+    if evidence_fields is not None:
+        if not frame.index.equals(evidence_fields.values.index) or not frame.index.equals(evidence_fields.available_at.index):
+            raise ValueError("evidence feature identities must match market history exactly")
+        if set(frame.columns) & set(evidence_fields.values.columns):
+            raise ValueError("evidence fields cannot override market observations")
+        if (evidence_fields.available_at.dropna() > snapshot.context.as_of).any():
+            raise ValueError("future contextual evidence")
+        frame = frame.join(evidence_fields.values, validate="one_to_one")
+        frame["available_at"] = pd.concat([frame.available_at, evidence_fields.available_at], axis=1).max(axis=1).where(evidence_fields.available_at.notna())
     result = {}
     for spec in specs:
         if spec.engine_version != "bounded-ast-1":
@@ -74,8 +84,9 @@ def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *,
     labels = (future_price / frame.close - 1).rename("forward_return")
     label_available = pd.concat([label_available.rename("future"), available.rename("current")], axis=1).max(axis=1)
     label_available = label_available.where(labels.notna())
+    snapshot_hash = snapshot.content_hash() if evidence_fields is None else digest(canonical_bytes({"market": snapshot.content_hash(), "contextual": evidence_fields.snapshot_hash}))
     return FeatureDataset(features, labels, available, label_available,
-                          snapshot.content_hash(), digest(canonical_bytes([s.model_dump(mode="json") for s in specs])))
+                          snapshot_hash, digest(canonical_bytes([s.model_dump(mode="json") for s in specs])))
 
 
 def join_features(base: pd.DataFrame, additional: pd.DataFrame) -> pd.DataFrame:

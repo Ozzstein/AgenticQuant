@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -263,3 +264,104 @@ class StrategyTracker:
                 for name, perf in self.performances.items()
             },
         }
+
+
+class AttributedPerformanceStore:
+    """Append-only return observations derived from the accounting ledger.
+
+    This stores no orders/positions/balances and is not a second portfolio ledger.
+    Caller supplies reconciled sleeve NAV and the immutable source event hash.
+    Flows are end-of-period; intraperiod flows require splitting the observation.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS attributed_nav (strategy TEXT, ended_at TEXT, available_at TEXT, source_event_id TEXT UNIQUE, payload TEXT, PRIMARY KEY(strategy,ended_at))")
+            for operation in ("UPDATE", "DELETE"):
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS nav_no_{operation.lower()} BEFORE {operation} ON attributed_nav BEGIN SELECT RAISE(ABORT, 'immutable attributed observation'); END")
+
+    @contextmanager
+    def _db(self):
+        import sqlite3
+        connection = sqlite3.connect(self.path, timeout=30)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def record_nav(self, strategy: str, *, started_at, ended_at, available_at, opening_nav,
+                   closing_nav, end_flow, source_event_id: str, source_event_hash: str):
+        from decimal import Decimal
+
+        from src.data.evidence.store import canonical_bytes
+        from src.domain.common import _utc
+        times = [_utc(value) for value in (started_at, ended_at, available_at)]
+        started_at, ended_at, available_at = times
+        if started_at >= ended_at or ended_at > available_at or not strategy or not source_event_id:
+            raise ValueError("valid period/source identity and explicit availability required")
+        if len(source_event_hash) != 64 or any(c not in "0123456789abcdef" for c in source_event_hash):
+            raise ValueError("immutable source event hash required")
+        if any(not isinstance(value, Decimal) or not value.is_finite() for value in (opening_nav, closing_nav, end_flow)):
+            raise ValueError("finite Decimal ledger NAV and flow required")
+        if opening_nav <= 0 or closing_nav < 0 or closing_nav-end_flow < 0:
+            raise ValueError("invalid reconciled NAV")
+        period_return = (closing_nav-end_flow)/opening_nav-1
+        payload = canonical_bytes(dict(strategy=strategy, started_at=started_at.isoformat(), ended_at=ended_at.isoformat(),
+                                       available_at=available_at.isoformat(), opening_nav=str(opening_nav), closing_nav=str(closing_nav),
+                                       end_flow=str(end_flow), period_return=str(period_return), source_event_id=source_event_id,
+                                       source_event_hash=source_event_hash, flow_convention="end_of_period")).decode()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT payload FROM attributed_nav WHERE source_event_id=?", (source_event_id,)).fetchone()
+            if existing:
+                if existing[0] != payload:
+                    raise ValueError("source event cannot be rewritten")
+                return
+            prior = db.execute("SELECT payload FROM attributed_nav WHERE strategy=? ORDER BY ended_at DESC LIMIT 1", (strategy,)).fetchone()
+            if prior:
+                previous = json.loads(prior[0])
+                if started_at.isoformat() < previous["ended_at"] or opening_nav != Decimal(previous["closing_nav"]):
+                    raise ValueError("attributed NAV must continue reconciled history without overlap")
+            db.execute("INSERT INTO attributed_nav VALUES (?,?,?,?,?)", (strategy, ended_at.isoformat(), available_at.isoformat(), source_event_id, payload))
+
+    def metrics(self, *, as_of, annualization: int, window: int = 60):
+        import pandas as pd
+
+        from src.domain.common import _utc
+        cutoff = _utc(as_of)
+        if annualization not in (252, 365) or window < 2:
+            raise ValueError("explicit equity or continuous calendar and valid window required")
+        with self._db() as db:
+            rows = db.execute("SELECT payload FROM attributed_nav WHERE ended_at<=? AND available_at<=? ORDER BY ended_at", (cutoff.isoformat(), cutoff.isoformat())).fetchall()
+        groups = {}
+        for row in rows:
+            value = json.loads(row[0])
+            groups.setdefault(value["strategy"], []).append(value)
+        metrics = []
+        for name, history in groups.items():
+            trailing = history[-window:]
+            dates = [pd.Timestamp(item["ended_at"]).date().isoformat() for item in history]
+            if annualization == 365:
+                expected = pd.date_range(dates[0], dates[-1], freq="D").strftime("%Y-%m-%d").tolist()
+            else:
+                from src.data.calendars import sessions
+                expected = list(sessions(dates[0], dates[-1], calendar="XNYS"))
+            complete = dates == expected
+            # Gaps are visible and never converted to zero daily returns or
+            # annualized as if sparse observations were consecutive sessions.
+            returns = np.array([float(item["period_return"]) for item in trailing])
+            std = returns.std(ddof=1) if len(returns) > 1 else np.nan
+            sharpe = float(returns.mean()/std*np.sqrt(annualization)) if complete and std > 0 and len(returns) >= 20 else np.nan
+            nav = np.r_[1., np.cumprod(1+np.array([float(item["period_return"]) for item in history]))]
+            drawdown = nav/np.maximum.accumulate(nav)-1
+            metrics.append(dict(strategy=name, sharpe=sharpe, observations=len(returns), annualization=annualization,
+                                complete=complete,
+                                available_at=pd.Timestamp(max(item["available_at"] for item in history)),
+                                source_event_ids=tuple(item["source_event_id"] for item in trailing),
+                                max_drawdown=float(drawdown.min()), current_drawdown=float(drawdown[-1]),
+                                total_return=float(nav[-1]-1)))
+        columns = ["strategy", "sharpe", "observations", "annualization", "complete", "available_at", "source_event_ids", "max_drawdown", "current_drawdown", "total_return"]
+        return pd.DataFrame(metrics, columns=columns).set_index("strategy")

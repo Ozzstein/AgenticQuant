@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0",
+  "name": "agent_consensus",
+  "family": "agent_consensus",
+  "origin": "declared_baseline",
+  "model_name": null,
+  "features": [
+    {
+      "schema_version": "1.0",
+      "name": "adv_20",
+      "expression": "Mean(close * volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    }
+  ],
+  "asset_classes": [
+    "equity",
+    "etf",
+    "crypto"
+  ],
+  "regimes": [
+    "risk_on",
+    "neutral",
+    "risk_off",
+    "crisis"
+  ],
+  "cadence": "daily",
+  "top_k": 20,
+  "capital_fraction": 0.95,
+  "position_cap": 0.05,
+  "max_signal_age_seconds": 86400,
+  "min_adv": 1000000.0,
+  "entry_rules": [
+    "five named roles present and at least four identical BUY recommendations",
+    "absolute risk veto blocks exposure"
+  ],
+  "exit_rules": [
+    "explicit consensus EXIT only",
+    "explicit REDUCE halves current sleeve weight"
+  ],
+  "sizing": "equal",
+  "max_holding_sessions": null,
+  "parameters": [
+    [
+      "reduction_fraction",
+      0.5
+    ]
+  ]
+}

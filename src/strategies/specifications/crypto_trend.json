@@ -1,0 +1,114 @@
+{
+  "schema_version": "1.0",
+  "name": "crypto_trend",
+  "family": "crypto_trend",
+  "origin": "declared_baseline",
+  "model_name": "XGBoost",
+  "features": [
+    {
+      "schema_version": "1.0",
+      "name": "adv_20",
+      "expression": "Mean(close * volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "sma_20",
+      "expression": "Mean(close, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "sma_50",
+      "expression": "Mean(close, 50)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "volume_ratio",
+      "expression": "volume / Mean(volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "crypto_volatility_20",
+      "expression": "Std((close / Ref(close, 1) - 1), 20) * 19.1049731745428",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "funding_reversion",
+      "expression": "-(funding_rate-Mean(funding_rate,30))/Std(funding_rate,30)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "oi_divergence",
+      "expression": "Corr(open_interest/Ref(open_interest,1)-1, (close / Ref(close, 1) - 1), 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "btc_dominance",
+      "expression": "(btc_dominance-Mean(btc_dominance,30))/Std(btc_dominance,30)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "beta_adjusted_momentum",
+      "expression": "Sum((close / Ref(close, 1) - 1) - (Ref(Cov((close / Ref(close, 1) - 1), (benchmark_close / Ref(benchmark_close, 1) - 1), 60) / Var((benchmark_close / Ref(benchmark_close, 1) - 1), 60), 1)) * (benchmark_close / Ref(benchmark_close, 1) - 1), 30)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    }
+  ],
+  "asset_classes": [
+    "crypto"
+  ],
+  "regimes": [
+    "risk_on"
+  ],
+  "cadence": "daily",
+  "top_k": 5,
+  "capital_fraction": 0.25,
+  "position_cap": 0.05,
+  "max_signal_age_seconds": 86400,
+  "min_adv": 1000000.0,
+  "entry_rules": [
+    "SMA20 > SMA50",
+    "volume >= trailing 20-bar mean",
+    "positive model prediction incorporating perpetual-derived funding/OI and BTC features"
+  ],
+  "exit_rules": [
+    "SMA20 <= SMA50",
+    "nonpositive model prediction"
+  ],
+  "sizing": "inverse_volatility",
+  "max_holding_sessions": null,
+  "parameters": [
+    [
+      "minimum_prediction",
+      0
+    ],
+    [
+      "minimum_volume_ratio",
+      1
+    ]
+  ]
+}

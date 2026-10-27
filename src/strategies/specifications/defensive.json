@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "name": "defensive",
+  "family": "defensive",
+  "origin": "declared_baseline",
+  "model_name": "Linear",
+  "features": [
+    {
+      "schema_version": "1.0",
+      "name": "adv_20",
+      "expression": "Mean(close * volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "beta_60",
+      "expression": "Ref(Cov((close / Ref(close, 1) - 1), (benchmark_close / Ref(benchmark_close, 1) - 1), 60) / Var((benchmark_close / Ref(benchmark_close, 1) - 1), 60), 1)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "roic",
+      "expression": "roic",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "volatility_20",
+      "expression": "Std((close / Ref(close, 1) - 1), 20) * 15.874507866387544",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    }
+  ],
+  "asset_classes": [
+    "equity",
+    "etf"
+  ],
+  "regimes": [
+    "risk_off",
+    "crisis"
+  ],
+  "cadence": "weekly",
+  "top_k": 20,
+  "capital_fraction": 0.7,
+  "position_cap": 0.1,
+  "max_signal_age_seconds": 86400,
+  "min_adv": 1000000.0,
+  "entry_rules": [
+    "0 <= beta <= 0.7",
+    "ROIC >= 0.10",
+    "positive model prediction; low beta/volatility first"
+  ],
+  "exit_rules": [
+    "beta or quality screen fails",
+    "outside selected low-risk names"
+  ],
+  "sizing": "inverse_volatility",
+  "max_holding_sessions": null,
+  "parameters": [
+    [
+      "minimum_prediction",
+      0
+    ],
+    [
+      "minimum_beta",
+      0
+    ],
+    [
+      "maximum_beta",
+      0.7
+    ],
+    [
+      "minimum_roic",
+      0.1
+    ]
+  ]
+}

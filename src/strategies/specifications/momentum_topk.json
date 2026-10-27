@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "name": "momentum_topk",
+  "family": "momentum",
+  "origin": "declared_baseline",
+  "model_name": "LightGBM",
+  "features": [
+    {
+      "schema_version": "1.0",
+      "name": "adv_20",
+      "expression": "Mean(close * volume, 20)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "composite_momentum",
+      "expression": "((close / Ref(close, 63)-1)+(close / Ref(close, 126)-1)+(close / Ref(close, 252)-1))/3 - (close / Ref(close, 21)-1)",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    },
+    {
+      "schema_version": "1.0",
+      "name": "volatility_20",
+      "expression": "Std((close / Ref(close, 1) - 1), 20) * 15.874507866387544",
+      "engine_version": "bounded-ast-1",
+      "required_fields": [],
+      "market_type": "any"
+    }
+  ],
+  "asset_classes": [
+    "equity",
+    "etf"
+  ],
+  "regimes": [
+    "risk_on"
+  ],
+  "cadence": "weekly",
+  "top_k": 30,
+  "capital_fraction": 0.95,
+  "position_cap": 0.1,
+  "max_signal_age_seconds": 86400,
+  "min_adv": 1000000.0,
+  "entry_rules": [
+    "positive reversal-adjusted 3/6/12 month momentum",
+    "rank momentum descending with positive model prediction"
+  ],
+  "exit_rules": [
+    "nonpositive momentum or prediction",
+    "outside selected top 30"
+  ],
+  "sizing": "equal",
+  "max_holding_sessions": null,
+  "parameters": [
+    [
+      "minimum_prediction",
+      0
+    ],
+    [
+      "minimum_momentum",
+      0
+    ]
+  ]
+}
