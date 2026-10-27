@@ -76,11 +76,13 @@ class LeanVenue:
         allow_live=False,
         fee_valuation=None,
         native_reader=None,
+        evidence_store=None,
     ):
         self.deployment = LeanDeployment.model_validate(deployment.model_dump())
         self.ledger, self.account_id, self.mode = ledger, account_id, self.deployment.mode
         self.runtime, self._fee_valuation = runtime, fee_valuation
         self.native_reader = native_reader
+        self.evidence_store = evidence_store
         self._rules = {
             key: VenueRules.model_validate(value.model_dump()) for key, value in rules.items()
         }
@@ -381,7 +383,17 @@ class LeanVenue:
                 native_rules.require_order(intent, now)
                 if not 0 <= (now - reader.balances(now).observed_at).total_seconds() <= 30:
                     raise LedgerError("LEAN live native funding proof is stale/future")
-                if reader.venue in ("binance", "kraken"):
+                if reader.venue == "binance":
+                    from src.execution.lean_references import resolve_binance_reference
+
+                    reference = resolve_binance_reference(self, intent, as_of=now)
+                    previous = reader._notional_reference
+                    try:
+                        reader._notional_reference = reference
+                        reader._check_order(intent, now)
+                    finally:
+                        reader._notional_reference = previous
+                elif reader.venue == "kraken":
                     reader._check_order(intent, now)
             self.runtime.preflight(intent)
         except (LedgerError, ValueError) as exc:

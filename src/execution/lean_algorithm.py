@@ -37,12 +37,20 @@ class AIQuantStackAlgorithm(QCAlgorithm):
             os.environ.get("QAL_AUTHORIZE_LIVE_EXECUTION") == config.deployment.deployment_id
         )
         self.port = LeanAlgorithmPort(self, config.deployment, symbols, allow_live=allow_live)
+        evidence_store = None
+        if config.evidence_store_path is not None:
+            from src.data.evidence.store import EvidenceStore
+
+            if not Path(config.evidence_store_path).is_file():
+                raise ValueError("configured actual EvidenceStore does not exist")
+            evidence_store = EvidenceStore(config.evidence_store_path)
         self.execution = create_typed_lean_execution(
             ledger_path=config.ledger_path,
             account=config.account,
             deployment=config.deployment,
             rules=config.rules,
             runtime=self.port,
+            evidence_store=evidence_store,
             fill_policy=config.fill_policy,
             risk_policy=config.risk_policy,
             allow_live=allow_live,

@@ -297,6 +297,7 @@ def create_typed_lean_execution(
     rules,
     runtime=None,
     native_reader=None,
+    evidence_store=None,
     fee_valuation=None,
     fill_policy=None,
     risk_policy=None,
@@ -318,6 +319,7 @@ def create_typed_lean_execution(
             rules=rules,
             runtime=runtime,
             native_reader=native_reader,
+            evidence_store=evidence_store,
             fee_valuation=fee_valuation,
             allow_live=allow_live,
         )

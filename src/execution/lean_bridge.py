@@ -44,10 +44,19 @@ class LeanLaunchConfig(VersionedContract):
     api_key_environment: str | None = None
     api_secret_environment: str | None = None
     native_markets: tuple[NativeSpotMarket, ...] = ()
+    evidence_store_path: str | None = None
 
     @model_validator(mode="after")
     def coherent(self):
         import re
+
+        if (
+            self.evidence_store_path is not None
+            and not Path(self.evidence_store_path).is_absolute()
+        ):
+            raise ValueError("LEAN EvidenceStore must have an explicit absolute path")
+        if self.deployment.brokerage == "BinanceBrokerage" and self.evidence_store_path is None:
+            raise ValueError("LEAN Binance requires the frozen-reference EvidenceStore path")
 
         if self.account.mode == "live" and any(
             value is None or not re.fullmatch(r"[A-Z][A-Z0-9_]*", value)
