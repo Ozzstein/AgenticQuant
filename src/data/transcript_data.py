@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from langchain_core.tools import tool
@@ -45,12 +46,10 @@ def _fetch_transcript(ticker: str, year: int, quarter: int, api_key: str) -> str
     Returns:
         Formatted transcript string or None if not available.
     """
-    url = (
-        f"https://financialmodelingprep.com/api/v3/earning_call_transcript/{ticker}"
-        f"?quarter={quarter}&year={year}&apikey={api_key}"
-    )
-
-    resp = requests.get(url, timeout=15)
+    if quarter not in (1, 2, 3, 4):
+        raise ValueError("quarter must be 1..4")
+    url = "https://financialmodelingprep.com/stable/earning-call-transcript"
+    resp = requests.get(url, params={"symbol": ticker, "quarter": quarter, "year": year, "apikey": api_key}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -62,10 +61,29 @@ def _fetch_transcript(ticker: str, year: int, quarter: int, api_key: str) -> str
     if not content:
         return None
 
+    # Capture the complete response before constructing a bounded legacy tool
+    # excerpt. This endpoint remains current-only; the typed adapter accepts an
+    # explicit RunContext and canonical Instrument for historical workflows.
+    from src.data.adapters.base import store_observation
+    from src.data.evidence.store import EvidenceStore
+    from src.domain.common import RunContext
+    captured = datetime.now(timezone.utc)
+    context = RunContext(run_id=f"transcript-capture:{ticker}:{captured.isoformat()}", mode="research",
+                         as_of=captured, config_hash="0"*64, code_version="legacy-transcript-capture-v1")
+    store = EvidenceStore(Path(get_config().output_dir) / "evidence" / "evidence.sqlite")
+    raw = resp.content
+    if not isinstance(raw, bytes):
+        raise ValueError("provider response must supply raw bytes")
+    envelope = store_observation(store, raw=raw, normalized=item, document=content, provider="fmp",
+                                 version="stable-transcript-capture-v1", source_uri=url, kind="transcript",
+                                 logical_key=f"unresolved-symbol:{ticker}:{year}:Q{quarter}", context=context,
+                                 ingested_at=captured)
+    # No stable identity is invented from the display ticker; typed consumers
+    # require the canonical instrument adapter, not this compatibility tool.
     date = item.get("date", "N/A")
     header = f"=== {ticker} Earnings Call Transcript (Q{quarter} {year}) ==="
     body = content[:2200]
-    result = f"{header}\nDate: {date}\n\n{body}"
+    result = f"{header}\nDate: {date}\nSource: evidence:{envelope.record.evidence_id}#chars=0:{len(body)}\n\n{body}"
 
     if len(content) > 2200:
         result += f"\n\n[Transcript truncated — {len(content)} chars total]"
@@ -111,8 +129,8 @@ def get_earnings_transcript(ticker: str) -> str:
         return result[:2500]
 
     except Exception as e:
-        logger.warning(f"get_earnings_transcript failed for {ticker}: {e}")
-        return f"TOOL_ERROR: {type(e).__name__}: {str(e)[:200]}"
+        logger.warning("get_earnings_transcript failed: {}", type(e).__name__)
+        return f"TOOL_ERROR: {type(e).__name__}: provider request failed"
 
 
 @tool
@@ -142,5 +160,5 @@ def get_earnings_transcript_for_quarter(ticker: str, year: int, quarter: int) ->
         return result[:2500]
 
     except Exception as e:
-        logger.warning(f"get_earnings_transcript_for_quarter failed for {ticker} Q{quarter} {year}: {e}")
-        return f"TOOL_ERROR: {type(e).__name__}: {str(e)[:200]}"
+        logger.warning("get_earnings_transcript_for_quarter failed: {}", type(e).__name__)
+        return f"TOOL_ERROR: {type(e).__name__}: provider request failed"

@@ -37,3 +37,42 @@ PYTHONPATH="$PWD" /tmp/quantagentlab-review-venv/bin/python -m pytest tests/test
 ```
 
 Coordinator review fixes: snapshots check ALL supplied evidence, not just bar-linked records; every SQLite connection closes after commit/rollback.
+
+## B/A/E: direct adapters, MCP and usable CLI
+
+Direct entry points under `src/data/adapters/`:
+
+- `FMPAdapter.fetch`: stable statements/ratios/analyst/insider/institutional/filing/earnings/transcript routes. Full response bytes and complete transcript text survive bounded retrieval. Event dates do not invent revision availability; these captures are usable from receipt.
+- `FredAdapter.observations`: paginated FRED/ALFRED realtime intervals, all vintages retained. Day-resolution vintage availability uses the end of its US/Eastern date; missing `.` observations are explicitly unusable. Revisions remain visible for explicit resolution.
+- `CCXTAdapter.bars/derivatives`: explicit canonical venue/instrument, spot versus perpetual checks, bounded pagination, raw candles and separate funding/OI capabilities. `YFinanceAdapter.bars`: unadjusted SDK output, actual XNYS sessions and separately recorded corporate actions. Yahoo's SDK output is identified as parsed output, not claimed to be raw HTTP bytes. Current historical downloads are not silently treated as archived vintages.
+- `FinnhubAdapter.news`, `SECAdapter.submissions/filing`, `CoinGeckoAdapter.token/global_context`, `AlpacaReadAdapter.inspect`. SEC full accession documents preserve documented acceptance from an evidence-backed index; amendments are distinct accessions. Alpaca only account/position/order GET observations are reachable.
+
+`ReadHTTP` enforces bounded attempts/count/timeouts and rate spacing; errors distinguish credentials, entitlement, rate limits, malformed payload, provider outage and missing data without printing keys/URLs with credentials. External provider coverage is not inferred from successful fixture parsing. Bulk paths need deployment-specific coverage/entitlement exercises. Yahoo/FMP historical captures requiring genuine vintage provenance fail temporal training rather than fabricate publication dates.
+
+`MCPManager` supports actual MCP 2.3 Streamable HTTP connections, server identity/version and exact schema-hash verification, fixed argument policies, tool deduplication by capability, per-run evidence reuse and request/spend reservation budgets. Generic dispatch is unwrapped and checked locally and is never sent as an unrestricted remote call. Approved Alpaca observation names cannot be expanded to submission/cancellation/configuration/position mutations by a manifest. Failed verification evicts the connection. Unknown actual costs remain unknown. Selected tool results are stored completely as received; this does not assert that a remote server returned a complete original document. Prefer the full direct FMP ingestion for transcripts.
+
+`server_sources.json` pins reviewed OpenBB/FMP/Alpaca repository commits and identifies current Valyu's hosted endpoint. These are source pins, **not verified deployment manifests**: deployed server version/schema pins and provider extensions/entitlements must be captured and supplied as `ServerManifest`s before tool calls. Verified runtime versions: `mcp==2.3.0` (uses bundled `httpx2`), `exchange-calendars==4.13.2`, `pyqlib==0.9.7`. The coordinator owns the dependency lock.
+
+Primary implementation references: [Alpaca exact tool registry](https://github.com/alpacahq/alpaca-mcp-server/blob/d8dac43f3e17594e8879bac3b5b333196ea69aac/src/alpaca_mcp_server/tool_registry.py), [OpenBB MCP configuration](https://github.com/OpenBB-finance/OpenBB/tree/7df7d0c5592bf25be88e87e130a05c71e243d2d8/openbb_platform/extensions/mcp_server), [FMP API catalog](https://github.com/imbenrabi/Financial-Modeling-Prep-MCP-Server/blob/fe4e0a6eb4d07c81c0f79322263a4011afb13656/docs/API_REFERENCE.md), [FRED realtime observations](https://fred.stlouisfed.org/docs/api/fred/series_observations.html), [Valyu current hosted service](https://mcp.valyu.ai/).
+
+`EvidenceService.source_bundle(role,instrument,context)` returns source coverage and bounded exact passages without network access. `market_snapshot` resolves duplicate identical observations, reports conflicting prices and explicit expected-session gaps, and retains canonical identity. The legacy transcript tool now stores the complete response before excerpting, cites its store ID and redacts provider errors; unresolved legacy ticker identity does not become canonical evidence for typed agents.
+
+Executable interface: `python -m src.data --store /owned/path/evidence.sqlite --help`. Subcommands: `import-archive`, `query`, `document`, `snapshot`, `train`, `predict`, `qlib-export`, `qlib-alpha158`, `fmp-transcript`. Archive imports consume caller-supplied records/raw files with hashes; there is no runtime generator of sample market data. Context/instrument/feature/scenario inputs are validated JSON contracts. Failures return nonzero status. The coordinator must connect these services to the canonical application cycle/CLI.
+
+## C1/C2: US Qlib, local numeric flow and ensemble
+
+`src/data/qlib_us.py`: `export_bundle(snapshot,path)` writes immutable actual Qlib daily binaries/calendar/instruments and a content-hashed manifest with the entire evidence snapshot. Alpha158 requires actual VWAP; typical-price substitution is rejected. One raw/adjusted convention must be selected explicitly; raw factor=1 is declared raw. `USQlibScenario` pins US region, XNYS calendar, canonical-to-Qlib instrument mapping, benchmark, splits, label horizon and cost convention. `verify_bundle` checks files, coverage and label-horizon purging in actual sessions. `alpha158_dataset` runs real Qlib with train-only robust normalization and explicit labels. This does not claim a production US universe/delisting dataset has been obtained.
+
+IC ensembles split by distinct dates, purge overlapping training outcomes, compute date-local held-out IC and fail when no model has positive/defined validation IC. Equal/custom modes are explicit, never silent error substitutes. Every child artifact retains its fitted preprocessing; the parent manifest pins all child hashes. Current models cannot activate merely by writing a research YAML file.
+
+Consolidated Python 3.11 offline run (exact selected files in command below): **209 passed, 1 skipped in 10.93s**. The skipped Qlib test passes in the separate Python 3.12 environment. Synthetic sources are confined to `tests/data_quant_fixtures.py` and other tests.
+
+```sh
+PYTHONPATH="$PWD" /tmp/quantagentlab-review-venv/bin/python -m pytest tests/test_evidence_boundary.py tests/test_direct_evidence_adapters.py tests/test_mcp_evidence_permissions.py tests/test_feature_fidelity.py tests/test_temporal_models.py tests/test_local_quant_flow.py tests/test_core_data.py tests/test_core_models.py tests/test_core_factors.py tests/test_crypto_factors.py tests/test_crypto_pipeline.py tests/test_ensemble.py tests/test_transcript_data.py -q --basetemp=/tmp/quantagentlab-data-quant-checkpoint
+PYTHONPATH="$PWD" /tmp/quantagentlab-data-quant-venv/bin/python -m pytest tests/test_local_quant_flow.py::test_alpha158_actual_qlib_local_bundle -q --basetemp=/tmp/quantagentlab-data-quant-qlib
+# 1 passed in 2.64s: actual US Qlib/Alpha158, 300x158 train, 96x158 test, actual Ridge
+PYTHONPATH="$PWD" /tmp/quantagentlab-data-quant-venv/bin/python -m pytest tests/test_mcp_local_transport.py tests/test_mcp_evidence_permissions.py -q --basetemp=/tmp/quantagentlab-data-quant-mcp
+# 12 passed in 1.65s: actual SDK over localhost + permission/manifest/cache/budget cases
+```
+
+Outstanding full-plan evidence: real authenticated provider/MCP calls and deployed pins, historical US/crypto coverage including delistings and adjustments, complete text-feature integration, native RD-Agent US overlay and independent validation, D causal HMM/six strategies/allocation, actual historical comparative performance and all I prospective gates. No paid accounts, live orders, external deployments, push or PR were performed.

@@ -52,6 +52,7 @@ DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
         "learning_rate": 0.05,
         "depth": 6,
         "loss_function": "RMSE",
+        "allow_writing_files": False,
         "verbose": 0,
     },
     "XGBoost": {

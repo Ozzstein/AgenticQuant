@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "client_runtime": {"mcp": "2.3.0", "transport": "streamable-http"},
+  "sources": {
+    "openbb": {
+      "repository": "https://github.com/OpenBB-finance/OpenBB",
+      "commit": "7df7d0c5592bf25be88e87e130a05c71e243d2d8",
+      "path": "openbb_platform/extensions/mcp_server",
+      "deployment": "self-host; selected provider extensions must also be pinned",
+      "verification": "source reviewed; deployed tool schemas and provider entitlements unverified"
+    },
+    "fmp": {
+      "repository": "https://github.com/imbenrabi/Financial-Modeling-Prep-MCP-Server",
+      "commit": "fe4e0a6eb4d07c81c0f79322263a4011afb13656",
+      "deployment": "self-host static selected toolsets",
+      "verification": "source reviewed; deployed tool schemas and transcript entitlement unverified"
+    },
+    "alpaca": {
+      "repository": "https://github.com/alpacahq/alpaca-mcp-server",
+      "commit": "d8dac43f3e17594e8879bac3b5b333196ea69aac",
+      "deployment": "self-host observations only; application exact allowlist remains binding",
+      "verification": "source reviewed; deployed tool schemas and account access unverified"
+    },
+    "valyu": {
+      "endpoint": "https://mcp.valyu.ai/mcp",
+      "deployment": "hosted service with private bearer header",
+      "verification": "hosted docs reviewed; service version, tool schema, source entitlements and actual cost unverified"
+    }
+  }
+}

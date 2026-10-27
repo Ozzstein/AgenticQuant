@@ -256,8 +256,8 @@ def test_load_rd_agent_config_found(tmp_path) -> None:
     assert loaded["params"]["n_estimators"] == 200
 
 
-def test_load_params_uses_best_config(tmp_path, monkeypatch) -> None:
-    """When best_model_config.yaml exists with matching model, override defaults."""
+def test_unpromoted_best_config_cannot_activate(tmp_path, monkeypatch) -> None:
+    """A research output file cannot bypass explicit model activation."""
     cfg_data = {"model_name": "LightGBM", "params": {"n_estimators": 42, "learning_rate": 0.001}}
     cfg_file = tmp_path / "best_model_config.yaml"
     cfg_file.write_text(yaml.dump(cfg_data))
@@ -270,5 +270,5 @@ def test_load_params_uses_best_config(tmp_path, monkeypatch) -> None:
     )
 
     w = ModelWrapper("LightGBM")
-    assert w._params["n_estimators"] == 42
-    assert w._params["learning_rate"] == 0.001
+    assert w._params["n_estimators"] == DEFAULT_PARAMS["LightGBM"]["n_estimators"]
+    assert w._params["learning_rate"] == DEFAULT_PARAMS["LightGBM"]["learning_rate"]

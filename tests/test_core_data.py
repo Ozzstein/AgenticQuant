@@ -69,14 +69,16 @@ class TestInitQlib:
         )
         assert pipeline._qlib_initialized is True
 
-    def test_init_qlib_graceful_no_qlib(self, mock_config):
-        """init_qlib does not raise when pyqlib is not installed."""
+    def test_init_qlib_missing_dependency_fails(self, mock_config):
+        """A missing required Qlib runtime cannot silently change the data source."""
         from src.core.data_pipeline import DataPipeline
 
         with patch.dict("sys.modules", {"qlib": None}):
             pipeline = DataPipeline(config=mock_config)
+            from src.utils.exceptions import DataPipelineError
             with patch("builtins.__import__", side_effect=_import_blocker("qlib")):
-                pipeline.init_qlib()
+                with pytest.raises(DataPipelineError, match="pyqlib is required"):
+                    pipeline.init_qlib()
 
         assert pipeline._qlib_initialized is False
 
@@ -154,7 +156,7 @@ class TestYfinanceFallback:
         mock_df = _make_ohlcv()
 
         with patch("yfinance.download", return_value=mock_df) as mock_dl:
-            pipeline.yfinance_fallback()
+            pipeline.yfinance_fallback(tickers=["SPY"])
 
         assert mock_dl.call_args is not None
         kwargs = mock_dl.call_args.kwargs
@@ -208,7 +210,7 @@ class TestCustomFactors:
 
         pipeline = DataPipeline(config=mock_config)
         base = pd.DataFrame(
-            {"open": [100.0], "close": [101.0]},
+            {"open": [100.0], "close": [101.0], "ticker": ["SPY"]},
             index=pd.to_datetime(["2023-01-02"]),
         )
         # Patch yfinance_fallback to avoid real network calls
@@ -223,10 +225,11 @@ class TestCustomFactors:
 
         pipeline = DataPipeline(config=mock_config)
         base = pd.DataFrame(
-            {"open": [100.0], "close": [101.0]},
+            {"open": [100.0], "close": [101.0], "ticker": ["SPY"]},
             index=pd.to_datetime(["2023-01-02"]),
         )
-        factors_df = pd.DataFrame({"factor_a": [1.0], "factor_b": [0.5]})
+        factors_df = pd.DataFrame({"factor_a": [1.0], "factor_b": [0.5]},
+                                  index=pd.MultiIndex.from_tuples([(pd.Timestamp("2023-01-02"), "SPY")], names=["datetime", "instrument"]))
         with patch.object(pipeline, "yfinance_fallback", return_value=base):
             result = pipeline.create_dataset_with_custom_factors(custom_factors=factors_df)
         # Qlib not available → returns merged DataFrame

@@ -104,38 +104,12 @@ class TestTrain:
         weights = e.get_weights()
         assert len(weights) == 1
 
-    def test_ic_fallback_to_equal_when_val_set_too_small(self):
-        """Falls back to equal weights when val set < _MIN_VAL_SAMPLES."""
-        # Use a tiny val_fraction that gives < 20 samples → equal fallback
-        X, y = _make_data(n=50, p=5)
-        e = EnsembleModel(
-            model_names=["LightGBM", "Linear"],
-            weighting="ic_weighted",
-            val_fraction=0.3,  # 50 * 0.3 = 15 samples < 20 → fallback
-        )
-        e.train(X, y)
-        weights = e.get_weights()
-        assert abs(sum(weights.values()) - 1.0) < 1e-6
-
-    def test_ic_weighted_handles_noisy_data(self):
-        """IC-weighted training produces valid weights on noise data (may fall back to equal)."""
-        rng = np.random.default_rng(0)
-        # Large enough to have > 20 val samples (200 * 0.15 = 30 val samples)
-        X = pd.DataFrame(rng.standard_normal((200, 5)), columns=[f"f{i}" for i in range(5)])
-        # Target is random noise independent of X → IC should be ~0
-        y = pd.Series(rng.standard_normal(200), name="target")
-
-        e = EnsembleModel(
-            model_names=["LightGBM", "Linear"],
-            weighting="ic_weighted",
-            val_fraction=0.15,
-        )
-        e.train(X, y)
-        weights = e.get_weights()
-        # Weights must always sum to 1 and cover all models
-        assert abs(sum(weights.values()) - 1.0) < 1e-6
-        assert len(weights) == 2
-        assert all(w >= 0.0 for w in weights.values())
+    def test_ic_insufficient_validation_fails(self):
+        """Insufficient validation cannot masquerade as an IC-weighted model."""
+        X, y = _make_data(n=40)
+        e = EnsembleModel(model_names=["Linear"], weighting="ic_weighted", val_fraction=0.1)
+        with pytest.raises(ModelError, match="insufficient eligible"):
+            e.train(X, y)
 
 
 # ---------------------------------------------------------------------------

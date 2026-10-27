@@ -110,3 +110,14 @@ def test_requested_cutoff_and_snapshot_integrity(store):
         store.put(record(requested_as_of=None), b"raw", kind="news", logical_key="x")
     key = store.save_snapshot({"run": "one", "ids": ["1", "2"]})
     assert store.snapshot(key)["ids"] == ["1", "2"]
+
+
+def test_standalone_future_evidence_rejected_and_connections_closed(store):
+    context = RunContext(run_id="test", mode="backtest", as_of=T, config_hash="0"*64, code_version="test")
+    with pytest.raises(ValueError, match="unavailable"):
+        MarketSnapshot(context=context, bars=(), evidence=(record(available_at=T+timedelta(seconds=1)),))
+    with store._connect() as connection:
+        connection.execute("SELECT 1")
+    import sqlite3
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")

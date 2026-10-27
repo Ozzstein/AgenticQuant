@@ -1,7 +1,9 @@
 """CCXT-based crypto data pipeline with caching and universe building."""
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import ccxt
@@ -61,7 +63,7 @@ class CryptoPipeline:
 
     def _cache_path(self, symbol: str, timeframe: str) -> Path:
         """Return parquet cache path for a symbol / timeframe pair."""
-        safe_symbol = symbol.replace("/", "_")
+        safe_symbol = hashlib.sha256(symbol.encode()).hexdigest()[:24]
         return self._cache_dir / self._exchange_id / safe_symbol / f"{timeframe}.parquet"
 
     def _cache_valid(self, path: Path) -> bool:
@@ -121,7 +123,12 @@ class CryptoPipeline:
         Raises:
             DataPipelineError: If the fetch fails after all retries.
         """
-        cache_path = self._cache_path(symbol, timeframe)
+        if limit < 1 or limit > 100_000:
+            raise DataPipelineError("OHLCV limit must be 1..100000")
+        if since is not None and (since.tzinfo is None or since.utcoffset() is None):
+            raise DataPipelineError("since must be timezone-aware")
+        request_hash = hashlib.sha256(json.dumps({"since": since.isoformat() if since else None, "limit": limit}, sort_keys=True).encode()).hexdigest()[:20]
+        cache_path = self._cache_path(symbol, timeframe).with_name(f"{timeframe}-{request_hash}.parquet")
         if self._cache_valid(cache_path):
             logger.debug("Cache hit for {}/{} {}", self._exchange_id, symbol, timeframe)
             return pd.read_parquet(cache_path)
@@ -139,7 +146,10 @@ class CryptoPipeline:
                 all_candles.extend(candles)
                 if len(candles) < page_limit:
                     break  # last page — exchange returned fewer candles than requested
-                since_ms = candles[-1][0] + 1  # advance to the timestamp after the last candle
+                next_since = max(row[0] for row in candles) + 1
+                if since_ms is not None and next_since <= since_ms:
+                    raise DataPipelineError("OHLCV pagination did not advance")
+                since_ms = next_since
                 if len(all_candles) >= limit:
                     break
 
@@ -156,7 +166,17 @@ class CryptoPipeline:
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df = df.set_index("timestamp").sort_index()
-        df = df[~df.index.duplicated(keep="last")]
+        if df.index.duplicated().any():
+            conflicts = df.groupby(level=0).nunique().gt(1).any(axis=1)
+            if conflicts.any():
+                raise DataPipelineError("conflicting candles at the same timestamp")
+            df = df[~df.index.duplicated()]
+        # This legacy display API is capture-time data, not a historical authority.
+        # The immutable CCXTAdapter supplies research snapshots and provenance.
+        if since is not None:
+            df = df.loc[df.index >= since]
+        seconds = ccxt.Exchange.parse_timeframe(timeframe)
+        df = df.loc[df.index + pd.Timedelta(seconds=seconds) <= datetime.now(timezone.utc)]
 
         # Write to cache
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,8 +199,7 @@ class CryptoPipeline:
         try:
             raw = self._exchange.fetch_funding_rate_history(symbol)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("fetch_funding_rates not supported or failed for {}: {}", symbol, exc)
-            return pd.DataFrame(columns=["funding_rate"])
+            raise DataPipelineError(f"funding rates unavailable for {symbol}: {type(exc).__name__}") from None
 
         if not raw:
             return pd.DataFrame(columns=["funding_rate"])
@@ -203,7 +222,9 @@ class CryptoPipeline:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
 
-        return df[["funding_rate"]] if "funding_rate" in df.columns else df
+        if "funding_rate" not in df.columns:
+            raise DataPipelineError("funding response lacks funding rate")
+        return df[["funding_rate"]]
 
     def fetch_open_interest(self, symbol: str) -> pd.DataFrame:
         """Fetch historical open interest data.
@@ -218,8 +239,7 @@ class CryptoPipeline:
         try:
             raw = self._exchange.fetch_open_interest_history(symbol)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("fetch_open_interest not supported or failed for {}: {}", symbol, exc)
-            return pd.DataFrame(columns=["open_interest"])
+            raise DataPipelineError(f"open interest unavailable for {symbol}: {type(exc).__name__}") from None
 
         if not raw:
             return pd.DataFrame(columns=["open_interest"])
@@ -227,8 +247,12 @@ class CryptoPipeline:
         df = pd.DataFrame(raw)
 
         # Normalise column names
-        if "openInterest" in df.columns:
+        if "openInterestAmount" in df.columns:
+            df = df.rename(columns={"openInterestAmount": "open_interest"})
+        elif "openInterest" in df.columns:
             df = df.rename(columns={"openInterest": "open_interest"})
+        else:
+            raise DataPipelineError("open interest response lacks amount; quote notional is not a substitute")
 
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)

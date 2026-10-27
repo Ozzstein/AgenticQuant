@@ -49,7 +49,9 @@ def feature_dataset(snapshot: MarketSnapshot, specs: tuple[FeatureSpec, ...], *,
         rows.append({"datetime": bar.closed_at, "instrument": bar.instrument.instrument_id,
                      **{k: float(getattr(bar, k)) for k in ("open", "high", "low", "close", "volume")},
                      "vwap": float(bar.vwap) if bar.vwap is not None else np.nan,
-                     "available_at": evidence[bar.evidence_id].available_at, "market_type": bar.market_type})
+                     "available_at": max(evidence[bar.evidence_id].available_at,
+                                         evidence[bar.evidence_id].requested_as_of or evidence[bar.evidence_id].available_at),
+                     "market_type": bar.market_type})
     if not rows:
         raise ValueError("no eligible bars")
     frame = pd.DataFrame(rows).set_index(["datetime", "instrument"]).sort_index()

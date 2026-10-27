@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
-from src.utils.config import AppConfig
+import pytest
 
+from src.utils.config import AppConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -15,6 +17,7 @@ def _make_mock_response(data: list) -> MagicMock:
     """Build a mock requests.Response with .json() and .raise_for_status()."""
     mock_resp = MagicMock()
     mock_resp.json.return_value = data
+    mock_resp.content = json.dumps(data).encode()
     mock_resp.raise_for_status.return_value = None
     return mock_resp
 
@@ -22,6 +25,11 @@ def _make_mock_response(data: list) -> MagicMock:
 def _mock_config(api_key: str = "test-fmp-key") -> AppConfig:
     """Return an AppConfig with the given FMP API key."""
     return AppConfig(fmp_api_key=api_key)
+
+
+@pytest.fixture(autouse=True)
+def isolate_transcript_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIQUANT_OUTPUT_DIR", str(tmp_path / "outputs"))
 
 
 SAMPLE_TRANSCRIPT = [
@@ -161,9 +169,8 @@ class TestGetEarningsTranscript:
         ):
             get_earnings_transcript.invoke({"ticker": "aapl"})
 
-        called_url: str = mock_get.call_args[0][0]
-        assert "/AAPL?" in called_url
-        assert "/aapl?" not in called_url
+        assert mock_get.call_args.kwargs["params"]["symbol"] == "AAPL"
+        assert "apikey" not in mock_get.call_args[0][0]
 
 
 class TestGetEarningsTranscriptForQuarter:
