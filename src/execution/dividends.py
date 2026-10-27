@@ -239,6 +239,16 @@ def _fence(ledger, account, at):
         "SELECT 1 FROM snapshots WHERE account=? AND at>=?", (account, at.isoformat())
     ).fetchone():
         raise LedgerError("dividend cannot rewrite published NAV")
+    # A sleeve attribution is published economic history even when no canonical
+    # snapshot was persisted (for example, a cycle stopped between stages).
+    # SleeveBook is optional, so old/no-sleeve archives need no schema migration.
+    if ledger.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sleeve_observations'"
+    ).fetchone() and ledger.db.execute(
+        "SELECT 1 FROM sleeve_observations WHERE account=? AND at>=? LIMIT 1",
+        (account, at.isoformat()),
+    ).fetchone():
+        raise LedgerError("dividend cannot rewrite published NAV in sleeve attribution")
     ledger._clock(account, at)
 
 
