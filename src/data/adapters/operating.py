@@ -309,6 +309,7 @@ def _calendar(store, evidence_id, as_of):
 
 def _daily_adv(store, bar_ids, instrument, cutoff, *, expected_sessions):
     rows, sources = {}, []
+    wanted = tuple(sorted(expected_sessions))[-20:]
     for key in bar_ids:
         source = store.get(key, as_of=cutoff)
         if source.kind != "bar" or instrument.instrument_id not in source.record.instrument_ids:
@@ -322,6 +323,8 @@ def _daily_adv(store, bar_ids, instrument, cutoff, *, expected_sessions):
             or bar.vwap is None
         ):
             _fail("actual_completed_raw_vwap_required")
+        if bar.session not in wanted:
+            continue
         if (
             bar.session not in expected_sessions
             or (bar.opened_at, bar.closed_at) != expected_sessions[bar.session]
@@ -331,7 +334,6 @@ def _daily_adv(store, bar_ids, instrument, cutoff, *, expected_sessions):
             _fail("conflicting_adv_session")
         rows[bar.session] = bar.vwap * bar.volume
         sources.append(source)
-    wanted = tuple(sorted(expected_sessions))[-20:]
     if len(wanted) != 20 or any(session not in rows for session in wanted):
         _fail("twenty_complete_observed_adv_sessions_required")
     return sum((rows[s] for s in wanted), Decimal(0)) / 20, sources
@@ -670,11 +672,13 @@ class AlpacaOperatingAdapter(OperatingCapture):
         tick = _decimal(asset.get("price_increment"))
         at = self.now()
         calendar = _calendar(self.store, calendar_id, at)
-        wanted = {
-            s: (opened, close)
-            for s, (_, opened, close) in calendar.items()
-            if close <= context.as_of
-        }
+        from src.data.calendars import sessions
+        schedule=sessions((context.as_of.date()-timedelta(days=90)).isoformat(),
+                          context.as_of.date().isoformat(),calendar='XNYS')
+        completed=[(s,times) for s,times in schedule.items() if times[1]<=context.as_of][-20:]
+        wanted=dict(completed)
+        if len(wanted)!=20 or any(s not in calendar or calendar[s][1:]!=times for s,times in completed):
+            _fail('current_twenty_session_calendar_coverage_required')
         adv, sources = _daily_adv(self.store, bar_ids, instrument, at, expected_sessions=wanted)
         active = (
             asset.get("status") == "active"

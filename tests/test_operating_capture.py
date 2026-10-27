@@ -862,3 +862,33 @@ def test_missing_reference_authority_never_uses_default_sector_or_lot(equity_cap
             bar_ids=f.bar_ids,
             calendar_id=f.calendar.record.evidence_id,
         )
+
+
+def test_equity_reference_uses_actual_request_cutoff_not_truncated_calendar(equity_capture):
+    f=equity_capture
+    # Before today's close, yesterday's completed 20 are the actual window.
+    f.clock.at=datetime(2024,3,12,13,32,tzinfo=UTC)
+    before=context(datetime(2024,3,12,13,31,tzinfo=UTC))
+    current=f.adapter.reference(f.instrument,before,asset_id='asset-123',bar_ids=f.bar_ids,
+        calendar_id=f.calendar.record.evidence_id)
+    assert read(f.store,primary(current,'operating_reference'),f.clock)['adv_sessions'][-1]=='2024-03-11'
+    # After that close, the same 20 are missing today's actual completed day.
+    f.clock.at=datetime(2024,3,12,20,5,tzinfo=UTC)
+    after=context(datetime(2024,3,12,20,tzinfo=UTC))
+    with pytest.raises(ProviderError,match='twenty_complete'):
+        f.adapter.reference(f.instrument,after,asset_id='asset-123',bar_ids=f.bar_ids,
+            calendar_id=f.calendar.record.evidence_id)
+    f.clock.at=datetime(2026,3,12,20,5,tzinfo=UTC)
+    later=context(datetime(2026,3,12,20,tzinfo=UTC))
+    with pytest.raises(ProviderError,match='current_twenty_session_calendar'):
+        f.adapter.reference(f.instrument,later,asset_id='asset-123',bar_ids=f.bar_ids,
+            calendar_id=f.calendar.record.evidence_id)
+
+
+def test_crypto_reference_cannot_relabel_old_turnover_as_current(crypto_capture):
+    f=crypto_capture
+    f.clock.at=datetime(2026,3,22,0,5,tzinfo=UTC)
+    later=context(datetime(2026,3,22,tzinfo=UTC))
+    with pytest.raises(ProviderError,match='twenty_complete|fx_missing_stale'):
+        f.adapter.reference(f.instrument,later,bar_ids=f.bar_ids,
+            fx_evidence_id=f.fx.record.evidence_id if f.fx else None,**f.kwargs)
