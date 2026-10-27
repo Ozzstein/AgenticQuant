@@ -54,13 +54,21 @@ def require_strategy_eligible(spec: StrategySpec, context: RunContext, *, resolv
     return activation.candidate_hash
 
 
-def rebalance_due(spec: StrategySpec, signal_at, last_rebalanced_at):
+def rebalance_due(spec: StrategySpec, signal_at, last_rebalanced_at, *, decision_as_of=None):
+    current = pd.Timestamp(signal_at)
+    cutoff = pd.Timestamp(signal_at if decision_as_of is None else decision_as_of)
+    if current.tzinfo is None or cutoff.tzinfo is None or current > cutoff:
+        raise StrategyInputError("signal and decision cutoff must be explicit causal timestamps")
     if last_rebalanced_at is None:
         return True
     previous = pd.Timestamp(last_rebalanced_at)
-    current = pd.Timestamp(signal_at)
-    if previous.tzinfo is None or previous > current:
+    if previous.tzinfo is None or previous > cutoff:
         raise StrategyInputError("last rebalance must be an explicit past timestamp")
+    # Actual fills/targets retain their decision clock. A later cycle using the
+    # same older signal cannot make that signal newly eligible for rebalance.
+    if previous >= current:
+        return False
+    previous, current = previous.tz_convert('UTC'), current.tz_convert('UTC')
     if spec.cadence == "daily":
         return previous.date() < current.date()
     if spec.cadence == "weekly":
@@ -86,6 +94,7 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     date = pd.Timestamp(signal_at)
     if date.tzinfo is None or date > context.as_of or (pd.Timestamp(context.as_of)-date).total_seconds() > spec.max_signal_age_seconds:
         raise StrategyInputError("signal is future, stale or lacks timezone")
+    due = rebalance_due(spec, date, last_rebalanced_at, decision_as_of=context.as_of)
     if universe.effective_at > date or universe.available_at > date or not universe.universe_version:
         raise StrategyInputError("universe was not effective and available at signal cutoff")
     if universe.data_snapshot_id not in {dataset.snapshot_hash, *context.data_snapshot_ids}:
@@ -118,7 +127,7 @@ def evaluate_strategy(spec: StrategySpec, dataset: FeatureDataset, context: RunC
     if regime.regime not in spec.regimes:
         result.loc[:, ["target_weight", "action", "reason"]] = [0., "EXIT", "regime_ineligible"]
         return result
-    if not (force_rebalance or rebalance_due(spec, date, last_rebalanced_at)):
+    if not (force_rebalance or due):
         return result
     result.attrs["cadence_due"] = True
     rows = dataset.features.loc[dataset.features.index.get_level_values("datetime") == date]

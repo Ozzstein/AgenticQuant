@@ -213,6 +213,30 @@ def test_weekly_monthly_cadence_and_future_universe():
         evaluate_strategy(specs['agent_consensus'], dataset, snapshot.context, **args)
 
 
+def test_actual_later_rebalance_clock_preserves_same_signal_and_rejects_future():
+    from src.strategies.runner import rebalance_due
+
+    spec = baseline_specs()['agent_consensus']
+    snapshot, dataset = market_inputs(spec)
+    signal = snapshot.context.as_of
+    actual_rebalance = signal+pd.Timedelta(minutes=15)
+    cutoff = signal+pd.Timedelta(minutes=30)
+    context = snapshot.context.model_copy(update={'as_of':cutoff})
+    args = args_for(snapshot,dataset)
+    args.update(regime=regime_for(context),last_rebalanced_at=actual_rebalance,
+                holdings=pd.Series({args['instruments'][0].instrument_id:.04}))
+    for cadence in ('daily','weekly','monthly'):
+        assert not rebalance_due(spec.model_copy(update={'cadence':cadence}), signal,
+                                 actual_rebalance, decision_as_of=cutoff)
+    result = evaluate_strategy(spec,dataset,context,**args)
+    assert not result.attrs['cadence_due']
+    assert (result.action == 'HOLD').all()
+    assert result.loc[args['instruments'][0].instrument_id,'target_weight'] == .04
+    args['last_rebalanced_at'] = cutoff+pd.Timedelta(microseconds=1)
+    with pytest.raises(StrategyInputError,match='last rebalance'):
+        evaluate_strategy(spec,dataset,context,force_rebalance=True,**args)
+
+
 def test_registry_exact_hash_and_executable_parameter_change():
     spec = baseline_specs()['agent_consensus']
     snapshot, dataset = market_inputs(spec)
