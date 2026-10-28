@@ -4,7 +4,6 @@ from __future__ import annotations
 import io
 import json
 import stat
-import subprocess
 import sys
 import types
 import warnings
@@ -431,25 +430,23 @@ def test_independent_fresh_three_family_fit_has_identical_container(tmp_path):
         assert Path(str(paths[0]) + suffix).read_bytes() == Path(str(paths[1]) + suffix).read_bytes()
 
 
-def historical_module(relative, name):
-    """Execute exact pre-stage owned source read-only, solely for byte compatibility."""
-    code = subprocess.check_output(["git", "show", f"ca47c84:{relative}"])
+def historical_reference():
+    """Frozen test-only serializer/artifact; portable without private Git objects."""
+    name = "tests._before_stage1_reference"
+    reference = Path(__file__).parent / "fixtures" / "model_v2_reference.py.txt"
     module = types.ModuleType(name)
     sys.modules[name] = module
-    exec(compile(code, relative + "@ca47c84", "exec"), module.__dict__)
+    exec(compile(reference.read_bytes(), str(reference), "exec"), module.__dict__)
     return module
 
 
 def test_existing_single_family_serializer_and_artifact_bytes_unchanged(tmp_path):
     from src.core.model_zoo import ModelWrapper
-    old_zoo = historical_module("src/core/model_zoo.py", "tests._before_stage1_model_zoo")
-    old_market = historical_module("src/domain/market.py", "tests._before_stage1_market")
-    old_zoo.ModelArtifact = old_market.ModelArtifact
+    legacy = historical_reference()
     X, y, metadata = inputs()
     model = ModelWrapper("Linear").train(X, y, **metadata)
-    original = old_zoo.ModelWrapper("Linear")
-    original.__dict__.update(model.__dict__)
-    original.save(str(tmp_path / "before.joblib"))
+    original = types.SimpleNamespace(**model.__dict__)
+    legacy.save(original, str(tmp_path / "before.joblib"))
     model.save(str(tmp_path / "after.joblib"))
     for suffix in ("", ".json"):
         assert Path(str(tmp_path / "before.joblib") + suffix).read_bytes() == Path(str(tmp_path / "after.joblib") + suffix).read_bytes()

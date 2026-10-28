@@ -1,0 +1,89 @@
+"""Frozen TEST-ONLY reference from ca47c840ef432cfc22d0d1c2a40c1c5dd05a6649.
+Original save block SHA256: bc17bef320fd32119bbc247317235b0b5d84b36178bcc467e0aad06ae8258afc
+Original ModelArtifact block SHA256: 28f74d090becc3c14ec6cb55f29e81e06ed4cfa3ecc1edd382c743efdfa97af9
+No runtime fallback or dependency on private Git history.
+"""
+from __future__ import annotations
+import importlib.metadata
+import os
+import tempfile
+from pathlib import Path
+from typing import Literal
+import joblib
+from pydantic import model_validator
+from src.data.evidence.store import canonical_bytes, digest
+from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedContract
+from src.utils.exceptions import ModelError
+REGISTRY = {'LightGBM':'lightgbm.LGBMRegressor','CatBoost':'catboost.CatBoostRegressor','XGBoost':'xgboost.XGBRegressor','Linear':'sklearn.linear_model.Ridge'}
+
+class ModelArtifact(VersionedContract):
+    model_name: NonEmptyString
+    payload_hash: Sha256
+    training_data_hash: Sha256
+    feature_spec_hash: Sha256
+    feature_names: tuple[NonEmptyString, ...]
+    fitted_at: UtcTimestamp
+    training_start: UtcTimestamp
+    training_end: UtcTimestamp
+    labels_available_through: UtcTimestamp
+    code_version: NonEmptyString
+    environment: tuple[tuple[str, str], ...]
+    parameters_json: NonEmptyString
+    preprocessing: NonEmptyString = "train-median-standard-scaler-v1"
+    vintage_policy: Literal["decision-time-vintage-1", "captured-vintage-at-fit-1"] = "decision-time-vintage-1"
+    features_available_through: UtcTimestamp | None = None
+    label_end_through: UtcTimestamp | None = None
+    label_end_policy: Literal["explicit-outcome-end-1", "availability-upper-bound-1"] = "availability-upper-bound-1"
+
+    @model_validator(mode="after")
+    def ordered(self) -> "ModelArtifact":
+        if not self.training_start <= self.training_end <= self.labels_available_through <= self.fitted_at:
+            raise ValueError("model training/label/fit chronology is invalid")
+        if len(set(self.feature_names)) != len(self.feature_names):
+            raise ValueError("duplicate model features")
+        if self.features_available_through is not None and self.features_available_through > self.fitted_at:
+            raise ValueError("features were unavailable at model fit")
+        if self.label_end_through is not None and not self.training_end <= self.label_end_through <= self.labels_available_through:
+            raise ValueError("outcome end/availability chronology is invalid")
+        return self
+
+def save(self, path: str) -> None:
+    """Save model+fitted transforms with a hashed, versioned sidecar.
+
+    Only load application-owned artifacts: joblib deserialization is for
+    trusted local files, never raw research/provider downloads.
+    """
+    if self.model is None:
+        raise ModelError("Cannot save an untrained model.")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = {"schema_version": "2.0", "model_name": self.model_name, "model": self.model,
+            "feature_names": self._feature_names, "imputer": self._imputer, "scaler": self._scaler,
+            "provenance": self._provenance, "params": self._params}
+    fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".model-")
+    os.close(fd)
+    try:
+        joblib.dump(data, temporary)
+        payload_hash = digest(Path(temporary).read_bytes())
+        metadata = {"schema_version": "2.0", "payload_hash": payload_hash, "temporal_provenance": self._provenance is not None}
+        if self._provenance:
+            packages = ("numpy", "pandas", "scikit-learn", "joblib", REGISTRY[self.model_name].split(".")[0])
+            environment = []
+            for package in dict.fromkeys(packages):
+                try:
+                    environment.append((package, importlib.metadata.version(package)))
+                except importlib.metadata.PackageNotFoundError:
+                    pass
+            self.artifact = ModelArtifact(model_name=self.model_name, payload_hash=payload_hash,
+                                          feature_names=self._feature_names, environment=tuple(environment),
+                                          parameters_json=canonical_bytes(self._params).decode(), **self._provenance)
+            metadata["artifact"] = self.artifact.model_dump(mode="json")
+        # Content mismatch during a concurrent read fails closed. Activation
+        # is a coordinator-owned atomic manifest pointer, not these files.
+        os.replace(temporary, target)
+        sidecar = Path(str(target) + ".json")
+        side_temp = Path(str(sidecar) + ".tmp")
+        side_temp.write_bytes(canonical_bytes(metadata))
+        os.replace(side_temp, sidecar)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
