@@ -794,23 +794,8 @@ def crypto_capture(tmp_path, request):
     bar_ids = tuple(e.record.evidence_id for e in result.evidence if e.kind == "bar")
     fx = None
     if venue == "binance":
-        fx = store_observation(
-            store,
-            raw=b'{"observed-usdt-usd":"0.9997"}',
-            normalized=dict(
-                base_currency="USDT",
-                quote_currency="USD",
-                rate="0.9997",
-                observed_at=clock().isoformat(),
-            ),
-            provider="synthetic-fx-test",
-            version="1",
-            source_uri="test://fx",
-            kind="fx",
-            logical_key="USDT/USD",
-            context=req,
-            ingested_at=clock(),
-        )
+        from tests.test_kraken_fx import capture_fx
+        fx, _ = capture_fx(store, clock, req)
     reference = primary(
         adapter.reference(
             instrument,

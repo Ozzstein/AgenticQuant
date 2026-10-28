@@ -185,7 +185,8 @@ class OperatingCapture:
         return envelope, value
 
     def derived(
-        self, context, sources, builder, *, kind, logical_key, instrument=None, policy=None
+        self, context, sources, builder, *, kind, logical_key, instrument=None, policy=None,
+        observed_at=None, units=None,
     ):
         captured = self.now()
         if captured < context.as_of:
@@ -226,6 +227,8 @@ class OperatingCapture:
             context=context,
             ingested_at=captured,
             instrument=instrument,
+            observed_at=observed_at,
+            units=units,
         )
 
     def result(
@@ -299,6 +302,11 @@ def verify_operating_capture(store: EvidenceStore, evidence_id: str, *, as_of: d
         if digest(raw) != envelope.record.raw_hash:
             _fail("source_raw_hash_differs")
         value = store.normalized(key, as_of=as_of)
+        if envelope.kind == "fx":
+            from src.data.kraken_fx import _verify_reference
+            _verify_reference(store, Instrument.model_validate(value.get("instrument")), as_of,
+                evidence_id=key, valuation_at=envelope.record.available_at)
+            return
         if (
             envelope.record.provider != "operating"
             or envelope.record.provider_version not in SUPPORTED_VERSIONS
@@ -329,8 +337,23 @@ def verify_operating_capture(store: EvidenceStore, evidence_id: str, *, as_of: d
                 or actual.record.raw_hash != source["raw_hash"]
             ):
                 _fail("source_envelope_hash_differs")
-            # Non-operating archived FX/market records remain full typed evidence.
-            if actual.record.provider == "operating":
+            if actual.kind == "fx":
+                from src.data.kraken_fx import _verify_reference
+                fx_value = store.normalized(source["evidence_id"], as_of=as_of)
+                if "instrument" not in fx_value:
+                    _fail("fx_certified_native_source_required")
+                events = value.get("opening_events", value.get("execution_bars", []))
+                default = envelope.record.ingested_at if envelope.kind == "operating_reference" else actual.record.available_at
+                cutoff = min((_instant(e["opened_at"]) for e in events), default=default)
+                certified = _verify_reference(store, Instrument.model_validate(fx_value["instrument"]), as_of,
+                    evidence_id=source["evidence_id"], valuation_at=cutoff)
+                if envelope.kind == "operating_reference" and Instrument.model_validate(value["instrument"]).quote_currency != certified["base_currency"]:
+                    _fail("reference_fx_currency_differs")
+                if any(Instrument.model_validate(e["instrument"]).quote_currency != certified["base_currency"]
+                       or _decimal(e["fx_rate"]) != _decimal(certified["rate"]) for e in events):
+                    _fail("opening_fx_source_value_differs")
+            # Other archived market records keep raw checks; FX is certified above.
+            if actual.kind == "fx" or actual.record.provider == "operating":
                 check(source["evidence_id"])
             elif digest(store.raw(source["evidence_id"])) != actual.record.raw_hash:
                 _fail("external_source_raw_differs")
@@ -913,7 +936,12 @@ def _fx(capture, instrument, context, fx_evidence_id, *, at):
     if not fx_evidence_id:
         _fail("explicit_usd_fx_evidence_required")
     source = capture.store.get(fx_evidence_id, as_of=at)
-    value = capture.store.normalized(fx_evidence_id, as_of=at)
+    from src.data.kraken_fx import parse_kraken_fx_reference
+    stored = capture.store.normalized(fx_evidence_id, as_of=at)
+    if "instrument" not in stored:
+        _fail("fx_certified_native_source_required")
+    value = parse_kraken_fx_reference(capture.store, Instrument.model_validate(stored["instrument"]),
+        context.model_copy(update={"as_of": at}), evidence_id=fx_evidence_id, valuation_at=at)
     if (
         source.kind != "fx"
         or value.get("base_currency") != instrument.quote_currency
@@ -1052,7 +1080,7 @@ class KrakenOperatingAdapter(_CryptoOperatingAdapter):
         self.http = http or ReadHTTP("kraken", "https://api.kraken.com")
 
     def _get(self, operation, context, instrument, params):
-        if operation not in ("AssetPairs", "OHLC", "Trades"):
+        if operation not in ("AssetPairs", "Assets", "OHLC", "Trades"):
             _fail("unsupported_kraken_operation")
         wire, value = self.wire(
             self.http,
@@ -1065,6 +1093,11 @@ class KrakenOperatingAdapter(_CryptoOperatingAdapter):
         if value.get("error") or not isinstance(value.get("result"), dict):
             _fail("kraken_provider_error_wire_archived")
         return wire, value["result"]
+
+    @_operation
+    def fx_reference(self, instrument, context, *, market_id):
+        from src.data.kraken_fx import capture_kraken_fx
+        return capture_kraken_fx(self, instrument, context, market_id=market_id)
 
     @_operation
     def reference(self, instrument, context, *, market_id, bar_ids, fx_evidence_id=None):
