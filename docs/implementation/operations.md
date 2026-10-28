@@ -548,3 +548,37 @@ arbitrary intraday expiry, legacy missing proof and unowned contingent tickets
 reject. This remains an offline protocol result; direct native DAY calendar
 certification, discrepancy settlement, grouped orders and actual LEAN runtime
 acceptance are separate outstanding requirements.
+
+### Delivered source coverage and native calendar authority
+
+Jev `8ce0439` integrated as `c12da5e`. Root forwards the exact serialized
+`source_coverage` from `load_desk_sources` into `analyze_instrument` and persists
+that same object in canonical CLI output. The allocator gives each role/document
+an initial span before long-document tails and reports exact delivered hashes,
+eligible/omitted/partial IDs and exclusions. Stored availability is separate
+from delivery status; omitted documents block new exposure and partial delivery
+cannot substantiate numeric evidence completeness. Original graph/history
+validation checks spans against immutable full documents.
+
+120 root coverage/projection/workflow/desk/history/memory/clock/original-portfolio/
+registered-advice/cost/CLI tests passed in 66.28s. The additional CLI regression
+uses actual stored long filing and short contrary-news fixtures, verifies both
+reach the graph boundary, retains partial status and exact output equality;
+all seven canonical agents CLI cases passed in 2.11s. Only provider/model boundaries
+are substituted in these tests; they do not establish semantic efficacy.
+
+Accounting `e48faa1` integrated as `42d25d3`. 169 root native Alpaca DAY, LEAN
+DAY/trailing/recovery, expiry, venue, ledger and frozen-reference cases passed in
+14.36s. The original bounded native calendar raw receipt is bound to the
+original direct/LEAN submission claim and reverified before native fill reports;
+restart cannot replace it with a newly selected session. Actual provider/SDK
+acceptance remains unavailable.
+
+Data's reproduced captured-vintage IC ensemble issue and missing canonical
+parent artifact/strategy-operating admission are tracked explicitly in C2. The
+next approved narrow fix preserves strict historical defaults and validates
+the entire retrospective weight-selection population against the actual fit
+cutoff before fitting. It does not by itself make an ensemble an approved
+strategy or operating model. The live catalog was rechecked and this task was
+explicitly assigned Codex GPT-6.1-Sol, xhigh reasoning, Standard tier; root remains
+Astra/high and the accounting/Jev authority lanes remain Astra/xhigh/Standard.

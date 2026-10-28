@@ -53,11 +53,13 @@ def analyze_input(request: DeskAnalysisInput, *, evidence_path: Path, ledger_pat
             portfolio = PortfolioReviewContext(as_of=snapshot.as_of, snapshot_id=snapshot.content_hash(),
                 portfolio_json=snapshot.model_dump_json(), correlation_json=request.correlations_json,
                 deterministic_vetoes=request.deterministic_vetoes)
+    delivered = {role: {kind: value.model_dump(mode="json") for kind, value in kinds.items()}
+                 for role, kinds in coverage.items()}
     decision = analyze_instrument(request.instrument, request.context, sources=sources,
+        source_coverage=delivered,
         hmm_context=hmm, portfolio_context=portfolio, qlib_context=request.qlib_context,
         config=config, observation_mode=observation_mode, evidence_store=store)
-    return decision, {role: {kind: value.model_dump(mode="json") for kind, value in kinds.items()}
-                      for role, kinds in coverage.items()}
+    return decision, delivered
 
 
 def _write(path: Path, value: dict) -> None:
