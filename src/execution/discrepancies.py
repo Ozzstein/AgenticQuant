@@ -205,6 +205,8 @@ class ViolationBinding(VersionedContract):
 class ExecutionComplianceAudit(VersionedContract):
     implementation: Literal["execution-compliance-1"] = "execution-compliance-1"
     account_id: NonEmptyString
+    account_spec_hash: Sha256
+    execution_binding_hash: Sha256
     authority_prefix_hash: Sha256
     lineage: Literal["historical-replay", "local-paper", "lean-paper", "native", "unverified"]
     status: Literal["PASS", "FAIL"]

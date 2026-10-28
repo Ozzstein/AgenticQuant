@@ -818,3 +818,17 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-a
 ```
 
 Final paper/admission/source-identity suite: **67 passed in 5.55s**, same invocation restricted to `tests/test_execution_admission.py tests/test_venue_execution.py tests/test_opening_publication_fence.py tests/test_opening_source_identity.py`, outputs/logs `/tmp/quantagent-accounting-admission-paper-{output,log}`. Source/claim-only checkpoint also passed 35 tests in 3.55s after shared payload consolidation. Ruff over `src/execution` and changed tests/diff pass. All transport/runtime inputs are fixtures; no authenticated calls or actual venue/LEAN acceptance. Root/H current authority/ancestor gate integration remains required. There is no economic settlement, private expiry exception, WF/model admission change, contingent group or discretionary corrective order.
+
+## Immutable current-authority locator fields
+
+`ExecutionComplianceAudit` now includes the two agreed derived SHA fields in the same consistent read-only view: `account_spec_hash = AccountSpec.content_hash()` and `execution_binding_hash`. The latter hashes an explicit `execution-binding-1` object containing the account ID, exact original `initial` journal row, exact canonical execution-book owner/configuration and sorted original `remote-binding:*` / `remote-instrument:*` event IDs and payload bytes. Physical event/book row IDs are excluded; the original journal sequence remains part of its exact journal row. Original native broker/network/credential identities and the LEAN deployment are included through their actual immutable bindings. No credential identity is invented when the original adapter did not retain one.
+
+This identity excludes growing order/report/source captures, mutable application flags, new runtime epochs, current economics and audit metadata. Root can freeze both fields with its canonical operator path/file identity and exact evaluation/decision/source bindings. It must continue recomputing current status and never require the mutable `authority_prefix_hash` to remain equal to its historical value. The two fields do not replace current FAIL checks, original-source validation, operator authority for every ancestor account, or complete external source coverage. No old positive audit/locator is silently upgraded.
+
+Nine new tests prove stability across actual native capture/admission/partial fills, restart, another account's journal growth and a new real fixture LEAN runtime identity; they detect changed owner/configuration, native account/instrument/credential binding and original initial-journal clock under the same AccountSpec. A separate AccountSpec mutation changes its own hash while the original immutable binding hash remains unchanged, requiring both comparisons. Read-only byte/DDL/network guards remain active. Final combined regression **66 passed in 5.41s**, zero skips:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-accounting-binding-final-output AIQUANT_LOG_DIR=/tmp/quantagent-accounting-binding-final-log /tmp/quantagentlab-review-venv/bin/python -m pytest tests/test_execution_binding_identity.py tests/test_execution_compliance.py tests/test_execution_admission.py tests/test_validation.py -q --disable-socket --allow-unix-socket
+```
+
+Changed-file Ruff/diff pass. This is an additive reader identity checkpoint for root's current registry locator, with no new application locator schema, WF bridge, external action or settlement enablement.

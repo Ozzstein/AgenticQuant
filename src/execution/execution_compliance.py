@@ -313,6 +313,26 @@ def collect(ledger, account_id):
         }
         events = {row["id"]: row for row in tables["events"]}
         retained = [row for row in tables["events"] if not row["id"].startswith(_AUDIT_PREFIXES)]
+        binding_hash = digest(
+            {
+                "implementation": "execution-binding-1",
+                "account_id": account_id,
+                "initial_journal": [
+                    {key: value for key, value in row.items() if key != "retained_sequence"}
+                    for row in tables["journal"]
+                    if row["id"] == "initial"
+                ],
+                "execution_books": [
+                    {key: value for key, value in row.items() if key != "retained_sequence"}
+                    for row in tables["execution_books"]
+                ],
+                "identity_events": [
+                    {key: row[key] for key in ("account", "id", "payload")}
+                    for row in sorted(tables["events"], key=lambda row: row["id"])
+                    if row["id"].startswith(("remote-binding:", "remote-instrument:"))
+                ],
+            }
+        )
         prefix = digest(
             {**tables, "events": retained, "account_spec": archive.spec.model_dump(mode="json")}
         )
@@ -554,6 +574,8 @@ def collect(ledger, account_id):
         )
         audit = ExecutionComplianceAudit(
             account_id=account_id,
+            account_spec_hash=archive.spec.content_hash(),
+            execution_binding_hash=binding_hash,
             authority_prefix_hash=prefix,
             lineage=lineage,
             status="FAIL"
