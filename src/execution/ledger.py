@@ -326,6 +326,28 @@ class PortfolioLedger:
             )
             self._journal(account, "cancel:" + intent_id, status, _utc(at), reason, ZERO)
 
+    def _require_unpublished(self, account: str, at: datetime, detail: str):
+        """Fence a new economic event inside its caller's atomic transaction.
+
+        Exact already-consumed identities must return before this guard. Either
+        sleeve publication authority is binding, including legacy-only archives.
+        """
+        at = _utc(at).isoformat()
+        for table in ("snapshots", "sleeve_observations", "sleeve_snapshot_receipts"):
+            if (
+                table != "snapshots"
+                and not self.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+            ):
+                continue
+            if self.db.execute(
+                f"SELECT 1 FROM {table} WHERE account=? AND at>=? LIMIT 1", (account, at)
+            ).fetchone():
+                raise LedgerError(
+                    detail + (" in sleeve attribution" if table != "snapshots" else "")
+                )
+
     def apply_fill(self, fill: Fill, *, observed_at: datetime | None = None) -> bool:
         """Apply an actual execution, optionally received after a newer market mark.
 
@@ -361,29 +383,11 @@ class PortfolioLedger:
                 and fill.fx_rate != 1
             ):
                 raise LedgerError("base currency fill must have FX rate 1")
-            published = self.db.execute(
-                "SELECT 1 FROM snapshots WHERE account=? AND at>=? LIMIT 1",
-                (fill.account_id, fill.executed_at.isoformat()),
-            ).fetchone()
-            if published:
-                raise LedgerError("late execution requires explicit published NAV reconciliation")
-            # A sleeve publication is authoritative even if the cycle stopped
-            # before separately persisting a canonical snapshot. Check both the
-            # legacy index and full receipt; deleting one is not permission to
-            # rewrite the other. Preview snapshots persist neither authority.
-            for table in ("sleeve_observations", "sleeve_snapshot_receipts"):
-                if (
-                    self.db.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                    ).fetchone()
-                    and self.db.execute(
-                        f"SELECT 1 FROM {table} WHERE account=? AND at>=? LIMIT 1",
-                        (fill.account_id, fill.executed_at.isoformat()),
-                    ).fetchone()
-                ):
-                    raise LedgerError(
-                        "late execution requires explicit published NAV reconciliation in sleeve attribution"
-                    )
+            self._require_unpublished(
+                fill.account_id,
+                fill.executed_at,
+                "late execution requires explicit published NAV reconciliation",
+            )
             booked_at = fill.executed_at
             if observed_at is not None:
                 booked_at = _utc(observed_at)

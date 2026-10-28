@@ -1244,14 +1244,12 @@ class PaperVenue:
                 require_same_opening(
                     consumed_event(self.ledger, self.account_id, first.consumed_event_id), event
                 )
-            if (
-                first is None
-                and self.ledger.db.execute(
-                    "SELECT 1 FROM snapshots WHERE account=? AND at>=?",
-                    (self.account_id, event.opened_at.isoformat()),
-                ).fetchone()
-            ):
-                raise LedgerError("observed opening print conflicts with published NAV")
+            if first is None:
+                self.ledger._require_unpublished(
+                    self.account_id,
+                    event.opened_at,
+                    "observed opening print conflicts with published NAV",
+                )
             require_new_event_source(self.ledger, self.account_id, event, source_identity)
             accepted = self.accepted_intent_ids_before(event.opened_at)
             expected = {
