@@ -538,3 +538,13 @@ calls or market-availability claim. The 300-second operating ceiling never
 relaxes the 30-second fee bound. Current-FX revaluation of historical quote
 turnover keeps its existing explicit convention; neither historical daily USD
 conversion nor executable FX/multicurrency settlement is established.
+
+LEAN `f710dc0` integrated as `1088cad`: 207 root DAY/trailing/runtime/native
+recovery/reference/expiry/signal/venue tests passed in 16.07s. Actual
+DayTimeInForce replaces GoodTilDate; the subscribed security calendar and timezone
+must reproduce the admitted expiry on both preflight and submit, and original
+ticket order time binds restart proof. Unsupported brokerage/asset/calendar,
+arbitrary intraday expiry, legacy missing proof and unowned contingent tickets
+reject. This remains an offline protocol result; direct native DAY calendar
+certification, discrepancy settlement, grouped orders and actual LEAN runtime
+acceptance are separate outstanding requirements.
