@@ -28,9 +28,9 @@ def test_status_cli_serializes_only_real_missing_configured_stores(tmp_path,monk
         response=CliRunner().invoke(app,['status'])
     assert response.exit_code==0,response.output
     value=json.loads(response.output)
-    assert all(section['status']=='missing' for name,section in value.items() if name!='decision_budgets')
+    assert all(section['status']=='missing' for name,section in value.items() if name not in ('decision_budgets','budgets'))
     assert value['decision_budgets'] == {'status':'unavailable','reason':'decision_store_missing'}
-    assert value['budgets']['actual_cost_usd'] is None
+    assert value['budgets']['day_usage'] is None
     assert not (tmp_path/'outputs/paper-ledger.sqlite3').exists()
 
 

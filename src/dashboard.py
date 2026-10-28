@@ -128,12 +128,19 @@ def operations_page(operations,budgets,decision_budgets):
         st.dataframe(pd.DataFrame(operations.get('alerts',[])),hide_index=True)
     st.subheader('Generative model usage and budget charges')
     if not _unavailable(budgets,'Durable model budget'):
+        usage = budgets['day_usage']
+        st.caption(f"UTC admission day {budgets['day']} · recorded through {budgets['as_of']}")
         cols = st.columns(3)
-        for column,label,key in zip(cols,('Observed cost','Budget charged','Unknown usage reserved'),
-                                    ('actual_cost_usd','charged_cost_usd','uncertain_reserved_cost_usd'),strict=True):
-            column.metric(label,f"USD {Decimal(budgets[key]):,.6f}")
-        st.caption('Costs use reported tokens at configured rates; they are not provider invoice claims. Unknown usage retains its reservation.')
-        st.dataframe(pd.DataFrame(budgets['calls']),hide_index=True)
+        for column,label,key in zip(cols,('Known cost lower bound','Total reported cost','Conservative budget charge'),
+                                    ('known_cost_lower_bound_usd','actual_cost_usd','conservative_cost_usd'),strict=True):
+            value = usage[key]
+            column.metric(label,'Unknown' if value is None else f"USD {Decimal(value):,.6f}")
+        st.caption(f"{usage['requests']} admitted calls · {usage['pending_requests']} pending · {usage['usage_unknown_requests']} with incomplete usage · {usage['unpriced_requests']} without an exact priced total. Conservative charges retain reservation floors; these are not provider invoices.")
+        if usage['breached']:
+            st.error('A generative budget breach blocks further admission for this UTC day and affected runs.')
+            st.dataframe(pd.DataFrame({'call_id':usage['breach_call_ids']}),hide_index=True)
+            st.write({'breach_reasons':usage['breach_reasons']})
+        st.dataframe(pd.DataFrame([{'status':key,'calls':value} for key,value in usage['statuses'].items()]),hide_index=True)
     st.subheader('Jev decision usage')
     if not _unavailable(decision_budgets,'Verified decision budget'):
         usage = decision_budgets['day_usage']

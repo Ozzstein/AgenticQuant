@@ -354,7 +354,8 @@ def test_native_result_requires_actual_final_budget_receipt(
     boundary.token = private_key
     def after_start():
         boundary.budget['ready'] = False
-        boundary.budget['observed_models'] = ['wrong'] if changed_model else []
+        if changed_model:
+            boundary.budget['observed_models'] = ['wrong']
     boundary.start_hook = after_start
     result = supervisor.run(request, gateway_token_path=private_key, registry=registry)
     assert result["status"] == ("audit_unavailable" if changed_model else "discovery_complete")

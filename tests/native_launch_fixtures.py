@@ -77,7 +77,12 @@ def install_native_boundary(monkeypatch, supervisor, request, registry):
         return state.process
 
     monkeypatch.setattr(supervisor, "_docker", docker)
-    monkeypatch.setattr(supervisor, "gateway_receipt", lambda *a, **k: state.budget)
+    def gateway_receipt(*args, **kwargs):
+        now = datetime.now(timezone.utc)
+        state.budget["accounting"].update(as_of=now.isoformat(), day_id=now.date().isoformat())
+        return state.budget
+
+    monkeypatch.setattr(supervisor, "gateway_receipt", gateway_receipt)
     monkeypatch.setattr(native, "subprocess", SimpleNamespace(
         Popen=start, run=native.subprocess.run, TimeoutExpired=native.subprocess.TimeoutExpired))
     return state

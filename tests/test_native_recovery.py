@@ -12,17 +12,18 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from src.research.native import NativeSupervisor
-from src.research.native_runtime.overlay import UPSTREAM_REVISION
-from src.research.registry import RegistryError, ResearchRegistry
 
 from src.research import native_mounts
+from src.research.native import NativeSupervisor
 from src.research.native_recovery import (
     NativeRecoveryService,
     RecoveryError,
     bind_container,
     record_launch,
 )
+from src.research.native_runtime.overlay import UPSTREAM_REVISION
+from src.research.registry import RegistryError, ResearchRegistry
+from tests.native_budget_fixtures import pending, receipt
 from tests.test_native_discovery_exposure import mounted_request
 
 
@@ -133,33 +134,6 @@ class DockerBoundary:
         pytest.fail("Unexpected Docker action: " + repr(args))
 
 
-def receipt(req, now):
-    return {
-        "schema_version": "1.0",
-        "run_id": req.run_id,
-        "config_hash": req.gateway_config_hash,
-        "ready": True,
-        "provider_configured": True,
-        "streaming": False,
-        "blocked": False,
-        "expires_at": (now + timedelta(days=2)).isoformat(),
-        "models": {
-            scope: {"provider": "openai", "model": model.removeprefix("openai/")}
-            for scope, model in (("chat", req.chat_model), ("embedding", req.embedding_model))
-        },
-        "admission_available": {"chat": True, "embedding": True},
-        "limits": req.gateway_limits.model_dump(mode="json", exclude={"schema_version"}),
-        "day_limits": req.gateway_day_limits.model_dump(mode="json", exclude={"schema_version"}),
-        "observed_models": [req.chat_model.removeprefix("openai/")],
-        "charged": {"requests": 1, "tokens": 15, "cost_usd": "0.01"},
-        "actual": {
-            "requests_with_usage": 1,
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "cost_usd": "0.01",
-        },
-        "uncertain": {"requests": 0, "reserved_tokens": 0, "reserved_cost_usd": "0"},
-    }
 
 
 @pytest.fixture
@@ -221,12 +195,17 @@ def job(tmp_path):
     def clock():
         return now + timedelta(seconds=20)
 
+    def gateway_receipt(*args):
+        value = copy.deepcopy(budget)
+        value["accounting"].update(as_of=clock().isoformat(), day_id=clock().date().isoformat())
+        return value
+
     service = NativeRecoveryService(
         supervisor,
         registry,
         clock=clock,
         docker=docker,
-        gateway_receipt=lambda *a: copy.deepcopy(budget),
+        gateway_receipt=gateway_receipt,
     )
     return SimpleNamespace(
         req=req,
@@ -277,7 +256,7 @@ def test_actual_registry_restart_recovers_only_original_clean_exit(job):
         registry,
         clock=job.clock,
         docker=job.docker,
-        gateway_receipt=lambda *a: job.budget,
+        gateway_receipt=job.service.gateway_receipt,
     )
     event = service.reconcile(job.req.run_id)
     assert event.reason == "completion_recovered" and event.cost_state == "audited"
@@ -426,13 +405,7 @@ def test_daemon_and_gateway_outages_are_distinct_durable_events(job):
 
 def test_uncertain_usage_cannot_be_released_or_completed(job):
     finish(job)
-    job.budget["actual"] = {
-        "requests_with_usage": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cost_usd": "0",
-    }
-    job.budget["uncertain"] = {"requests": 1, "reserved_tokens": 15, "reserved_cost_usd": "0.01"}
+    pending(job.budget)
     before = copy.deepcopy(job.budget)
     event = job.service.reconcile(job.req.run_id)
     assert event.reason == "cost_uncertain" and job.budget == before
@@ -562,3 +535,36 @@ def test_private_extra_gateway_fields_are_not_archived_in_recovered_result(job):
         "private-fixture-must-not-persist"
         not in job.registry.blob(event.gateway_receipt_hash).decode()
     )
+
+
+@pytest.mark.parametrize('case', ['reservation-floor', 'run-breach', 'day-breach', 'stale'])
+def test_recovery_requires_fresh_clear_v2_scope_not_legacy_arithmetic(job, case):
+    from tests.native_budget_fixtures import project
+
+    finish(job)
+    run = job.budget['accounting']['run']
+    run.update(conservative_tokens=100, conservative_cost_usd='0.10')
+    job.budget['accounting']['day'] = copy.deepcopy(run)
+    if case.endswith('breach'):
+        scope = job.budget['accounting']['run' if case == 'run-breach' else 'day']
+        scope.update(breached=True, breach_call_ids=['original-call'],
+                     breach_reasons=['token_reservation_exceeded'])
+    project(job.budget)
+    if case == 'stale':
+        job.service.gateway_receipt = lambda *args: copy.deepcopy(job.budget)
+    event = job.service.reconcile(job.req.run_id)
+    if case == 'reservation-floor':
+        assert event.reason == 'completion_recovered'
+        result = job.registry.native_result(job.req.run_id)
+        saved = result['gateway_final_receipt']
+        assert saved['charged']['cost_usd'] == '0.10'
+        assert saved['actual']['cost_usd'] == '0.01'
+        assert saved['uncertain']['requests'] == 0
+    else:
+        assert event.reason == ('gateway_unavailable' if case == 'stale' else 'budget_breached')
+        assert not (job.work/'result.json').exists()
+        with pytest.raises(RegistryError):
+            job.registry.native_result(job.req.run_id)
+        if case != 'stale':
+            assert event.cost_state == 'audited'
+            assert event.gateway_receipt_hash is not None

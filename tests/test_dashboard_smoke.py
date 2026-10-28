@@ -8,9 +8,9 @@ from src.utils.config import AppConfig
 def test_missing_stores_remain_unknown_and_are_not_created(tmp_path):
     config = AppConfig(output_dir=str(tmp_path/'missing'),_env_file=None)
     result = system_view(config)
-    assert all(section['status']=='missing' for name,section in result.items() if name!='decision_budgets')
+    assert all(section['status']=='missing' for name,section in result.items() if name not in ('decision_budgets','budgets'))
     assert result['decision_budgets'] == {'status':'unavailable','reason':'decision_store_missing'}
-    assert result['budgets']['actual_cost_usd'] is None
+    assert result['budgets']['day_usage'] is None
     assert not (tmp_path/'missing').exists()
 
 
@@ -42,7 +42,8 @@ def test_budget_report_preserves_unknown_usage_reservation(tmp_path):
     budget = AgentCallBudget(config,'run',deadline=time.monotonic()+30)
     budget.reserve_bound('test-pinned',100,100)
     value = budget_view(tmp_path/'budget.db')
-    assert value['calls_with_unknown_usage']==1
-    assert value['uncertain_reserved_cost_usd']=='0.0003'
-    assert value['actual_cost_usd']=='0'
-    assert value['charged_cost_usd']=='0.0003'
+    scope = value['day_usage']
+    assert scope['pending_requests'] == scope['usage_unknown_requests'] == scope['unpriced_requests'] == 1
+    assert scope['uncertain_cost_usd'] == scope['conservative_cost_usd'] == '0.0003'
+    assert scope['actual_cost_usd'] is None
+    assert scope['known_cost_lower_bound_usd'] == '0'

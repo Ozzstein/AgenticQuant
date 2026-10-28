@@ -50,8 +50,8 @@ def test_attached_exit_zero_cannot_override_missing_or_uncertain_proof(launch, p
     def started():
         if problem == 'uncertain':
             budget = launch.boundary.budget
-            budget['charged'].update(requests=2, tokens=25, cost_usd='0.02')
-            budget['uncertain'].update(requests=1, reserved_tokens=10, reserved_cost_usd='0.01')
+            from tests.native_budget_fixtures import pending
+            pending(budget)
         elif problem == 'bad-inputs':
             (launch.work/'request.json').write_text('{}')
     launch.boundary.start_hook = started
@@ -94,6 +94,7 @@ def test_projection_failure_keeps_authoritative_result_for_recovery(launch, monk
 
 def test_recovery_winning_publication_is_retained_by_original_runner(launch, monkeypatch):
     calls = []
+    fresh_receipt = launch.supervisor.gateway_receipt
     def budget(*args):
         calls.append(1)
         if len(calls) == 2:
@@ -103,9 +104,9 @@ def test_recovery_winning_publication_is_retained_by_original_runner(launch, mon
                 StartedAt=bound['bound_at'], FinishedAt=datetime.now(timezone.utc).isoformat())
             event = NativeRecoveryService(launch.supervisor, launch.registry,
                 docker=launch.boundary.docker,
-                gateway_receipt=lambda *a: launch.boundary.budget).reconcile(launch.request.run_id)
+                gateway_receipt=fresh_receipt).reconcile(launch.request.run_id)
             assert event.reason == 'completion_recovered'
-        return launch.boundary.budget
+        return fresh_receipt(*args)
     monkeypatch.setattr(launch.supervisor, 'gateway_receipt', budget)
     result = execute(launch)
     assert result['recovered'] is True

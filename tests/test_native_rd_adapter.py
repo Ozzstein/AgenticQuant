@@ -2,7 +2,7 @@
 import copy
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -89,14 +89,8 @@ def test_real_pinned_templates_render_explicit_us_scenario(tmp_path):
 def test_receipt_enforces_models_caps_scope_expiry_and_faults():
     req = request()
     now = datetime.now(timezone.utc)
-    receipt = dict(run_id=req.run_id,config_hash=req.gateway_config_hash,ready=True,provider_configured=True,
-                   streaming=False,expires_at=(now+timedelta(hours=2)).isoformat(),
-                   models={scope:dict(provider='openai',model=model.removeprefix('openai/'))
-                           for scope,model in [('chat',req.chat_model),('embedding',req.embedding_model)]},
-                   admission_available={'chat':True,'embedding':True},
-                   limits=req.gateway_limits.model_dump(mode='json',exclude={'schema_version'}),
-                   day_limits=req.gateway_day_limits.model_dump(mode='json',exclude={'schema_version'}),
-                   observed_models=[],blocked=False)
+    from tests.native_budget_fixtures import receipt as budget_receipt
+    receipt = budget_receipt(req, now)
     NativeSupervisor.verify_receipt(req,receipt,now=now)
     for path,value in [(('models','chat','model'),'other-model'),(('limits','requests'),101),
                        (('admission_available','embedding'),False), (('blocked',),True),

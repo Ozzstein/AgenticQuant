@@ -28,6 +28,130 @@ from src.research.native_runtime.overlay import UPSTREAM_REVISION
 COMMANDS = ('fin_factor', 'fin_model', 'fin_quant', 'fin_factor_report', 'general_model', 'ui', 'health_check')
 
 
+def _usage_integer(value):
+    if type(value) is not int or value < 0:
+        raise ValueError('invalid gateway usage count')
+    return value
+
+
+def _usage_cost(value):
+    if not isinstance(value, str):
+        raise ValueError('gateway costs require exact decimal strings')
+    number = Decimal(value)
+    if not number.is_finite() or number < 0:
+        raise ValueError('invalid gateway usage cost')
+    return number
+
+
+def _usage_scope(scope):
+    """Check public summary consistency, without recreating reservation pricing."""
+    counts = ('requests','pending_requests','known_input_tokens','known_output_tokens',
+              'known_total_tokens_lower_bound','usage_unknown_requests','unpriced_requests',
+              'conservative_tokens','uncertain_tokens')
+    costs = ('known_cost_lower_bound_usd','conservative_cost_usd','uncertain_cost_usd')
+    extra = ('actual_tokens','actual_cost_usd','breached','breach_call_ids','breach_reasons',
+             'statuses','observed_models','observed_model_hashes')
+    if not isinstance(scope, dict) or set(scope) != set(counts+costs+extra):
+        raise ValueError('closed v2 gateway usage scope required')
+    for key in counts:
+        _usage_integer(scope[key])
+    money = {key:_usage_cost(scope[key]) for key in costs}
+    n, unknown, unpriced = (scope[k] for k in ('requests','usage_unknown_requests','unpriced_requests'))
+    if not 0 <= scope['pending_requests'] <= unknown <= unpriced <= n:
+        raise ValueError('inconsistent gateway uncertainty counts')
+    total = scope['known_input_tokens']+scope['known_output_tokens']
+    if not total <= scope['known_total_tokens_lower_bound'] <= scope['conservative_tokens']:
+        raise ValueError('gateway lower bound exceeds conservative tokens')
+    if (money['known_cost_lower_bound_usd'] > money['conservative_cost_usd']
+            or money['uncertain_cost_usd'] > money['conservative_cost_usd']
+            or scope['uncertain_tokens'] > scope['conservative_tokens']):
+        raise ValueError('gateway cost/uncertainty exceeds conservative charge')
+    if unknown:
+        if scope['actual_tokens'] is not None:
+            raise ValueError('unknown usage cannot have exact tokens')
+    elif (_usage_integer(scope['actual_tokens']) != total
+          or total != scope['known_total_tokens_lower_bound']):
+        raise ValueError('exact token total differs')
+    if unpriced:
+        if scope['actual_cost_usd'] is not None:
+            raise ValueError('unpriced usage cannot have exact cost')
+    elif (_usage_cost(scope['actual_cost_usd']) != money['known_cost_lower_bound_usd']
+          or scope['uncertain_tokens'] or money['uncertain_cost_usd']):
+        raise ValueError('exact cost or uncertainty differs')
+    for key in ('breach_call_ids','breach_reasons','observed_models','observed_model_hashes'):
+        values = scope[key]
+        if (not isinstance(values, list) or any(not isinstance(v, str) or not v or len(v)>160 for v in values)
+                or len(values) != len(set(values))):
+            raise ValueError('invalid public usage identities')
+    if (any(not re.fullmatch(r'[0-9a-f]{64}', v) for v in scope['observed_model_hashes'])
+            or type(scope['breached']) is not bool
+            or scope['breached'] != bool(scope['breach_call_ids'])
+            or scope['breached'] != bool(scope['breach_reasons'])
+            or len(scope['breach_call_ids']) > n):
+        raise ValueError('gateway breach/model identity differs')
+    if not n and (any(scope[k] for k in counts) or any(money.values())
+                  or any(scope[k] for k in ('observed_models','observed_model_hashes'))):
+        raise ValueError('empty gateway scope has nonempty usage')
+    statuses = scope['statuses']
+    if (not isinstance(statuses, dict)
+            or any(not isinstance(k,str) or not re.fullmatch(r'[a-z_]{1,48}',k)
+                   or not _usage_integer(v) for k,v in statuses.items())
+            or sum(statuses.values()) != n or statuses.get('reserved',0) != scope['pending_requests']):
+        raise ValueError('gateway status counts differ')
+
+
+def _gateway_accounting(request, receipt, now):
+    """Require the authenticated gateway's v2 scope; no legacy success downgrade."""
+    value = receipt.get('accounting')
+    if (not isinstance(value,dict)
+            or set(value) != {'schema_version','policy','run_id','as_of','day_id','run','day'}
+            or value['schema_version'] != '2.0' or value['policy'] != 'reservation-floor-2'
+            or value['run_id'] != request.run_id
+            or receipt.get('cost_semantics') != 'verified_usage_with_reservation_floor'):
+        raise ValueError('verified v2 gateway accounting required')
+    at = datetime.fromisoformat(value['as_of'].replace('Z','+00:00'))
+    if (now.tzinfo is None or at.tzinfo is None or at > now
+            or value['day_id'] != at.astimezone(timezone.utc).date().isoformat()
+            or value['day_id'] != now.astimezone(timezone.utc).date().isoformat()):
+        raise ValueError('gateway accounting clock/day differs')
+    for name in ('run','day'):
+        _usage_scope(value[name])
+    run = value['run']
+    expected = {
+        'charged': {'requests':run['requests'],'tokens':run['conservative_tokens'],
+                    'cost_usd':run['conservative_cost_usd']},
+        'actual': {'requests_with_usage':run['requests']-run['unpriced_requests'],
+                   'input_tokens':run['known_input_tokens'],'output_tokens':run['known_output_tokens'],
+                   'cost_usd':run['actual_cost_usd']},
+        'uncertain': {'requests':run['unpriced_requests'],'reserved_tokens':run['uncertain_tokens'],
+                      'reserved_cost_usd':run['uncertain_cost_usd']},
+    }
+    if any(json.dumps(receipt.get(key),sort_keys=True,allow_nan=False)
+           != json.dumps(item,sort_keys=True,allow_nan=False) for key,item in expected.items()):
+        raise ValueError('gateway public counters differ from verified scope')
+    if (receipt.get('observed_models') != run['observed_models']
+            or receipt.get('statuses') != run['statuses']
+            or type(receipt.get('blocked')) is not bool
+            or receipt['blocked'] != (run['breached'] or value['day']['breached'])):
+        raise ValueError('gateway public status differs from verified scope')
+    # A copy keeps the caller's mutable response from changing an archived proof.
+    return json.loads(json.dumps(value,allow_nan=False))
+
+
+def _budget_audit_error(receipt):
+    accounting = receipt['accounting']
+    for name, limits_key in (('run','limits'),('day','day_limits')):
+        scope, limits = accounting[name], receipt[limits_key]
+        if (scope['breached'] or scope['requests'] > limits['requests']
+                or scope['conservative_tokens'] > limits['tokens']
+                or _usage_cost(scope['conservative_cost_usd']) > _usage_cost(limits['cost_usd'])):
+            return 'budget_breached'
+    if any(accounting[name][key] for name in ('run','day')
+           for key in ('pending_requests','usage_unknown_requests','unpriced_requests')):
+        return 'uncertain_usage_retained'
+    return None
+
+
 class NativeBudgetLimits(VersionedContract):
     requests: int = Field(gt=0)
     tokens: int = Field(gt=0)
@@ -141,8 +265,9 @@ class NativeSupervisor:
         network = json.loads(self._docker('network','inspect',request.network))[0]
         if not network.get('Internal'):
             raise ValueError('native generated code requires an internal Docker network with no direct internet route')
+        requested_at = datetime.now(timezone.utc)
         receipt = self.gateway_receipt(request, gateway_token_path)
-        self.verify_receipt(request, receipt, now=datetime.now(timezone.utc))
+        self.verify_receipt(request, receipt, now=datetime.now(timezone.utc), not_before=requested_at)
         return {'upstream_revision':UPSTREAM_REVISION,'image_id':image['Id'], 'network_id':network['Id'],
                 'scenario_hash':request.scenario.content_hash(),'bundle_hash':request.scenario.bundle_hash,
                 'data_snapshot_hash': hashlib.sha256(json.dumps(manifest['snapshot'],sort_keys=True).encode()).hexdigest(),
@@ -165,7 +290,12 @@ class NativeSupervisor:
         return json.loads(raw)
 
     @staticmethod
-    def verify_receipt(request: NativeRequest, receipt: dict, *, now: datetime, final: bool=False) -> None:
+    def verify_receipt(request: NativeRequest, receipt: dict, *, now: datetime, final: bool=False,
+                       not_before: datetime | None=None) -> dict:
+        if (not isinstance(receipt, dict) or receipt.get('schema_version') != '1.0'
+                or any(type(receipt.get(k)) is not bool for k in
+                       ('ready','provider_configured','streaming','blocked'))):
+            raise ValueError('closed gateway schema and boolean status required')
         if receipt.get('run_id') != request.run_id or receipt.get('config_hash') != request.gateway_config_hash:
             raise ValueError('gateway admission does not match native run/config identity')
         if ((not final and not receipt.get('ready')) or not receipt.get('provider_configured')
@@ -181,12 +311,23 @@ class NativeSupervisor:
             if not final and receipt.get('admission_available',{}).get(scope) is not True:
                 raise ValueError('gateway scope is exhausted')
         for name, expected in (('limits',request.gateway_limits),('day_limits',request.gateway_day_limits)):
+            _usage_integer(receipt[name]['requests'])
+            _usage_integer(receipt[name]['tokens'])
+            _usage_cost(receipt[name]['cost_usd'])
             actual = NativeBudgetLimits.model_validate(receipt[name])
             if actual != expected:
                 raise ValueError('gateway budget caps differ from explicit native bounds')
         allowed = {request.chat_model.removeprefix('openai/'),request.embedding_model.removeprefix('openai/')}
-        if set(receipt.get('observed_models',[]))-allowed or receipt.get('blocked'):
+        if set(receipt.get('observed_models',[]))-allowed:
             raise ValueError('gateway reported a model substitution or fault')
+        accounting = _gateway_accounting(request,receipt,now)
+        if not_before is not None:
+            at = datetime.fromisoformat(accounting['as_of'].replace('Z','+00:00'))
+            if not_before.tzinfo is None or not not_before <= at <= now:
+                raise ValueError('gateway accounting predates the requested fresh audit')
+        if not final and _budget_audit_error(receipt):
+            raise ValueError('gateway usage is breached or uncertain')
+        return accounting
 
     def command(self, request: NativeRequest, work: Path, token: Path, *, frozen_root: Path | None=None) -> list[str]:
         data_root=frozen_root/'qlib' if frozen_root is not None else Path(request.scenario.provider_uri).resolve()
@@ -444,10 +585,10 @@ class NativeSupervisor:
                     code = process.returncode
                     final_receipt, audit_error = None, None
                     try:
+                        audit_started_at = datetime.now(timezone.utc)
                         final_receipt = _budget_receipt(request,self.gateway_receipt(request,token),
-                                                        datetime.now(timezone.utc))
-                        if any(Decimal(str(v)) != 0 for v in final_receipt['uncertain'].values()):
-                            audit_error = 'uncertain_usage_retained'
+                                                        datetime.now(timezone.utc), not_before=audit_started_at)
+                        audit_error = _budget_audit_error(final_receipt)
                     except Exception as exc:
                         audit_error = type(exc).__name__
                     if audit_error and state == 'discovery_complete':

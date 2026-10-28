@@ -742,3 +742,45 @@ def test_wrong_model_never_reprices_at_pinned_rate_or_retries(research_env, monk
     resumed, second_calls = copilot(env)
     assert propose(resumed, env).status == "unavailable" and not second_calls
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('failure', [None, 'overrun'])
+def test_changed_caller_price_cannot_certify_copilot_generation(research_env, monkeypatch, failure):
+    from src.agents.budget import AgentCallBudget
+    from src.agents.receipts import read_call
+
+    env = research_env
+    reserve = AgentCallBudget.reserve_bound
+
+    def changed_price(self, *args, **kwargs):
+        identity, price, remaining = reserve(self, *args, **kwargs)
+        return identity, SimpleNamespace(**{**vars(price), 'input_usd_per_million': Decimal('7')}), remaining
+
+    monkeypatch.setattr(AgentCallBudget, 'reserve_bound', changed_price)
+    service, calls = copilot(env, failure=failure)
+    outcome = propose(service, env)
+    assert outcome.status == 'unavailable' and len(calls) == 1
+    observation = GenerationObservation.model_validate_json(env.registry.blob(outcome.observation_hashes[0]))
+    assert observation.status == ('usage_overrun' if failure else 'pricing_mismatch')
+    assert observation.price_version is observation.pricing_json is observation.priced_usage_usd is None
+    assert observation.input_tokens == (900000 if failure else 100)
+    call = read_call(env.config.agents.budget_store_path, observation.budget_call_id)
+    assert call.status == observation.status
+    assert json.loads(call.admission_json)['pricing']['input_usd_per_million'] != '7'
+
+
+def test_generic_finish_failure_is_unavailable_not_invented_overrun(research_env, monkeypatch):
+    from src.agents.budget import AgentBudgetError, AgentCallBudget
+
+    finish = AgentCallBudget.finish
+
+    def unavailable(self, *args, **kwargs):
+        finish(self, *args, **kwargs)
+        raise AgentBudgetError('authority unavailable')
+
+    monkeypatch.setattr(AgentCallBudget, 'finish', unavailable)
+    service, calls = copilot(research_env)
+    outcome = propose(service, research_env)
+    observation = GenerationObservation.model_validate_json(research_env.registry.blob(outcome.observation_hashes[0]))
+    assert outcome.status == 'unavailable' and len(calls) == 1
+    assert observation.status == 'unavailable' and observation.priced_usage_usd is None

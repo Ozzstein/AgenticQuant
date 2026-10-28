@@ -124,6 +124,7 @@ class NativeRecoveryEvent(VersionedContract):
         "exit_failed",
         "gateway_unavailable",
         "cost_uncertain",
+        "budget_breached",
         "artifacts_unavailable",
         "completion_recovered",
         "authoritative_result_retained",
@@ -530,9 +531,9 @@ def bind_container(supervisor, registry, run_id, container_id, *, docker=None, c
     return binding
 
 
-def _budget_receipt(request, raw, now):
-    """Keep only the public budget schema; reject unknown accounting, never settle."""
-    NativeSupervisor.verify_receipt(request, raw, now=now, final=True)
+def _budget_receipt(request, raw, now, *, not_before=None):
+    """Retain verified public accounting, including honest uncertainty/breaches."""
+    accounting = NativeSupervisor.verify_receipt(request, raw, now=now, final=True, not_before=not_before)
     if raw["schema_version"] != "1.0" or any(
         type(raw[k]) is not bool for k in ("ready", "provider_configured", "streaming", "blocked")
     ):
@@ -557,6 +558,8 @@ def _budget_receipt(request, raw, now):
         scope: {k: raw["models"][scope][k] for k in ("provider", "model")}
         for scope in ("chat", "embedding")
     }
+    value['accounting'] = accounting
+    value['cost_semantics'] = raw['cost_semantics']
     counters = {
         "charged": ("requests", "tokens", "cost_usd"),
         "actual": ("requests_with_usage", "input_tokens", "output_tokens", "cost_usd"),
@@ -567,6 +570,9 @@ def _budget_receipt(request, raw, now):
         for key in keys:
             item = raw[group][key]
             if "cost" in key:
+                if group == 'actual' and item is None:
+                    value[group][key] = None
+                    continue
                 number = Decimal(str(item))
                 if not number.is_finite() or number < 0:
                     raise RecoveryError("invalid budget cost")
@@ -575,18 +581,6 @@ def _budget_receipt(request, raw, now):
                 if type(item) is not int or item < 0:
                     raise RecoveryError("invalid budget usage")
                 value[group][key] = item
-    charged, actual, uncertain = (value[k] for k in counters)
-    if (
-        charged["requests"] != actual["requests_with_usage"] + uncertain["requests"]
-        or charged["tokens"]
-        != actual["input_tokens"] + actual["output_tokens"] + uncertain["reserved_tokens"]
-        or Decimal(charged["cost_usd"])
-        != Decimal(actual["cost_usd"]) + Decimal(uncertain["reserved_cost_usd"])
-        or charged["requests"] > request.gateway_limits.requests
-        or charged["tokens"] > request.gateway_limits.tokens
-        or Decimal(charged["cost_usd"]) > request.gateway_limits.cost_usd
-    ):
-        raise RecoveryError("inconsistent budget accounting")
     return value
 
 
@@ -865,10 +859,12 @@ class NativeRecoveryService:
             started, finished = _instant(state["StartedAt"]), _instant(state["FinishedAt"])
             if not binding.bound_at <= started <= finished <= self.clock():
                 raise RecoveryError("process chronology differs")
+            audit_started_at = self.clock()
             receipt = _budget_receipt(
                 request,
                 self.gateway_receipt(request, Path(launch.gateway_token_path)),
                 self.clock(),
+                not_before=max(finished, audit_started_at),
             )
         except (
             RuntimeError,
@@ -883,11 +879,15 @@ class NativeRecoveryService:
                 observation="exited", reason="gateway_unavailable", inspection_hash=inspection_hash
             )
         receipt_hash = _archive(self.registry, receipt)
-        if any(Decimal(str(v)) != 0 for v in receipt["uncertain"].values()):
+        from src.research.native import _budget_audit_error
+        audit_error = _budget_audit_error(receipt)
+        if audit_error:
+            uncertain = any(receipt['accounting'][name][key] for name in ('run','day')
+                            for key in ('pending_requests','usage_unknown_requests','unpriced_requests'))
             return emit(
                 observation="exited",
-                reason="cost_uncertain",
-                cost_state="uncertain",
+                reason="budget_breached" if audit_error == 'budget_breached' else "cost_uncertain",
+                cost_state="uncertain" if uncertain else "audited",
                 inspection_hash=inspection_hash,
                 gateway_receipt_hash=receipt_hash,
             )

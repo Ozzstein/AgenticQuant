@@ -828,3 +828,54 @@ local predictions. Frozen-parent reload/republication is byte-identical; fresh
 four-family byte reconstruction is not claimed. Native semantic-comparison
 design remains a separate review prerequisite. No metadata stripping, new
 source/income authority, authenticated provider or release acceptance is implied.
+
+### Generative usage authority and current native budget consumers
+
+Jev `02115fb` integrated as `0d71c79`. Generative budgets now preserve independent
+valid counters, unknown prices and original reservation floors, with immutable
+run/original-UTC-day breach authority. The root reporting adapter delegates to
+`src.agents.receipts.read_usage_summary` in read-only mode; the dashboard separates
+known lower-bound cost, nullable exact cost and conservative charge. Missing or
+corrupt authority is unavailable, never measured zero. Unknown provider model
+text is not exposed by this public projection.
+
+Copilot retains original response usage, propagates `AgentBudgetError.status`
+without inventing an overrun, and compares pricing against the verified original
+admission before attaching priced generation provenance. This also rejects a
+changed caller price when an actual overrun takes status precedence.
+
+Native admission, original finalization and recovery require the authenticated
+v2 run/day summary, exact request/model/cap identities, consistent public
+projections and a measured fresh audit clock. Final success requires both scopes
+to have no pending, incomplete, unpriced or breached usage and to remain within
+all explicit caps. Known bills can be lower than reserved charges; the invalid
+`charged == actual + uncertain` equation is removed. Actual uncertainty/breaches
+are archived as failure evidence; they never become successful discovery.
+Preflight and final fetches reject stale same-day receipts, future clocks and
+scope substitutions. Existing completed authoritative native results remain
+immutable and readable; fresh v1-only receipts cannot authorize new completion.
+
+Root offline evidence (TCP disabled, Unix event-loop self-pipes only):
+
+- Initial consumer integration: **140 passed in 176.58s**.
+- Final native recovery/supervisor plus actual gateway accounting: **74 passed
+  in 69.53s**, including reservation-floor success, original/day breach failure,
+  stale receipt rejection and immutable original-result retention.
+- Actual gateway/reporting and copilot pricing/status regressions: **77 passed
+  in 26.18s**.
+- Actual budget authority, gateway/deployment, dashboard/CLI and existing decision
+  reporting: **129 passed in 31.40s**.
+
+Commands used `.venv/bin/python -m pytest ... -q --disable-socket
+--allow-unix-socket` with `PYTHONDONTWRITEBYTECODE=1`, OMP/OpenBLAS threads2.
+Logs are `/tmp/quantagentlab-root-generative-consumers.log`,
+`/tmp/quantagentlab-root-generative-native-verified.log`,
+`/tmp/quantagentlab-root-generative-extra-final.log` and
+`/tmp/quantagentlab-root-generative-authority-final.log`. New provider-bound tests
+use actual SQLite/ResearchGateway with HTTPX MockTransport; Docker boundary tests
+exercise the actual supervisor/registry with isolated protocol fixtures. Initial
+new-test fixture errors and stale synthetic receipt callbacks were corrected;
+no runtime authority, deadline or provider-usage check was relaxed. Production
+and changed-test Ruff plus diff checks pass. These overlapping counts are not a
+whole-suite green result. No authenticated provider, Docker, financial efficacy,
+positive income-source or release acceptance is implied.

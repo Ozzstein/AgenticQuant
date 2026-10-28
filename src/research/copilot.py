@@ -608,11 +608,23 @@ class ResearchCopilot:
                         status=status,
                         elapsed_ms=(time.monotonic() - clock) * 1000,
                     )
-                except AgentBudgetError:
-                    status = "usage_overrun"
+                except AgentBudgetError as exc:
+                    status = exc.status or "unavailable"
                     result = None
             usage = getattr(raw, "usage_metadata", None) or {}
             tokens_known = known and status != "model_mismatch"
+            price_verified = False
+            if call_id and price and status != "unavailable":
+                from src.agents.receipts import read_call
+
+                try:
+                    receipt = read_call(budget.path, call_id)
+                    price_verified = (
+                        json.loads(receipt.admission_json)["pricing"] == self._price_json(price)
+                    )
+                except (ValueError, OSError, sqlite3.Error):
+                    # An unavailable authority cannot establish a priced observation.
+                    price_verified = False
             observation = GenerationObservation(
                 request_hash=request_hash,
                 context=context,
@@ -622,8 +634,8 @@ class ResearchCopilot:
                 actual_model=actual,
                 status=status,
                 budget_call_id=call_id,
-                price_version=price.price_version if price else None,
-                pricing_json=canonical(self._price_json(price)).decode() if price else None,
+                price_version=price.price_version if price and price_verified else None,
+                pricing_json=canonical(self._price_json(price)).decode() if price and price_verified else None,
                 input_tokens=usage.get("input_tokens") if tokens_known else None,
                 output_tokens=usage.get("output_tokens") if tokens_known else None,
                 priced_usage_usd=(
@@ -631,7 +643,7 @@ class ResearchCopilot:
                     + Decimal(usage["output_tokens"]) * price.output_usd_per_million
                 )
                 / Decimal(1_000_000)
-                if tokens_known
+                if tokens_known and price_verified
                 else None,
                 response_hash=response_hash,
                 started_at=start,

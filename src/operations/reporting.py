@@ -47,23 +47,18 @@ def portfolio_view(path: str | Path, account_id: str) -> dict:
         ledger.close()
 
 
-def budget_view(path: str | Path, *, day: str | None = None) -> dict:
-    day = day or datetime.now(timezone.utc).date().isoformat()
-    if not Path(path).is_file():
-        return {'status':'missing','day':day,'actual_cost_usd':None,'charged_cost_usd':None,'calls':[]}
-    with read_database(path) as db:
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='calls' AND type='table'").fetchone():
-            return {'status':'missing','day':day,'actual_cost_usd':None,'charged_cost_usd':None,'calls':[]}
-        rows = [dict(r) for r in db.execute('''SELECT id,run_id,day,provider,model,pricing_version,
-                     reserved_tokens,charged_tokens,reserved_cost,charged_cost,input_tokens,output_tokens,
-                     status,latency_ms,actual_model FROM calls WHERE day=? ORDER BY rowid''',(day,))]
-    known = [r for r in rows if r['input_tokens'] is not None and r['output_tokens'] is not None]
-    unknown = [r for r in rows if r not in known]
-    return {'status':'available','day':day,'cost_semantics':'reported_tokens_at_configured_rates',
-            'actual_cost_usd':str(sum((Decimal(r['charged_cost']) for r in known),Decimal(0))),
-            'charged_cost_usd':str(sum((Decimal(r['charged_cost']) for r in rows),Decimal(0))),
-            'uncertain_reserved_cost_usd':str(sum((Decimal(r['charged_cost']) for r in unknown),Decimal(0))),
-            'calls_with_unknown_usage':len(unknown),'calls':rows}
+def budget_view(path: str | Path, *, day: str | None = None,
+                run_id: str | None = None, as_of: datetime | None = None) -> dict:
+    """Project the sole verified generative usage authority, never mutable SQL totals."""
+    from src.agents.receipts import read_usage_summary
+
+    cutoff = as_of or datetime.now(timezone.utc)
+    try:
+        return read_usage_summary(path, day=day or cutoff.astimezone(timezone.utc).date().isoformat(),
+                                  run_id=run_id, as_of=cutoff)
+    except Exception as exc:
+        return {'status':'unavailable','reason':'generative_usage_authority_invalid',
+                'error_type':type(exc).__name__}
 
 
 def decision_budget_view(path: str | Path, *, day: str | None = None,
