@@ -26,6 +26,55 @@ from src.domain.common import NonEmptyString, Sha256, UtcTimestamp, VersionedCon
 from src.domain.decisions import AgentDecision, DecisionRequest, DecisionResult, DecisionSource
 
 
+def verify_model_projections(receipt, *, decision_store, evidence_store, require_current=False):
+    """Original prompt bytes remain immutable; old unisolated prompts are not memory."""
+    from src.decision.workflows import PROJECTION_VERSION, exact_citation, semantic_projection
+    from src.domain.decisions import CitedClaim
+
+    calls = {c.call_id: c for c in receipt.calls}
+    observed = set(receipt.decision.judgment_observation_ids)
+    for generation in receipt.generations:
+        messages = json.loads(generation.request_json)
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("judgment_projection_version") != PROJECTION_VERSION:
+            if require_current:
+                raise ValueError("legacy prompt lacks certified shadow-isolation boundary")
+            continue  # Preserve legacy audit export; never silently upgrade memory eligibility.
+        entries = payload.get("accepted_task_judgments", [])
+        seen = set()
+        for entry in entries:
+            identity = entry["observation_id"]
+            if identity not in observed:
+                raise ValueError("prompt judgment is outside recorded desk observations")
+            result = DecisionResult.model_validate(
+                decision_store.export_observation(identity)["result"]
+            )
+            projections = semantic_projection(
+                decision_store,
+                evidence_store,
+                result,
+                context=receipt.decision.context,
+                instrument=receipt.decision.instrument,
+                sources=receipt.sources,
+                as_of=calls[generation.call_id].started_at,
+            )
+            key = (identity, entry["judgment"]["question_hash"])
+            if key in seen or entry not in projections:
+                raise ValueError("model-visible judgment differs from evaluated source authority")
+            seen.add(key)
+        extra = payload.get("additional_context") or {}
+        for entry in extra.get("citation_checks", []):
+            check = exact_citation(
+                CitedClaim.model_validate(entry["claim"]), receipt.sources, receipt.decision.context
+            )
+            if entry != {
+                "claim": check.claim.model_dump(mode="json"),
+                "status": check.status,
+                "reason": check.reason,
+            }:
+                raise ValueError("model-visible citation includes unapproved semantic status")
+
+
 class DeskHistoryReceipt(VersionedContract):
     decision_hash: Sha256
     decision: AgentDecision
@@ -237,7 +286,15 @@ class DeskHistoryStore:
         selected = sorted(candidates, key=lambda r: (r.decision.context.as_of, r.decision_hash))[
             -limit:
         ]
-        return tuple(self.export(r.decision_hash, as_of=as_of, **authorities) for r in selected)
+        receipts = tuple(self.export(r.decision_hash, as_of=as_of, **authorities) for r in selected)
+        for receipt in receipts:
+            verify_model_projections(
+                receipt,
+                decision_store=authorities["decision_store"],
+                evidence_store=authorities["evidence_store"],
+                require_current=True,
+            )
+        return receipts
 
     def export(
         self,
@@ -307,6 +364,9 @@ class DeskHistoryStore:
             verify_policy(observation)
         if canonical(expected) != receipt.jev_observations_json:
             raise ValueError("history Jev observation differs from authority")
+        verify_model_projections(
+            receipt, decision_store=decision_store, evidence_store=evidence_store
+        )
         inputs = json.loads(receipt.inputs_json)
         references = inputs.get("memory_receipts") or ()
         prior = []
@@ -324,6 +384,12 @@ class DeskHistoryStore:
                 or value.decision.instrument != receipt.decision.instrument
             ):
                 raise ValueError("memory receipt identity differs")
+            verify_model_projections(
+                value,
+                decision_store=decision_store,
+                evidence_store=evidence_store,
+                require_current=True,
+            )
             prior.append(value)
         projection, verified = memory_projection(prior)
         if (

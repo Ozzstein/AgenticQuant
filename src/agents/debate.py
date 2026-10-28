@@ -1,6 +1,7 @@
 """Configured challenge rounds with source-linked revised analyst reports."""
 
 from src.agents.desk import structured_report
+from src.decision.workflows import exact_citation
 from src.utils.config import get_config
 
 
@@ -19,8 +20,9 @@ class DebateManager:
         context = {
             "reports": [r.model_dump(mode="json") for r in reports.values()],
             "citation_checks": [
-                {"claim": c.claim.claim, "status": c.status, "reason": c.reason}
-                for c in state.get("citation_checks", ())
+                {"claim": c.claim.model_dump(mode="json"), "status": c.status, "reason": c.reason}
+                for check in state.get("citation_checks", ())
+                for c in (exact_citation(check.claim, state.get("sources", ()), state["context"]),)
             ],
             "prior_debate": state.get("debate_transcript", []),
         }

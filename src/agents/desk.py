@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.budget import AgentBudgetError
 from src.agents.contracts import legacy_report
 from src.agents.llm import get_llm
+from src.decision.workflows import PROJECTION_VERSION, semantic_projection
 from src.domain.decisions import AgentAction, ConfidenceSemantics, SpecialistReport
 from src.utils.config import get_config
 
@@ -88,13 +90,27 @@ def structured_report(state, role, mandate, *, llm=None, kinds=(), extra=None):
     ]
     # Only evaluated task judgments may influence synthesis. Shadow observations
     # remain separately recorded in state for evaluation and dashboards.
-    accepted = [
-        j.model_dump(mode="json")
-        for r in state.get("decision_results", ())
-        for j in r.judgments
-        if j.disposition == "accepted"
-    ]
+    accepted = []
+    try:
+        for result in state.get("decision_results", ()):
+            if not any(j.disposition == "accepted" for j in result.judgments):
+                continue
+            service = state["workflow"].service
+            accepted.extend(
+                semantic_projection(
+                    service.store,
+                    service.evidence_store,
+                    result,
+                    context=context,
+                    instrument=instrument,
+                    sources=state.get("sources", ()),
+                    as_of=datetime.now(timezone.utc),
+                )
+            )
+    except Exception:
+        return unavailable(role, "Evaluated semantic projection authority unavailable")
     payload = {
+        "judgment_projection_version": PROJECTION_VERSION,
         "instrument": instrument.model_dump(mode="json"),
         "as_of": context.as_of.isoformat(),
         "sources": evidence,
