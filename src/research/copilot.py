@@ -567,7 +567,7 @@ class ResearchCopilot:
             )
             if actual != model:
                 status = "model_mismatch"
-                raw = SimpleNamespace(usage_metadata={}, response_metadata={"model": actual})
+                # Keep original usage for accounting without pricing the wrong model.
                 raise ResearchUnavailable("Returned research model identity differs from its pin")
             known = all(
                 type(usage.get(k)) is int and 0 <= usage[k] < 2**62

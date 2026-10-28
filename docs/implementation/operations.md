@@ -774,3 +774,19 @@ All 181 root cases passed in 15.46s across `test_alpaca_venue`,
 `/tmp/quantagentlab-root-pure-native-terms.log`. Production/script Ruff and diff
 checks pass. Native/provider responses remain synthetic offline fixtures; no
 authenticated or actual LEAN acceptance is implied.
+
+### Copilot preserves rejected-model usage for accounting
+
+The copilot previously replaced an actual wrong-model response with an empty
+usage object before `AgentCallBudget.finish`, hiding valid counters from the
+upcoming durable budget repair. It now passes the original raw response through
+while still rejecting the model mismatch. The existing regression observes the
+real finish call, verifies both original counters/model/content, then delegates
+to the actual budget implementation and checks unavailable output, retained
+reservation and no retry. `SimpleNamespace` remains required elsewhere.
+
+All 56 `test_research_copilot.py` and `test_copilot_cli.py` cases passed in 29.09s
+with sockets disabled and Unix self-pipes allowed; changed-file Ruff and diff
+checks passed. Log: `/tmp/quantagentlab-root-copilot-raw-usage.log`. This caller
+repair does not claim the separate generative-budget day-fence implementation
+is already integrated; no wrong-model pricing or evaluator acceptance is added.

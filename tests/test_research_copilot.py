@@ -716,10 +716,24 @@ def test_missing_source_and_paper_ids_fail_as_typed_unavailable(research_env):
     assert paper.status == "unavailable" and not calls
 
 
-def test_wrong_model_never_reprices_at_pinned_rate_or_retries(research_env):
+def test_wrong_model_never_reprices_at_pinned_rate_or_retries(research_env, monkeypatch):
+    from src.agents.budget import AgentCallBudget
+
     env = research_env
+    received = []
+    finish = AgentCallBudget.finish
+
+    def observe_finish(self, identity, price, **kwargs):
+        received.append(kwargs["raw"])
+        return finish(self, identity, price, **kwargs)
+
+    monkeypatch.setattr(AgentCallBudget, "finish", observe_finish)
     service, calls = copilot(env, failure="model")
     assert propose(service, env).status == "unavailable"
+    assert len(received) == 1
+    assert received[0].usage_metadata == {"input_tokens": 100, "output_tokens": 100}
+    assert received[0].response_metadata == {"model": "wrong-model"}
+    assert received[0].content == "fixture provider text"
     with sqlite3.connect(env.config.agents.budget_store_path) as db:
         reserved, charged, status = db.execute(
             "SELECT reserved_cost,charged_cost,status FROM calls"
