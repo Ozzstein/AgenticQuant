@@ -756,3 +756,21 @@ generative monitoring and native completion will be integrated against that
 contract; current nonnull-counter/charged-cost aggregation is not sufficient for
 wrong-model pricing. No generative budget closure or actual spend claim is made
 until that checkpoint and its consumer tests pass.
+
+### Pure native order-term prerequisite
+
+Accounting `a0db90a` integrated as `9edfa14`. The unchanged Alpaca, Binance and
+Kraken order/intent predicates now share private pure functions in
+`execution/native_order_terms.py`. The actual report paths retain their original
+calendar, cumulative quantity, source capture and economic behavior; no adapter
+or transport is constructed by these predicates. This extraction is a prerequisite
+for independent retained-source verification, not an audit PASS or settlement API.
+
+All 181 root cases passed in 15.46s across `test_alpaca_venue`,
+`test_alpaca_day_calendar`, `test_binance_venue`, `test_kraken_venue`,
+`test_lean_day`, `test_lean_trailing`, `test_lean_execution` and
+`test_lean_binance_references`, with `--disable-socket --allow-unix-socket`,
+`PYTHONDONTWRITEBYTECODE=1` and BLAS/OMP threads set to two. Log:
+`/tmp/quantagentlab-root-pure-native-terms.log`. Production/script Ruff and diff
+checks pass. Native/provider responses remain synthetic offline fixtures; no
+authenticated or actual LEAN acceptance is implied.
