@@ -790,3 +790,41 @@ with sockets disabled and Unix self-pipes allowed; changed-file Ruff and diff
 checks passed. Log: `/tmp/quantagentlab-root-copilot-raw-usage.log`. This caller
 repair does not claim the separate generative-budget day-fence implementation
 is already integrated; no wrong-model pricing or evaluator acceptance is added.
+
+### Canonical ensemble artifact stage one
+
+Data `e136011` and `5d887c8` integrated as `15f61b3` and `1503b3a`. Stage one
+adds closed compositions, the parent/actual child and IC-selection artifacts,
+five-frame identities, a bounded ZIP_STORED primary/sidecar pair and explicit
+build/file-proof/load APIs. Loader checks all members and metadata before any
+child deserialization; joblib remains limited to application-owned bytes whose
+external hashes are authenticated by the consumer. File identity alone is not
+source, fitting or approval authority. The existing single-family serialization
+and H frame-hash convention remain compatible.
+
+The root run passed all **236 cases in 299.19s**, zero skips:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  .venv/bin/python -m pytest tests/test_canonical_ensemble.py \
+  tests/test_ensemble_temporal_policy.py tests/test_temporal_models.py \
+  tests/test_local_quant_flow.py tests/test_domain_common.py \
+  tests/test_ensemble.py tests/test_core_models.py tests/test_walk_forward.py \
+  -q --disable-socket
+```
+
+Log: `/tmp/quantagentlab-root-ensemble-artifacts.log`. This includes all 88 new
+canonical cases, actual four-family fits, retained selection models, malformed
+container/pre-deserialization rejection, frozen old serializer comparison,
+real local Qlib/Alpha158/Ridge and canonical walk-forward ledger tests. Root
+also removed one test-only first-party import separator exposed by the complete
+checkout; production/script and changed-test Ruff plus diff checks pass.
+
+Stage-two consumers are unchanged: no StrategySpec/H/ExperimentPlan composition
+admission, canonical WF two-file provenance or evaluator comparison relaxation
+has been introduced. Fresh CatBoost fits retain their actual varying native GUID
+and train-finish metadata, so their real payload hashes can differ despite equal
+local predictions. Frozen-parent reload/republication is byte-identical; fresh
+four-family byte reconstruction is not claimed. Native semantic-comparison
+design remains a separate review prerequisite. No metadata stripping, new
+source/income authority, authenticated provider or release acceptance is implied.

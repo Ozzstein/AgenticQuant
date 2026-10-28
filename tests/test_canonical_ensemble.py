@@ -474,7 +474,6 @@ def test_legacy_directory_stays_diagnostic_and_is_never_canonical(tmp_path):
 def test_no_consumer_admission_widening():
     from src.operations.contracts import ModelRecipe
     from src.research.evaluator import ExperimentPlan
-
     from src.strategies.specification import StrategySpec, baseline_specs
     assert "Ensemble" not in str(ModelRecipe.model_fields["model_name"].annotation)
     value = baseline_specs()["momentum_topk"].model_dump(mode="json")
