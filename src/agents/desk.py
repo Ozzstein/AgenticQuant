@@ -114,6 +114,7 @@ def structured_report(state, role, mandate, *, llm=None, kinds=(), extra=None):
         "instrument": instrument.model_dump(mode="json"),
         "as_of": context.as_of.isoformat(),
         "sources": evidence,
+        "source_coverage": state.get("source_coverage", {}),
         "quant_context": state.get("qlib_context", ""),
         "hmm": state["hmm_context"].model_dump(mode="json") if state.get("hmm_context") else None,
         "accepted_task_judgments": accepted,
@@ -188,12 +189,23 @@ def structured_report(state, role, mandate, *, llm=None, kinds=(), extra=None):
         if (
             report.confidence.legacy_confidence_0_100 is not None
             or report.confidence.calibrated_task_accuracy is not None
+            or any(
+                c.get("partial_ids") or c.get("omitted_ids")
+                for kinds in state.get("source_coverage", {}).values()
+                for c in kinds.values()
+            )
         ):
             report = report.model_copy(
                 update={
                     "confidence": ConfidenceSemantics(
                         analyst_conviction=report.confidence.analyst_conviction,
-                        evidence_completeness=report.confidence.evidence_completeness,
+                        evidence_completeness=None
+                        if any(
+                            c.get("partial_ids") or c.get("omitted_ids")
+                            for kinds in state.get("source_coverage", {}).values()
+                            for c in kinds.values()
+                        )
+                        else report.confidence.evidence_completeness,
                     )
                 }
             )

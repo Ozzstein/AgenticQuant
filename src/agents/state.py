@@ -17,6 +17,7 @@ class TradingDeskState(TypedDict, total=False):
     context: object
     instrument: object
     sources: tuple
+    source_coverage: dict
     hmm_context: object
     portfolio_context: object
     qlib_context: str

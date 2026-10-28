@@ -32,6 +32,12 @@ def verify_model_projections(receipt, *, decision_store, evidence_store, require
     from src.domain.decisions import CitedClaim
 
     calls = {c.call_id: c for c in receipt.calls}
+    from src.decision.evidence import validate_delivered_coverage
+
+    coverage = json.loads(getattr(receipt, "inputs_json", "{}")).get("source_coverage") or {}
+    validate_delivered_coverage(
+        coverage, receipt.sources, store=evidence_store, context=receipt.decision.context
+    )
     observed = set(receipt.decision.judgment_observation_ids)
     for generation in receipt.generations:
         messages = json.loads(generation.request_json)
@@ -40,6 +46,8 @@ def verify_model_projections(receipt, *, decision_store, evidence_store, require
             if require_current:
                 raise ValueError("legacy prompt lacks certified shadow-isolation boundary")
             continue  # Preserve legacy audit export; never silently upgrade memory eligibility.
+        if (payload.get("source_coverage") or {}) != coverage:
+            raise ValueError("model-visible source coverage differs from original input")
         entries = payload.get("accepted_task_judgments", [])
         seen = set()
         for entry in entries:
@@ -236,6 +244,7 @@ class DeskHistoryStore:
                 "macro_regime",
                 "macro_confidence",
                 "evidence_issues",
+                "source_coverage",
                 "risk_veto_reason",
             )
         }

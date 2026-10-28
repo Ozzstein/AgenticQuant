@@ -60,40 +60,29 @@ def test_exact_document_adapter(decision_source, decision_context):
 
 
 def test_role_bundle_adapter_deduplicates_and_preserves_coverage(
-    decision_source, decision_context, decision_instrument
+    tmp_path, decision_source, decision_context, decision_instrument
 ):
-    source = decision_source
-    passage = SimpleNamespace(
-        evidence=source.record,
-        text=source.text,
-        document_hash=source.document_hash,
-        start=0,
-        end=len(source.text),
-    )
+    from src.data.evidence.service import EvidenceService
+    from src.data.evidence.store import EvidenceStore
+    from src.domain.decisions import digest
 
-    class Store:
-        def document(self, *args, **kwargs):
-            return SimpleNamespace(
-                evidence=source.record, text=source.text, document_hash=source.document_hash
-            )
-
-    class EvidenceService:
-        store = Store()
-
-        def source_bundle(self, role, instrument, context):
-            return {
-                "coverage": {
-                    "transcript": SimpleNamespace(
-                        records=(SimpleNamespace(record=source.record),), status="conflicting"
-                    )
-                },
-                "passages": (passage,),
+    store = EvidenceStore(tmp_path / "source.sqlite")
+    for index, text in enumerate((decision_source.text, "Contrary transcript source.")):
+        record = decision_source.record.model_copy(
+            update={
+                "evidence_id": "transcript-" + str(index),
+                "raw_hash": digest(text),
+                "requested_as_of": decision_context.as_of,
             }
-
-    sources, coverage = load_desk_sources(EvidenceService(), decision_instrument, decision_context)
-    assert len(sources) == 1 and sources[0].kind == "transcript"
+        )
+        store.put(record, text.encode(), kind="transcript", logical_key="same-event", document=text)
+    sources, coverage = load_desk_sources(
+        EvidenceService(store), decision_instrument, decision_context
+    )
+    assert len(sources) == 2 and all(s.kind == "transcript" for s in sources)
     assert set(coverage) == {"fundamental", "sentiment", "technical", "risk", "strategist"}
-    assert all(v["transcript"].status == "conflicting" for v in coverage.values())
+    assert coverage["sentiment"]["transcript"].status == "conflicting"
+    assert coverage["strategist"]["transcript"].status == "conflicting"
 
 
 @pytest.mark.parametrize("available", [True, False])

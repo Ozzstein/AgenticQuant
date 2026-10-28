@@ -30,7 +30,7 @@ from src.core.walk_forward import frame_hash
 from src.data.evidence.service import ROLE_KINDS, EvidenceService
 from src.data.features.contextual import materialize_evidence_fields
 from src.data.features.dataset import FeatureDataset, feature_dataset
-from src.decision.evidence import source_from_passage
+from src.decision.evidence import allocate_desk_sources
 from src.decision.service import DecisionService
 from src.decision.store import DecisionStore
 from src.domain.common import RunContext
@@ -1212,51 +1212,18 @@ class PaperCycleService:
         return result
 
     def _desk_sources(self, plan, instrument):
-        allowed = set(plan.desk_evidence_ids)
-        coverage, ids, kinds = {}, set(), {}
-        for role, role_kinds in ROLE_KINDS.items():
-            coverage[role] = {}
-            for kind in role_kinds:
-                query = self.evidence.query(
-                    as_of=plan.inputs.context.as_of,
-                    kind=kind,
-                    instrument_id=instrument.instrument_id,
-                    current_revisions_only=False,
-                )
-                eligible = tuple(e for e in query.records if e.record.evidence_id in allowed)
-                coverage[role][kind] = {
-                    "status": query.status if eligible else "missing",
-                    "evidence_ids": [e.record.evidence_id for e in eligible],
-                    "excluded": list(query.excluded),
-                }
-                for item in eligible:
-                    if item.document_hash:
-                        identity = item.record.evidence_id
-                        ids.add(identity)
-                        kinds[identity] = (
-                            "transcript"
-                            if kind == "transcript"
-                            else "news"
-                            if kind in {"news", "analyst_estimates", "crypto_global"}
-                            else "technical"
-                            if kind in {"technical", "funding", "open_interest", "liquidity"}
-                            else "fundamental"
-                        )
-        passages = self.evidence.retrieve(
-            sorted(ids),
-            as_of=plan.inputs.context.as_of,
+        sources, coverage = allocate_desk_sources(
+            self.evidence,
+            instrument,
+            plan.inputs.context,
+            allowed_evidence_ids=plan.desk_evidence_ids,
             max_chars=plan.max_source_chars,
             max_passages=32,
         )
-        return tuple(
-            source_from_passage(
-                self.evidence,
-                p,
-                as_of=plan.inputs.context.as_of,
-                kind=kinds[p.evidence.evidence_id],
-            )
-            for p in passages
-        ), coverage
+        return sources, {
+            role: {kind: value.model_dump(mode="json") for kind, value in kinds.items()}
+            for role, kinds in coverage.items()
+        }
 
     def _desk(self, plan, regime, snapshot, returns, models, datasets, now, *, context=None):
         context = context or plan.inputs.context
@@ -1313,6 +1280,7 @@ class PaperCycleService:
                 instrument,
                 context,
                 sources=sources,
+                source_coverage=coverage,
                 hmm_context=hmm_context_from_result(regime),
                 portfolio_context=portfolio,
                 qlib_context=json.dumps(quantitative, sort_keys=True, allow_nan=False),

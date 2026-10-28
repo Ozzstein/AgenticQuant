@@ -66,6 +66,14 @@ def build_trading_desk_graph(
         # Explicit input contracts; never fabricate a security identity/current date.
         if state.get("context") is None or state.get("instrument") is None:
             raise ValueError("graph requires common.RunContext and common.Instrument")
+        from src.decision.evidence import validate_delivered_coverage
+
+        validate_delivered_coverage(
+            state.get("source_coverage", {}),
+            state.get("sources", ()),
+            store=evidence_store,
+            context=state["context"],
+        )
         return {
             "decision_deadline": time.monotonic()
             + getattr(config.agents, "analysis_timeout_seconds", 180),
@@ -253,6 +261,7 @@ def analyze_instrument(
     context,
     *,
     sources,
+    source_coverage=None,
     hmm_context=None,
     portfolio_context=None,
     qlib_context="",
@@ -276,6 +285,12 @@ def analyze_instrument(
         "instrument": instrument,
         "context": context,
         "sources": tuple(sources),
+        "source_coverage": source_coverage or {},
+        "new_exposure_blocked": any(
+            c.get("omitted_ids")
+            for kinds in (source_coverage or {}).values()
+            for c in kinds.values()
+        ),
         "hmm_context": hmm_context,
         "portfolio_context": portfolio_context,
         "ticker": instrument.symbol,
