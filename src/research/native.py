@@ -107,6 +107,7 @@ def _gateway_accounting(request, receipt, now):
             or set(value) != {'schema_version','policy','run_id','as_of','day_id','run','day'}
             or value['schema_version'] != '2.0' or value['policy'] != 'reservation-floor-2'
             or value['run_id'] != request.run_id
+            or not isinstance(value['as_of'],str) or not isinstance(value['day_id'],str)
             or receipt.get('cost_semantics') != 'verified_usage_with_reservation_floor'):
         raise ValueError('verified v2 gateway accounting required')
     at = datetime.fromisoformat(value['as_of'].replace('Z','+00:00'))

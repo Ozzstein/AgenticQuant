@@ -879,3 +879,40 @@ no runtime authority, deadline or provider-usage check was relaxed. Production
 and changed-test Ruff plus diff checks pass. These overlapping counts are not a
 whole-suite green result. No authenticated provider, Docker, financial efficacy,
 positive income-source or release acceptance is implied.
+
+A final public receipt re-export check now retains the verified `statuses`
+projection, so the bounded archived v2 receipt itself passes the same verifier.
+Malformed non-text audit clocks are rejected explicitly. All **22 actual
+consumer tests passed in 4.12s** (`test_generative_usage_consumers.py`, same
+offline environment); log `/tmp/quantagentlab-root-generative-reexport.log`.
+
+### Native retained-source compliance: read-only phase one integrated
+
+Accounting `45c143a`/`dc119ba` integrated as `8a0e17e`/`0b0b1cb`.
+Pure retained Alpaca/Binance/Kraken/LEAN exporters preserve first observation
+versus first complete execution authority and reject unsupported valuation
+closure or source revisions. The public canonical `execution_compliance` reader
+has no historical `as_of` escape hatch and does not trust mutable report/applied
+flags or the presence/absence of discrepancy indexes. Detection only appends
+immutable metadata; no settlement or expiry exception is reachable.
+
+Root source/audit/venue/durable/publication/historical-sleeve verification passed
+**113 tests in 18.22s**, zero skips, log
+`/tmp/quantagentlab-root-execution-authority.log`. Strict no-file-mutation tests
+use closed DELETE-journal archives; live WAL read consistency is preserved,
+including SQLite's possible coordination-file creation. No `immutable=1`
+shortcut is used to claim live authority.
+
+Accounting validation `555a61f` integrated as `2ebf571`. Its separate required
+compliance check applies even to accounting-only artifact validation; arithmetic
+reconciliation cannot clear an execution violation. Root validation/artifact/
+benchmark/callback verification passed **24 tests in 281.13s**, and actual
+registered model/advice experiments passed **10 tests in 293.93s**. Logs:
+`/tmp/quantagentlab-root-compliance-validation.log` and
+`/tmp/quantagentlab-root-compliance-registered.log`. All runs disabled TCP and
+allowed Unix event-loop self-pipes only. These results precede the next registry
+locator/ancestor gate changes, which remain separately under implementation.
+
+Data's source-pinned CatBoost comparator feasibility note `192920a` integrated
+as `9b8df4e` is documentation only. No comparator/parser, model-byte rewriting,
+consumer widening or exact-evaluator relaxation has been implemented.

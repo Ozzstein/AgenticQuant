@@ -94,7 +94,7 @@ def test_another_run_day_breach_blocks_known_native_run(cfg):
 
 @pytest.mark.parametrize('fault', [
     'missing-v2', 'policy', 'run', 'future', 'other-day', 'stale-final', 'bool-count',
-    'nan', 'false-exact', 'old-public', 'status-bool', 'empty-with-cost', 'day-count',
+    'nan', 'false-exact', 'old-public', 'status-bool', 'empty-with-cost', 'day-count', 'clock-type',
 ])
 def test_native_refuses_non_authoritative_or_inconsistent_scope(fault):
     req, now = request(), datetime.now(UTC)
@@ -108,6 +108,8 @@ def test_native_refuses_non_authoritative_or_inconsistent_scope(fault):
         a['run_id'] = 'another'
     elif fault == 'future':
         a['as_of'] = (now+timedelta(seconds=1)).isoformat()
+    elif fault == 'clock-type':
+        a['as_of'] = False
     elif fault == 'other-day':
         a['day_id'] = (now-timedelta(days=1)).date().isoformat()
     elif fault == 'stale-final':
@@ -157,5 +159,6 @@ def test_public_scope_copy_cannot_be_changed_after_verification():
     r = receipt(req, now)
     saved = _budget_receipt(req, r, now)
     original = copy.deepcopy(saved)
+    assert _budget_receipt(req, saved, now) == saved
     r['accounting']['run']['conservative_cost_usd'] = '999'
     assert saved == original

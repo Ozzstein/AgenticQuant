@@ -559,6 +559,7 @@ def _budget_receipt(request, raw, now, *, not_before=None):
         for scope in ("chat", "embedding")
     }
     value['accounting'] = accounting
+    value['statuses'] = dict(accounting['run']['statuses'])
     value['cost_semantics'] = raw['cost_semantics']
     counters = {
         "charged": ("requests", "tokens", "cost_usd"),
