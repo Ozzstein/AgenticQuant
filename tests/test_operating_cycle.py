@@ -10,9 +10,12 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+
+from src.core.strategy_tracker import AttributedPerformanceStore
 from src.data.calendars import sessions
 from src.data.evidence.store import EvidenceStore, canonical_bytes, digest
 from src.data.features.contextual import NumericEvidenceBinding
+from src.domain.common import EvidenceRecord, Instrument, RunContext
 from src.domain.market import MarketBar, MarketSnapshot
 from src.domain.portfolio import (
     AccountSpec,
@@ -24,6 +27,15 @@ from src.domain.portfolio import (
 )
 from src.execution.ledger import PortfolioLedger
 from src.execution.venue import VenueRules
+from src.operations.contracts import (
+    AllocationPolicy,
+    MacroRecipe,
+    ModelRecipe,
+    ObservedOpenReceipt,
+    PaperCycleInputs,
+    PaperCyclePlan,
+)
+from src.operations.cycle import PaperCycleService, cycle_config_hash, training_frame_hash
 from src.operations.store import OperationsStore
 from src.research.evidence import BoundArtifact, SourceBinding, expected_artifacts
 from src.research.regime_experiments import (
@@ -34,18 +46,6 @@ from src.research.regime_experiments import (
 )
 from src.research.registry import ResearchRegistry
 from src.strategies.specification import baseline_specs
-
-from src.core.strategy_tracker import AttributedPerformanceStore
-from src.domain.common import EvidenceRecord, Instrument, RunContext
-from src.operations.contracts import (
-    AllocationPolicy,
-    MacroRecipe,
-    ModelRecipe,
-    ObservedOpenReceipt,
-    PaperCycleInputs,
-    PaperCyclePlan,
-)
-from src.operations.cycle import PaperCycleService, cycle_config_hash, training_frame_hash
 from src.utils.config import AppConfig, ModelPricing
 from tests.test_agent_desk_invariants import GenerativeFixture, jev_service
 
@@ -972,11 +972,10 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
     from datetime import datetime
 
     from src.data.evidence.service import EvidenceService
-    from src.operations.refresh import FetchTask, RefreshPlan, RefreshService
-    from src.research.evidence import verify_provenance
-
     from src.operations import refresh
     from src.operations.contracts import PaperCycleTemplate
+    from src.operations.refresh import FetchTask, RefreshPlan, RefreshService
+    from src.research.evidence import verify_provenance
 
     plan = runtime.plan()
     service, store = runtime.service, runtime.archive.store
@@ -1127,10 +1126,9 @@ def test_prepare_uses_completed_refresh_and_exact_late_receipt_sources(runtime, 
 def funded_performance(runtime, completed, tmp_path_factory):
     import copy
 
+    from src.core.macro_regime import CausalRegimeResult
     from src.domain.portfolio import Fill, OrderIntent, PriceMark
     from src.execution.sleeves import SleeveBook
-
-    from src.core.macro_regime import CausalRegimeResult
 
     plan, _ = completed
     path = tmp_path_factory.mktemp("real-funded-performance")
@@ -1232,10 +1230,9 @@ def test_unobserved_performance_does_not_enable_weighting_or_bandit_exploitation
 ):
     import copy
 
+    from src.core.macro_regime import CausalRegimeResult
     from src.domain.portfolio import PortfolioSnapshot
     from src.execution.sleeves import SleeveBook
-
-    from src.core.macro_regime import CausalRegimeResult
 
     plan, _ = completed
     service = copy.copy(runtime.service)
@@ -1535,6 +1532,215 @@ def test_open_only_close_mark_expires_remaining_order_without_completed_executio
         assert not ledger.db.execute(
             "SELECT 1 FROM events WHERE id LIKE 'close:%' OR id LIKE 'open:%'"
         ).fetchone()
+        assert ledger.reconcile(account.account_id)["reconciled"]
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("already_published_close", [False, True])
+def test_crypto_same_clock_close_and_next_open_publish_after_batch(
+    tmp_path, already_published_close
+):
+    """Actual native proof/settlement and sleeve publication, outside income admission."""
+    from src.domain.portfolio import Fill, OrderIntent, PriceMark
+    from src.execution.ledger import LedgerError
+    from src.execution.sleeves import SleeveBook
+    from src.execution.venue import PaperVenue, VenueExecution
+    from src.research.evidence import verify_market_snapshot
+
+    at = pd.Timestamp("2026-10-09T00:00:00Z").to_pydatetime()
+    instrument = Instrument(
+        instrument_id="spot:BTC",
+        symbol="BTC/USD",
+        asset_class="crypto",
+        quote_currency="USD",
+        venue="kraken",
+    )
+    account = AccountSpec(
+        account_id="paper:midnight",
+        mode="paper",
+        base_currency="USD",
+        initial_cash=10000,
+        opened_at=at - timedelta(hours=2),
+    )
+    ledger = PortfolioLedger(tmp_path / "midnight.sqlite")
+    ledger.create_account(account)
+    book = SleeveBook(ledger, account.account_id).initialize({"owned": D(10000)})
+    original = OrderIntent(
+        intent_id="prior-holding",
+        account_id=account.account_id,
+        run_id="prior",
+        instrument=instrument,
+        side="buy",
+        quantity=1,
+        reference_price=100,
+        decision_at=account.opened_at,
+        eligible_at=account.opened_at + timedelta(seconds=1),
+        strategy_id="owned",
+    )
+    book.register_intent(original, {"owned": D(1)}, source_hash="a" * 64, quantity_quantum=D(1))
+    ledger.submit(original)
+    ledger.apply_fill(
+        Fill(
+            fill_id="prior-fill",
+            intent_id=original.intent_id,
+            account_id=account.account_id,
+            quantity=1,
+            price=100,
+            fee=0,
+            executed_at=original.eligible_at,
+            event_id="prior-real-test-print",
+        )
+    )
+    ledger.mark(
+        account.account_id,
+        [PriceMark(instrument=instrument, price=100, as_of=original.eligible_at)],
+    )
+    admitted = at - timedelta(hours=1)
+    order = original.model_copy(
+        update={
+            "intent_id": "next-midnight",
+            "run_id": "midnight",
+            "quantity": D(2),
+            "reference_price": D(91),
+            "decision_at": admitted,
+            "eligible_at": admitted + timedelta(seconds=1),
+        }
+    )
+    book.register_intent(order, {"owned": D(2)}, source_hash="b" * 64, quantity_quantum=D(1))
+    rules = VenueRules(
+        venue="paper",
+        instrument=instrument,
+        symbol=instrument.symbol,
+        available_at=account.opened_at,
+        quantity_step=1,
+        price_tick=".01",
+        minimum_quantity=1,
+        minimum_notional=1,
+        market_type="spot",
+        active=True,
+    )
+    costs = FillPolicy(crypto_cost_bps=0, slippage_bps=0, opening_participation=1)
+    venue = PaperVenue(
+        ledger, account.account_id, {instrument.instrument_id: rules}, fill_policy=costs
+    )
+    execution = VenueExecution(
+        ledger,
+        account.account_id,
+        {"paper": venue},
+        {instrument.instrument_id: "paper"},
+        owner="direct",
+        fill_policy=costs,
+    )
+    metadata = InstrumentRisk(
+        instrument=instrument, sector="crypto", adv_base=100000000, as_of=admitted, lot_size=1
+    )
+    execution.prepare(order, {instrument.instrument_id: metadata}, as_of=admitted)
+    assert execution.dispatch(order.intent_id, as_of=order.eligible_at)["state"] == "new"
+    context = RunContext(
+        run_id="midnight",
+        mode="paper",
+        as_of=at + timedelta(seconds=20),
+        account_id=account.account_id,
+        config_hash="c" * 64,
+        code_version="test-midnight",
+    )
+    evidence = EvidenceStore(tmp_path / "sources.sqlite")
+    close = MarketBar(
+        instrument=instrument,
+        opened_at=at - timedelta(days=1),
+        closed_at=at,
+        open=100,
+        high=100,
+        low=90,
+        close=90,
+        volume=1000,
+        evidence_id="actual-completed-crypto-close",
+        price_basis="raw",
+        market_type="spot",
+        calendar="24/7",
+        session="2026-10-08",
+    )
+    source = put(
+        evidence,
+        close.evidence_id,
+        close.model_dump(mode="json", exclude={"evidence_id"}),
+        context.as_of,
+        kind="bar",
+        instrument_ids=(instrument.instrument_id,),
+    )
+    verify_market_snapshot(
+        evidence, MarketSnapshot(context=context, bars=(close,), evidence=(source.record,))
+    )
+    event = OpeningEvent(
+        event_id="wire-will-pin",
+        instrument=instrument,
+        price=91,
+        opening_volume=10,
+        opened_at=at,
+        calendar="24/7",
+        calendar_version="UTC-paper-test-1",
+        session=at.date(),
+        session_open=at,
+        session_close=at + timedelta(days=1),
+    )
+    events, receipts = capture_openings(evidence, (event,), context)
+    event = events[0]
+    plan = SimpleNamespace(
+        inputs=SimpleNamespace(account=account, context=context, receipts=receipts)
+    )
+    service = object.__new__(PaperCycleService)
+    service.ledger, service.evidence = ledger, evidence
+    service.attribution = AttributedPerformanceStore(tmp_path / "attribution.sqlite")
+    opening = book.snapshot(order.eligible_at)
+    service._funded_anchor("owned", opening["owned"], order.eligible_at)
+    try:
+        if already_published_close:
+            published = service._observe(
+                plan, book, venue, execution, opening, [("market_close", close)], at
+            )
+            assert D(published["anchor"]["owned"]["portfolio"]["nav"]) == 9990
+            # A completed cycle's attribution stage publishes the canonical
+            # account snapshot in addition to the full sleeve observation.
+            canonical_close = ledger.snapshot(account.account_id, at, 86400)
+            with pytest.raises(LedgerError, match="published|committed"):
+                service._observe(
+                    plan, book, venue, execution, opening, [("opening_event", event)], at
+                )
+            assert ledger.quantity(account.account_id, instrument.instrument_id) == 1
+            assert len(ledger.fills(account.account_id)) == 1
+            assert ledger.snapshot(account.account_id, at, 86400) == canonical_close
+            assert venue.observed_open_receipt(event.event_id) is None
+        else:
+            # Intentionally reverse caller order: H must close then open, and
+            # publish only once after the complete same-clock economic batch.
+            result = service._observe(
+                plan,
+                book,
+                venue,
+                execution,
+                opening,
+                [("opening_event", event), ("market_close", close)],
+                at,
+            )
+            assert D(result["anchor"]["owned"]["portfolio"]["nav"]) == 9991
+            assert ledger.quantity(account.account_id, instrument.instrument_id) == 3
+            fills = ledger.fills(account.account_id)
+            assert len(fills) == 2 and fills[-1].executed_at == at and fills[-1].price == 91
+            assert venue.observed_open_receipt(event.event_id).observed_at == context.as_of
+            assert (
+                service._observe(
+                    plan,
+                    book,
+                    venue,
+                    execution,
+                    opening,
+                    [("market_close", close), ("opening_event", event)],
+                    at,
+                )
+                == result
+            )
+            assert len(ledger.fills(account.account_id)) == 2
         assert ledger.reconcile(account.account_id)["reconciled"]
     finally:
         ledger.close()
@@ -1877,7 +2083,6 @@ def income_runtime(tmp_path):
 
 def test_income_cycle_uses_pre_ex_ownership_and_original_payment_clocks(income_runtime):
     from src.domain.portfolio import CorporateAction
-
     from src.operations.cycle import _sleeves
 
     r = income_runtime
@@ -2035,6 +2240,7 @@ def test_native_income_gaps_block_cycle_before_economic_or_provider_admission(
     runtime, account_capture
 ):
     import httpx
+
     from src.data.adapters.base import ReadHTTP
     from src.data.adapters.dividends import (
         DATA,
@@ -2043,7 +2249,6 @@ def test_native_income_gaps_block_cycle_before_economic_or_provider_admission(
         verify_operating_dividend_capture,
     )
     from src.domain.portfolio import ActionCoverage
-
     from src.operations.contracts import INCOME_FIELDS
 
     plan = runtime.plan(run_id="native-income-gap-" + str(account_capture))
