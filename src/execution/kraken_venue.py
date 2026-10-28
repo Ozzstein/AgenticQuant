@@ -431,34 +431,9 @@ class KrakenVenue(CCXTSpotVenue):
         self, intent, client_id, order_id, order, observed, references, *, report_client_id=None
     ):
         market, description = self._market(intent.instrument), order["descr"]
-        if (
-            order.get("cl_ord_id") != client_id
-            or description.get("pair") not in (market.native_id, market.symbol)
-            or description.get("type") != intent.side
-            or description.get("ordertype") != order_type(intent)
-            or description.get("leverage") != "none"
-            or description.get("close") not in (None, "")
-            or decimal(order["vol"]) != intent.quantity
-            or decimal(order.get("expiretm", 0))
-        ):
-            raise LedgerError("native Kraken order differs from exact spot intent")
-        if set(filter(None, order.get("oflags", "").split(","))) - {"fciq", "fcib"}:
-            raise LedgerError("unexpected native Kraken order flags")
-        if intent.order_type == "trailing_stop":
-            require_trailing_price(intent, description.get("price"))
-            if order.get("trigger") != "last":
-                raise LedgerError(
-                    "native Kraken trailing trigger requires the original last-price basis"
-                )
-            for key in ("stopprice", "limitprice"):
-                if key in order and decimal(order[key]) < 0:
-                    raise LedgerError("native Kraken trailing observation is negative")
-            if description.get("price2") is not None and decimal(description["price2"]):
-                raise LedgerError("native Kraken market trailing order cannot have a limit price")
-        elif intent.order_type != "market" and decimal(description["price"]) != (
-            intent.limit_price if intent.order_type == "limit" else intent.stop_price
-        ):
-            raise LedgerError("native Kraken order price differs")
+        from src.execution.native_order_terms import require_kraken_order
+
+        require_kraken_order(intent, client_id, order, market)
         cumulative = decimal(order["vol_exec"])
         ids = order.get("trades", [])
         if (

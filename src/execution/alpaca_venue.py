@@ -521,33 +521,11 @@ class AlpacaVenue:
         from src.execution.alpaca_calendar import read as read_day
 
         read_day(self, intent)
-        if (
-            not order.get("id")
-            or order.get("extended_hours") is not False
-            or order.get("order_class") not in ("", "simple")
-            or order.get("client_order_id") != client_order_id
-            or order.get("symbol") != self._rules[intent.instrument.instrument_id].symbol
-            or order.get("side") != intent.side
-            or _decimal(order.get("qty")) != intent.quantity
-            or order.get("type") != intent.order_type
-            or order.get("time_in_force", "").upper() != intent.tif
-        ):
-            raise LedgerError("remote acknowledgement differs from exact intended order")
-        price_keys = (
-            ("limit_price", "trail_price", "trail_percent")
-            if intent.order_type == "trailing_stop"
-            else ("limit_price", "stop_price", "trail_price", "trail_percent")
+        from src.execution.native_order_terms import require_alpaca_order
+
+        require_alpaca_order(
+            intent, client_order_id, order, self._rules[intent.instrument.instrument_id].symbol
         )
-        for key in price_keys:
-            actual = order.get(key)
-            if (None if actual is None else _decimal(actual)) != getattr(intent, key):
-                raise LedgerError("remote acknowledgement price differs from intended order")
-        if intent.order_type == "trailing_stop":
-            # These are native observations, not caller-supplied fixed stop prices.
-            # Retain exact wire values; never generate fills from a HWM/threshold.
-            for key in ("hwm", "stop_price"):
-                if order.get(key) is not None and _decimal(order[key]) <= 0:
-                    raise LedgerError("native trailing observation must be positive or null")
         cumulative = _decimal(order["filled_qty"])
         fills = []
         if cumulative:

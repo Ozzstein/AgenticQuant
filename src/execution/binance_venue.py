@@ -457,28 +457,9 @@ class BinanceVenue(CCXTSpotVenue):
     def _report(self, intent, client_order_id, order, observed, references):
         market = self._market(intent.instrument)
         order_id = native_integer(order.get("orderId"))
-        if (
-            order.get("symbol") != market.symbol
-            or order.get("clientOrderId") != client_order_id
-            or order.get("side") != intent.side.upper()
-            or order.get("type") != order_type(intent)
-            or decimal(order["origQty"]) != intent.quantity
-            or order.get("orderListId", -1) != -1
-        ):
-            raise LedgerError("native Binance order differs from exact submitted intent")
-        if (
-            order.get("timeInForce") != intent.tif
-            or (intent.order_type == "limit" and decimal(order["price"]) != intent.limit_price)
-            or (intent.order_type == "stop" and decimal(order["stopPrice"]) != intent.stop_price)
-        ):
-            raise LedgerError("native Binance order price/time-in-force differs")
-        if intent.order_type == "trailing_stop":
-            if native_integer(order.get("trailingDelta")) != trailing_delta(intent):
-                raise LedgerError("native Binance trailing delta differs from original intent")
-            if decimal(order.get("stopPrice", "0")) < 0:
-                raise LedgerError("native Binance trailing stop observation is negative")
-        elif order.get("trailingDelta") is not None:
-            raise LedgerError("native Binance order unexpectedly has trailing terms")
+        from src.execution.native_order_terms import require_binance_order
+
+        require_binance_order(intent, client_order_id, order, market)
         cumulative = decimal(order["executedQty"])
         fills, seen = [], set()
         if cumulative:
