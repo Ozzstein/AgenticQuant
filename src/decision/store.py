@@ -13,6 +13,13 @@ from pathlib import Path
 from src.domain.decisions import DecisionRequest, DecisionResult
 
 
+def _evaluation_types():
+    from src.decision.evaluation import EVALUATION_TYPES
+    from src.decision.experiments import EXPERIMENT_TYPES
+
+    return {**EVALUATION_TYPES, **EXPERIMENT_TYPES}
+
+
 class DecisionStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -47,6 +54,14 @@ class DecisionStore:
                     ON evaluation_artifacts BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
                 CREATE TRIGGER IF NOT EXISTS evaluation_immutable_delete BEFORE DELETE
                     ON evaluation_artifacts BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
+                CREATE TABLE IF NOT EXISTS evaluation_runs (
+                    run_id TEXT PRIMARY KEY, manifest_hash TEXT UNIQUE NOT NULL,
+                    frozen_id TEXT UNIQUE NOT NULL);
+                CREATE TABLE IF NOT EXISTS evaluation_dispatches (
+                    cache_key TEXT PRIMARY KEY, artifact_id TEXT UNIQUE NOT NULL,
+                    observation_id TEXT UNIQUE NOT NULL);
+                CREATE TABLE IF NOT EXISTS evaluation_dispatch_starts (
+                    artifact_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(reservations)")}
             for name, kind in (("observation_id", "TEXT"), ("attempt", "INTEGER")):
@@ -56,16 +71,23 @@ class DecisionStore:
                 db.execute(
                     f"CREATE TRIGGER IF NOT EXISTS reservation_{action.lower()} BEFORE {action} ON reservations BEGIN SELECT RAISE(ABORT, 'immutable reservation'); END"
                 )
+                for table in (
+                    "evaluation_runs",
+                    "evaluation_dispatches",
+                    "evaluation_dispatch_starts",
+                ):
+                    db.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {table}_{action.lower()} BEFORE {action} "
+                        f"ON {table} BEGIN SELECT RAISE(ABORT, 'immutable evaluation admission'); END"
+                    )
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
 
     def _append_evaluation(self, value):
         """Owned EvaluationService write boundary; never a supplied pass flag."""
-        from src.decision.evaluation import EVALUATION_TYPES
-
         kind = type(value).__name__
-        if EVALUATION_TYPES.get(kind) is not type(value):
+        if _evaluation_types().get(kind) is not type(value):
             raise ValueError("unknown evaluation contract")
         value = type(value).model_validate(value.model_dump())
         with self.connect() as db:
@@ -77,9 +99,7 @@ class DecisionStore:
 
     def evaluation_artifact(self, identity, expected_type):
         """Read an immutable typed record; semantic proof is resolved by service."""
-        from src.decision.evaluation import EVALUATION_TYPES
-
-        if EVALUATION_TYPES.get(expected_type.__name__) is not expected_type:
+        if _evaluation_types().get(expected_type.__name__) is not expected_type:
             raise ValueError("unknown evaluation contract")
         with self.connect() as db:
             row = db.execute(
@@ -91,6 +111,209 @@ class DecisionStore:
         if value.content_hash() != identity:
             raise ValueError("evaluation record hash differs")
         return value
+
+    def experiment_for_manifest(self, manifest_hash):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT frozen_id FROM evaluation_runs WHERE manifest_hash=?", (manifest_hash,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def evaluation_cohort_role(self, cohort_id):
+        """Admitted experiment role, if this cohort belongs to a manifest."""
+        from src.decision.experiments import FrozenExperiment
+
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT r.frozen_id FROM evaluation_runs r "
+                "JOIN evaluation_artifacts a ON a.identity=r.frozen_id "
+                "JOIN json_each(a.payload, '$.cohort_ids') c "
+                "WHERE json_extract(c.value, '$[1]')=?",
+                (cohort_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("cohort is bound to multiple experiment admissions")
+        if not rows:
+            return None
+        frozen = self.evaluation_artifact(rows[0][0], FrozenExperiment)
+        names = [name for name, identity in frozen.cohort_ids if identity == cohort_id]
+        matches = [c.role for c in frozen.manifest.cohorts if c.name in names]
+        if len(matches) != 1:
+            raise ValueError("cohort role differs from frozen experiment")
+        return matches[0]
+
+    def freeze_experiment(self, frozen, cohorts):
+        """Atomically admit all frozen cohorts and their single shared budget run."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM reservations WHERE run_id=?", (frozen.manifest.run_id,)
+            ).fetchone():
+                raise ValueError("experiment run already has usage or uncertain reservations")
+            for cohort in cohorts:
+                for case in cohort.cases:
+                    if (
+                        db.execute(
+                            "SELECT 1 FROM observations WHERE cache_key=?",
+                            (case.request.cache_key(),),
+                        ).fetchone()
+                        or db.execute(
+                            "SELECT 1 FROM evaluation_dispatches WHERE cache_key=?",
+                            (case.request.cache_key(),),
+                        ).fetchone()
+                    ):
+                        raise ValueError(
+                            "case was already observed or admitted before experiment freeze"
+                        )
+            try:
+                db.execute(
+                    "INSERT INTO evaluation_runs VALUES(?,?,?)",
+                    (
+                        frozen.manifest.run_id,
+                        frozen.manifest.content_hash(),
+                        frozen.content_hash(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("experiment run or manifest already admitted") from exc
+            for value in (*cohorts, frozen):
+                db.execute(
+                    "INSERT OR IGNORE INTO evaluation_artifacts VALUES(?,?,?)",
+                    (
+                        value.content_hash(),
+                        type(value).__name__,
+                        value.model_dump_json(),
+                    ),
+                )
+
+    def evaluation_dispatch_for(self, key):
+        from src.decision.experiments import EvaluationDispatch
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT artifact_id,observation_id FROM evaluation_dispatches WHERE cache_key=?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = self.evaluation_artifact(row[0], EvaluationDispatch)
+        if value.cache_key != key or value.observation_id != row[1]:
+            raise ValueError("evaluation dispatch index differs from immutable record")
+        return value
+
+    def claim_evaluation_dispatch(self, claim):
+        from src.decision.experiments import EvaluationDispatch
+
+        claim = EvaluationDispatch.model_validate(claim.model_dump())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM observations WHERE cache_key=?", (claim.cache_key,)
+            ).fetchone():
+                raise ValueError("case already observed outside this experiment dispatch")
+            try:
+                db.execute(
+                    "INSERT INTO evaluation_dispatches VALUES(?,?,?)",
+                    (
+                        claim.cache_key,
+                        claim.content_hash(),
+                        claim.observation_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("case already claimed; ambiguous calls cannot be retried") from exc
+            db.execute(
+                "INSERT INTO evaluation_artifacts VALUES(?,?,?)",
+                (
+                    claim.content_hash(),
+                    type(claim).__name__,
+                    claim.model_dump_json(),
+                ),
+            )
+
+    def start_evaluation_dispatch(self, identity, request):
+        """Consume an existing pre-dispatch intent once, before any network call."""
+        from datetime import datetime, timezone
+
+        from src.decision.experiments import EvaluationDispatch, FrozenExperiment
+
+        claim = self.evaluation_artifact(identity, EvaluationDispatch)
+        frozen = self.evaluation_artifact(claim.experiment_hash, FrozenExperiment)
+        cohort_ids = dict(frozen.cohort_ids)
+        matches = [
+            case
+            for spec in frozen.manifest.cohorts
+            if cohort_ids.get(spec.name) == claim.cohort_id
+            for case in spec.cases
+            if case.case_id == claim.case_id and case.request == request
+        ]
+        if (
+            len(matches) != 1
+            or claim.request_hash != request.content_hash()
+            or claim.cache_key != request.cache_key()
+            or self.evaluation_dispatch_for(claim.cache_key) != claim
+            or not frozen.recorded_at
+            <= claim.recorded_at
+            <= datetime.now(timezone.utc)
+            < frozen.deadline_at
+        ):
+            raise ValueError("invalid or expired authoritative case dispatch")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "INSERT INTO evaluation_dispatch_starts VALUES(?,?)",
+                    (identity, datetime.now(timezone.utc).isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    "case dispatch already started; cannot repeat an ambiguous call"
+                ) from exc
+        return claim.observation_id, (
+            frozen.deadline_at - datetime.now(timezone.utc)
+        ).total_seconds()
+
+    def evaluation_dispatch_usage(self, claim, *, at):
+        with self.connect() as db:
+            db.row_factory = sqlite3.Row
+            reservations = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM reservations WHERE observation_id=? AND at<=? ORDER BY attempt",
+                    (claim.observation_id, at.timestamp()),
+                )
+            ]
+            # Attempts are append-only and have no wall-clock column. A report
+            # of an interrupted call conservatively includes all known attempts;
+            # a later write changes the proof and invalidates that old report.
+            attempts = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM attempts WHERE observation_id=? ORDER BY attempt",
+                    (claim.observation_id,),
+                )
+            ]
+        return attempts, reservations
+
+    def evaluation_run_reservations(self, run_id, *, at):
+        with self.connect() as db:
+            db.row_factory = sqlite3.Row
+            return [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM reservations WHERE run_id=? AND at<=? ORDER BY seq",
+                    (run_id, at.timestamp()),
+                )
+            ]
+
+    def evaluation_dispatch_started_at(self, identity):
+        from datetime import datetime
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT started_at FROM evaluation_dispatch_starts WHERE artifact_id=?", (identity,)
+            ).fetchone()
+        return datetime.fromisoformat(row[0]) if row else None
 
     def append(self, request: DecisionRequest, result: DecisionResult):
         with self.connect() as db:
@@ -135,6 +358,36 @@ class DecisionStore:
         """Atomic reservation; rate delay returned before consuming a request."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            admitted = db.execute(
+                "SELECT frozen_id FROM evaluation_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if admitted:
+                from src.decision.experiments import FrozenExperiment
+
+                frozen = self.evaluation_artifact(admitted[0], FrozenExperiment)
+                if (
+                    limits != frozen.manifest.budget.limits()
+                    or now >= frozen.deadline_at.timestamp()
+                ):
+                    return False, "frozen experiment limits or deadline differ", 0
+                claim_row = db.execute(
+                    "SELECT artifact_id FROM evaluation_dispatches WHERE observation_id=?",
+                    (observation_id,),
+                ).fetchone()
+                if (
+                    claim_row is None
+                    or db.execute(
+                        "SELECT 1 FROM evaluation_dispatch_starts WHERE artifact_id=?",
+                        (claim_row[0],),
+                    ).fetchone()
+                    is None
+                ):
+                    return False, "experiment usage lacks exact one-time dispatch admission", 0
+                from src.decision.experiments import EvaluationDispatch
+
+                claim = self.evaluation_artifact(claim_row[0], EvaluationDispatch)
+                if claim.experiment_hash != frozen.content_hash():
+                    return False, "experiment usage belongs to a different admission", 0
             for column, value, requests, max_tokens, max_cost in (
                 ("run_id", run_id, limits.run_requests, limits.run_tokens, limits.run_spend_usd),
                 ("day", day, limits.day_requests, limits.day_tokens, limits.day_spend_usd),

@@ -10,6 +10,11 @@ from src.domain.decisions import DecisionRequest, DecisionStatus
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "evaluate":
+        from src.decision.evaluation_cli import main as evaluation_main
+
+        return evaluation_main(argv[1:])
     parser = argparse.ArgumentParser(description="Typed Jev judgment, with immutable replay")
     parser.add_argument("request", type=Path)
     parser.add_argument("--store", type=Path, required=True)

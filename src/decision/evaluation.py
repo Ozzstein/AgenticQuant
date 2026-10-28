@@ -329,6 +329,8 @@ class EvaluationService:
             if (
                 case.label_source.record.evidence_id
                 in {s.record.evidence_id for s in request.sources}
+                or case.label_source.document_hash in {s.document_hash for s in request.sources}
+                or case.label_source.record.raw_hash in {s.record.raw_hash for s in request.sources}
                 or json.loads(case.label_source.text) != case.annotation()
             ):
                 raise ValueError("gold annotation must be exact independent archived label data")
@@ -474,6 +476,10 @@ class EvaluationService:
         questions = []
         for identity in publication.evaluation_ids:
             receipt = self.store.evaluation_artifact(identity, EvaluationReceipt)
+            if self.store.evaluation_cohort_role(receipt.cohort_id) in ("selection", "calibration"):
+                raise ValueError(
+                    "selection/calibration cohorts cannot authorize policy publication"
+                )
             cohort, report = self._receipt(receipt)
             if (
                 not report["passed"]

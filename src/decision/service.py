@@ -175,6 +175,7 @@ class DecisionService:
         timeout_seconds: float = 30,
         mode: Literal["cache", "refresh", "replay"] = "cache",
         observation_id: str | None = None,
+        _evaluation_dispatch_id: str | None = None,
     ) -> DecisionResult:
         if mode not in ("cache", "refresh", "replay"):
             raise ValueError("invalid observation mode")
@@ -184,7 +185,15 @@ class DecisionService:
             raise ValueError("observation_id is only meaningful in recorded replay")
         started, clock = datetime.now(timezone.utc), time.monotonic()
         deadline = clock + timeout_seconds
-        identity = str(uuid4())
+        if _evaluation_dispatch_id is not None:
+            if mode != "refresh" or observation_id is not None:
+                raise ValueError("evaluation dispatch requires a fresh exact observation")
+            identity, experiment_remaining = self.store.start_evaluation_dispatch(
+                _evaluation_dispatch_id, request
+            )
+            deadline = min(deadline, time.monotonic() + max(0, experiment_remaining))
+        else:
+            identity = str(uuid4())
         attempts, raw, actual, input_tokens, output_tokens = 0, None, None, None, None
         evaluated = False
 
