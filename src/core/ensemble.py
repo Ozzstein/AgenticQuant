@@ -101,6 +101,9 @@ class EnsembleModel:
 
         For "ic_weighted": temporal split → per-model IC on val set → weights.
         Sub-models are re-trained on the full dataset after weight computation.
+        Temporal inputs use ModelWrapper's explicit availability policy/clock
+        keywords. Captured fitting additionally requires true ``label_end_at``;
+        internal IC selection remains retrospective within the actual fit.
 
         Args:
             X_train: Feature matrix (DataFrame or ndarray).
@@ -116,8 +119,15 @@ class EnsembleModel:
         if y_s is None:
             raise ModelError("y_train must not be None.")
 
-        if not X_df.index.equals(y_s.index) or not X_df.index.is_unique:
+        if X_df.empty or not X_df.index.equals(y_s.index) or not X_df.index.is_unique:
             raise ModelError("ensemble feature/label identity mismatch")
+        self._validate_fit_inputs(X_df, y_s, temporal_metadata)
+        # Once a new fit starts, failure must not leave old executable weights
+        # paired with new validation evidence or partially refitted children.
+        self._trained = False
+        self._models = {}
+        self._weights = {}
+        self.validation_evidence = {}
         self._train_metadata = temporal_metadata
         n = len(X_df)
 
@@ -133,7 +143,6 @@ class EnsembleModel:
             raise ModelError("unsupported weighting")
 
         # Re-train all sub-models on the full dataset
-        self._models = {}
         for name in self._model_names:
             wrapper = ModelWrapper(name, self.config)
             try:
@@ -151,24 +160,80 @@ class EnsembleModel:
         n = len(self._model_names)
         return {name: 1.0 / n for name in self._model_names}
 
+    @staticmethod
+    def _clock_series(value, index: pd.Index, field: str) -> pd.Series:
+        """Validate exact identities before any positional split or estimator fit."""
+        if not isinstance(value, pd.Series) or not value.index.equals(index) or value.isna().any():
+            raise ModelError(f"explicit aligned {field} required")
+        try:
+            if any(pd.Timestamp(t).tzinfo is None for t in value):
+                raise ValueError("timezone missing")
+            return pd.to_datetime(value, utc=True)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ModelError(f"{field} requires timezone-aware timestamps") from exc
+
+    def _validate_fit_inputs(self, X: pd.DataFrame, y: pd.Series, metadata: dict) -> None:
+        """Check the entire fit, including validation rows, before selecting weights.
+
+        Child training checks only its own subset. In particular, retrospective
+        weight selection must never inspect a future or unidentified validation
+        outcome before the final full-data child training rejects it.
+        """
+        if not X.columns.is_unique or not all(isinstance(c, str) for c in X.columns):
+            raise ModelError("unique string feature names required")
+        try:
+            if not np.isfinite(y.to_numpy(dtype=float)).all():
+                raise ModelError("unrealized or invalid training labels")
+        except (TypeError, ValueError) as exc:
+            raise ModelError("unrealized or invalid training labels") from exc
+        policy = metadata.get("availability_policy", "decision-time-vintage-1")
+        context = metadata.get("context")
+        if policy not in ("decision-time-vintage-1", "captured-vintage-at-fit-1") or (
+            context is None and policy != "decision-time-vintage-1"
+        ):
+            raise ModelError("supported availability policy and actual temporal context required")
+        if context is None:
+            return  # Non-contextual diagnostics cannot yield temporal inference authority.
+        dates = ModelWrapper._dates(X.index)
+        if dates.isna().any() or (dates > context.as_of).any():
+            raise ModelError("missing or future feature observations cannot enter training")
+        features = self._clock_series(metadata.get("feature_available_at"), X.index, "feature availability")
+        labels = self._clock_series(metadata.get("label_available_at"), X.index, "label availability")
+        if (features > context.as_of).any() or (labels > context.as_of).any():
+            raise ModelError("future observations cannot enter training")
+        if policy == "decision-time-vintage-1" and (features.to_numpy() > dates.to_numpy()).any():
+            raise ModelError("revised/future features unavailable at their historical decision date")
+        end_values = metadata.get("label_end_at")
+        if end_values is None and policy == "captured-vintage-at-fit-1":
+            raise ModelError("captured ensemble requires explicit aligned label_end_at")
+        ends = self._clock_series(labels if end_values is None else end_values, X.index, "outcome ends")
+        if (ends > context.as_of).any() or (ends.to_numpy() < dates.to_numpy()).any() or (ends > labels).any():
+            raise ModelError("future or inconsistent outcome end/availability")
+        if not metadata.get("feature_spec_hash") or not metadata.get("data_snapshot_hash"):
+            raise ModelError("feature and snapshot hashes required for temporal training")
+
     def _ic_weighted_train(
         self, X: pd.DataFrame, y: pd.Series, n: int
     ) -> dict[str, float]:
-        """Compute IC weights via temporal split, with equal fallback."""
+        """Select weights retrospectively within this fit; never claim OOS inference."""
+        policy = self._train_metadata.get("availability_policy", "decision-time-vintage-1")
+        captured = policy == "captured-vintage-at-fit-1"
         if isinstance(X.index, (pd.DatetimeIndex, pd.MultiIndex)):
             dates = ModelWrapper._dates(X.index)
+            if dates.isna().any():
+                raise ModelError("missing feature observation dates")
             unique = dates.unique().sort_values()
             boundary = int(len(unique) * (1 - self._val_fraction))
             if boundary < 1 or boundary >= len(unique):
                 raise ModelError("insufficient distinct validation dates")
             cutoff = unique[boundary]
             train_mask, val_mask = dates < cutoff, dates >= cutoff
-            # Outcomes overlapping the validation period cannot fit even the
-            # submodels used to select weights.
-            labels_available = self._train_metadata.get("label_available_at")
-            if labels_available is None:
-                raise ModelError("IC ensemble requires label availability for temporal purging")
-            train_mask &= (labels_available < cutoff).to_numpy()
+            # Current captures retain their actual receipt/fit clocks. Their
+            # economic outcome ends, not those later receipts, determine overlap.
+            # Strict historical fitting keeps its original publication purge.
+            field = "label_end_at" if captured else "label_available_at"
+            purge_at = self._clock_series(self._train_metadata.get(field), X.index, field)
+            train_mask &= (purge_at < cutoff).to_numpy()
         else:
             # Generic non-temporal diagnostics only. Contextual training below
             # still rejects this index; it cannot yield an eligible artifact.
@@ -181,19 +246,32 @@ class EnsembleModel:
         X_val, y_val = X.loc[val_mask], y.loc[val_mask]
         metadata = dict(self._train_metadata)
         for field in ("feature_available_at", "label_available_at", "label_end_at"):
-            if field in metadata:
+            if metadata.get(field) is not None:
                 metadata[field] = metadata[field].loc[train_mask]
-        if "context" in metadata and cutoff is not None:
+        if metadata.get("context") is not None and cutoff is not None and not captured:
             metadata["context"] = metadata["context"].model_copy(update={"as_of": (cutoff - pd.Timedelta(nanoseconds=1000)).to_pydatetime()})
         ics = {}
         for name in self._model_names:
             wrapper = ModelWrapper(name, self.config)
             wrapper.train(X_sub, y_sub, **metadata)
+            # Intentionally non-contextual: this is internal retrospective
+            # selection after whole-input eligibility checks, not external
+            # temporal inference at a fabricated post-fit timestamp.
             ic = prediction_metrics(wrapper.predict(X_val), y_val)["ic"]
             if not math.isfinite(ic):
                 raise ModelError(f"undefined validation IC for {name}")
             ics[name] = ic
-        self.validation_evidence = {"ic": ics, "boundary": str(cutoff), "train_rows": len(X_sub), "validation_rows": len(X_val)}
+        fit_context = self._train_metadata.get("context")
+        weight_context = metadata.get("context")
+        self.validation_evidence = {
+            "ic": ics, "boundary": str(cutoff), "train_rows": len(X_sub), "validation_rows": len(X_val),
+            "scope": "retrospective-within-fit-weight-selection-1",
+            "prediction_policy": "non-contextual-internal-validation-1",
+            "availability_policy": policy,
+            "fit_cutoff": fit_context.as_of.isoformat() if fit_context is not None else None,
+            "weight_fit_cutoff": weight_context.as_of.isoformat() if weight_context is not None else None,
+            "purge_policy": "outcome-end-before-validation-1" if captured else "label-availability-before-validation-1",
+        }
         positive = {name: max(ic, 0.0) for name, ic in ics.items()}
         total = sum(positive.values())
         if total <= 0:
