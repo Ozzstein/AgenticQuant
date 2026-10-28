@@ -435,6 +435,9 @@ class ExperimentService:
                 frozen.manifest.cohorts, frozen.cohort_ids, strict=True
             ):
                 for case in spec.cases:
+                    now = datetime.now(timezone.utc)
+                    if self.store.budget_fences(frozen.manifest.run_id, now.date().isoformat()):
+                        return self._report(frozen)
                     claim = self.store.evaluation_dispatch_for(case.request.cache_key())
                     if claim is not None:
                         self._dispatch(frozen, claim, cohort_id, case)
@@ -527,12 +530,17 @@ class ExperimentService:
         frozen = self.inspect(value.experiment_hash)
         if value.recorded_at < value.observed_through:
             raise ValueError("report creation precedes its observation cutoff")
-        report, dispatches = self._compose(frozen, value.cohort_receipts, value.observed_through)
+        report, dispatches = self._compose(
+            frozen,
+            value.cohort_receipts,
+            value.observed_through,
+            usage_authority="usage_authority_version" in json.loads(value.report_json)["operating"],
+        )
         if value.report_json != canonical_json(report) or value.dispatch_ids != dispatches:
             raise ValueError("experiment report differs from actual immutable authorities")
         return value
 
-    def _compose(self, frozen, receipt_ids, at):
+    def _compose(self, frozen, receipt_ids, at, *, usage_authority=True):
         if at < frozen.recorded_at or len(dict(receipt_ids)) != len(receipt_ids):
             raise ValueError("invalid experiment report chronology or receipt map")
         receipts = {}
@@ -665,6 +673,32 @@ class ExperimentService:
             if exports
             else None,
         }
+        if usage_authority:
+            from src.decision.store import summarize_usage
+
+            accounting = summarize_usage(self.store.budget_usage(frozen.manifest.run_id, at=at))
+            fences = summarize_usage(
+                self.store.budget_fences(frozen.manifest.run_id, at.date().isoformat(), at=at)
+            )
+            operating.update(
+                usage_authority_version="attempt-ledger-1",
+                accounting=accounting,
+                admission_breaches=fences["breaches"],
+                **{
+                    k: accounting[k]
+                    for k in (
+                        "known_input_tokens",
+                        "known_output_tokens",
+                        "known_cost_usd",
+                        "total_cost_usd",
+                        "unknown_usage_reservations",
+                    )
+                },
+            )
+            if fences["breached"]:
+                for row in rows:
+                    if row["status"] == "not_dispatched":
+                        row["nondispatch_reason"] = "durable_run_or_day_budget_breach"
         pairs = self._pair_reports(frozen, receipts)
         priors = self._prior_reports(frozen, receipts, at)
         represented = {p["kind"] for p in pairs if p["status"] == "measured"}
@@ -732,11 +766,18 @@ class ExperimentService:
             or started is None
             or not claim.recorded_at <= started <= result.completed_at
             or (
-                result.input_tokens is None
-                and (result.output_tokens is not None or result.cost_usd is not None)
+                "usage_authority" not in proof
+                and (
+                    result.input_tokens is None
+                    and (result.output_tokens is not None or result.cost_usd is not None)
+                )
             )
         ):
             raise ValueError("experiment observation differs from exact original dispatch")
+        if "usage_authority" in proof and result.status != DecisionStatus.OK:
+            # export_observation rederives independent usage even for invalid
+            # answers, wrong models and partial counters. No semantic parse here.
+            return
         if result.input_tokens is not None:
             model, judgments, tokens_in, tokens_out = parse_response(
                 case.request, result.raw_response

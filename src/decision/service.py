@@ -62,7 +62,15 @@ def parse_response(
     def bad_constant(_):
         raise ValueError("non-finite JSON value")
 
-    data = json.loads(raw, parse_constant=bad_constant)
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("ambiguous duplicate response key")
+            value[key] = item
+        return value
+
+    data = json.loads(raw, parse_constant=bad_constant, object_pairs_hook=unique)
     if not isinstance(data, dict) or set(data) != {"model", "answers", "usage"}:
         raise ValueError("unexpected response envelope")
     if not isinstance(data["model"], str):
@@ -196,6 +204,7 @@ class DecisionService:
             identity = str(uuid4())
         attempts, raw, actual, input_tokens, output_tokens = 0, None, None, None, None
         evaluated = False
+        usage = None
 
         def finish(status, reason="", *, judgments=(), reused=None):
             if evaluated and status == DecisionStatus.OK:
@@ -205,10 +214,8 @@ class DecisionService:
                     else j
                     for j in judgments
                 )
-            cost = None
+            cost = usage.actual_cost_usd if usage is not None else None
             price = self.limits.input_usd_per_million
-            if input_tokens is not None and price is not None and actual == request.policy.model:
-                cost = input_tokens * price / 1_000_000
             result = DecisionResult(
                 observation_id=identity,
                 request_hash=request.content_hash(),
@@ -343,6 +350,7 @@ class DecisionService:
                     limits=self.limits,
                     observation_id=identity,
                     attempt=attempts + 1,
+                    request=request,
                 )
                 if not allowed:
                     if wait and wait < remaining:
@@ -358,27 +366,43 @@ class DecisionService:
                     return finish(DecisionStatus.TIMED_OUT, "deadline expired during admission")
                 retry_delay = min(0.25 * 2 ** (attempts - 1), 2)
                 try:
+                    # Counters refer only to this attempt. Earlier usage remains
+                    # in the immutable attempt ledger, including failed retries.
+                    raw = actual = input_tokens = output_tokens = None
+                    usage = None
                     timeout = min(remaining, self.limits.attempt_timeout_seconds)
                     response = await asyncio.wait_for(
                         self.transport.post(payload, timeout), timeout
                     )
                     raw = response.body
-                    self.store.attempt(
+                    usage = self.store.attempt(
                         identity,
                         attempts,
                         response.status,
                         raw,
                         (time.monotonic() - attempt_clock) * 1000,
                     )
+                    actual, input_tokens, output_tokens = (
+                        usage.actual_model,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                    )
                     if response.status == 200:
                         try:
-                            data = json.loads(raw)
-                            actual = data.get("model") if isinstance(data, dict) else None
-                            if not isinstance(actual, str):
-                                actual = None
                             actual, judgments, input_tokens, output_tokens = parse_response(
                                 request, raw
                             )
+                            if (actual, input_tokens, output_tokens) != (
+                                usage.actual_model,
+                                usage.input_tokens,
+                                usage.output_tokens,
+                            ):
+                                actual, input_tokens, output_tokens = (
+                                    usage.actual_model,
+                                    usage.input_tokens,
+                                    usage.output_tokens,
+                                )
+                                raise ValueError("ambiguous response usage")
                         except ModelVersionMismatch:
                             return finish(
                                 DecisionStatus.VERSION_MISMATCH,
@@ -389,12 +413,16 @@ class DecisionService:
                                 DecisionStatus.MALFORMED,
                                 "provider response violates typed contract",
                             )
-                        if input_tokens + output_tokens > reserve_tokens:
+                        if usage.breaches:
                             return finish(
                                 DecisionStatus.BUDGET,
                                 "provider usage exceeds conservative reservation",
                             )
                         return finish(DecisionStatus.OK, judgments=judgments)
+                    if usage.breaches:
+                        return finish(
+                            DecisionStatus.BUDGET, "provider usage breached durable admission"
+                        )
                     if response.status not in (408, 429, 500, 502, 503, 504):
                         return finish(
                             DecisionStatus.MALFORMED

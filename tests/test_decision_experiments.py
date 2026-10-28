@@ -356,7 +356,9 @@ def test_malformed_or_wrong_model_never_drops_failed_population(experiment):
     _, receipt, report = run(x)
     assert report["status"] == "incomplete" and not report["cohorts"]
     assert len(report["cases"]) == len(x.env.cases)
-    assert all(row["status"] == "malformed" for row in report["cases"])
+    assert report["cases"][0]["status"] == "malformed"
+    assert all(row["status"] == "not_dispatched" for row in report["cases"][1:])
+    assert report["operating"]["accounting"]["breached"]
     assert report["operating"]["total_cost_usd"] is None
     assert x.service.verify_report(receipt.content_hash()) == receipt
 

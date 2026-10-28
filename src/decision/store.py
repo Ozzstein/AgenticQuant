@@ -7,10 +7,176 @@ request may have been processed. Run/day limits therefore survive restarts.
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
-from src.domain.decisions import DecisionRequest, DecisionResult
+from src.domain.common import Sha256, UtcTimestamp, VersionedContract
+from src.domain.decisions import DecisionRequest, DecisionResult, canonical_json, digest
+
+
+class AttemptUsage(VersionedContract):
+    """Provider-reported usage, independently of semantic response validity.
+
+    The original admission day owns the charge even if a response crosses UTC
+    midnight. This is provider response evidence, not a reconciled invoice.
+    """
+
+    reservation_hash: Sha256
+    admission_hash: Sha256
+    attempt_hash: Sha256
+    request_hash: Sha256
+    source_hashes: tuple[Sha256, ...]
+    recorded_at: UtcTimestamp
+    actual_model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    actual_cost_usd: float | None
+    charged_tokens: int
+    charged_cost_usd: float | None
+    breaches: tuple[str, ...]
+
+
+def response_usage(body):
+    """Parse accounting independently; invalid answers cannot hide valid usage."""
+
+    class ObjectPairs(list):
+        pass
+
+    ambiguous = False
+
+    def field(value, key):
+        nonlocal ambiguous
+        if not isinstance(value, ObjectPairs):
+            return None
+        matches = [item for name, item in value if name == key]
+        if len(matches) > 1:
+            ambiguous = True
+            return None
+        return matches[0] if matches else None
+
+    try:
+        value = json.loads(body, object_pairs_hook=ObjectPairs)
+    except (ValueError, TypeError, RecursionError):
+        return None, None, None, False
+    if not isinstance(value, ObjectPairs):
+        return None, None, None, False
+    model = field(value, "model")
+    model = model if isinstance(model, str) and 0 < len(model) <= 160 else None
+    usage = field(value, "usage")
+    values = tuple(field(usage, k) for k in ("input_tokens", "output_tokens"))
+    # Keep independently known counters. Unknown/invalid counters are never zero.
+    return (model, *(v if type(v) is int and 0 <= v < 2**62 else None for v in values), ambiguous)
+
+
+def _derive_usage(reservation, admission, attempt, recorded_at):
+    request = DecisionRequest.model_validate(admission["request"])
+    model, tokens_in, tokens_out, ambiguous = response_usage(attempt["body"])
+    price = admission["limits"]["input_usd_per_million"]
+    known = tokens_in is not None and tokens_out is not None and not ambiguous
+    priced = model == request.policy.model and price is not None
+    actual_cost = tokens_in * price / 1_000_000 if known and priced else None
+    # Even partial usage supplies a lower bound; never refund the reservation.
+    token_floor = sum(v for v in (tokens_in, tokens_out) if v is not None)
+    cost_floor = tokens_in * price / 1_000_000 if tokens_in is not None and priced else None
+    if cost_floor is not None and not math.isfinite(cost_floor):
+        raise ValueError("unrepresentable reported provider charge")
+    reserved_cost = reservation["reserved_cost"]
+    breaches = []
+    if ambiguous:
+        breaches.append("ambiguous_usage_response")
+    if token_floor > reservation["reserved_tokens"]:
+        breaches.append("token_reservation_exceeded")
+    if cost_floor is not None and reserved_cost is not None and cost_floor > reserved_cost:
+        breaches.append("cost_reservation_exceeded")
+    if (model is not None or tokens_in is not None or tokens_out is not None) and not priced:
+        breaches.append("response_model_or_price_unverifiable")
+    return AttemptUsage(
+        reservation_hash=digest(canonical_json(reservation)),
+        admission_hash=digest(canonical_json(admission)),
+        attempt_hash=digest(canonical_json(attempt)),
+        request_hash=request.content_hash(),
+        source_hashes=tuple(s.content_hash() for s in request.sources),
+        recorded_at=recorded_at,
+        actual_model=model,
+        input_tokens=tokens_in,
+        output_tokens=tokens_out,
+        actual_cost_usd=actual_cost,
+        charged_tokens=max(reservation["reserved_tokens"], token_floor),
+        charged_cost_usd=max(reserved_cost, cost_floor or 0) if reserved_cost is not None else None,
+        breaches=tuple(breaches),
+    )
+
+
+def summarize_usage(charges):
+    """Safe counters/identities only; no requests, raw responses or credentials."""
+    usage = [v["usage"] for v in charges if v["usage"] is not None]
+    known_costs = [v["actual_cost_usd"] for v in usage if v["actual_cost_usd"] is not None]
+    unknown = sum(
+        v["usage"] is None
+        or any(v["usage"][k] is None for k in ("input_tokens", "output_tokens", "actual_cost_usd"))
+        for v in charges
+    )
+    costs = [v["charged_cost_usd"] for v in charges]
+    return {
+        "accounting_policy": "attempt-conservative-max-original-utc-day-1",
+        "requests": len(charges),
+        "known_input_tokens": sum(v["input_tokens"] or 0 for v in usage),
+        "known_output_tokens": sum(v["output_tokens"] or 0 for v in usage),
+        "known_cost_usd": sum(known_costs),
+        "total_cost_usd": sum(known_costs) if not unknown else None,
+        "unknown_usage_reservations": unknown,
+        "conservative_tokens": sum(v["charged_tokens"] for v in charges),
+        "conservative_cost_usd": sum(costs) if all(v is not None for v in costs) else None,
+        "breached": any(v["breaches"] for v in charges),
+        "breaches": [
+            {
+                "observation_id": v["reservation"]["observation_id"],
+                "attempt": v["reservation"]["attempt"],
+                "run_id": v["reservation"]["run_id"],
+                "day": v["reservation"]["day"],
+                "reasons": v["breaches"],
+                "usage_hash": digest(canonical_json(v["usage"])) if v["usage"] else None,
+            }
+            for v in charges
+            if v["breaches"]
+        ],
+    }
+
+
+def read_usage_summary(path, *, day, run_id=None, as_of):
+    """Read-only monitoring projection; absent/old authority never becomes zero usage.
+
+    `day` is the original UTC admission date (YYYY-MM-DD), not response date.
+    Corruption raises; callers must expose unavailable rather than assume zero.
+    """
+    if as_of.tzinfo is None or datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day:
+        raise ValueError("aware cutoff and exact UTC budget day required")
+    path = Path(path).resolve()
+    if not path.is_file():
+        return {"status": "unavailable", "reason": "decision_store_missing"}
+    store = DecisionStore.__new__(DecisionStore)
+    store.path, store._read_only = path, True
+    with store.connect() as db:
+        db.execute("BEGIN")
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"reservations", "reservation_authorities", "attempt_usage"}.issubset(tables):
+            return {"status": "unavailable", "reason": "usage_authority_schema_missing"}
+        values = store._charges(db, run_id=run_id, day=day, at=as_of)
+        return {
+            "status": "available",
+            "as_of": as_of.isoformat(),
+            "day": day,
+            "day_usage": summarize_usage([v for v in values if v["reservation"]["day"] == day]),
+            "run_id": run_id,
+            "run_usage": summarize_usage(
+                [v for v in values if v["reservation"]["run_id"] == run_id]
+            )
+            if run_id is not None
+            else None,
+        }
 
 
 def _evaluation_types():
@@ -62,6 +228,10 @@ class DecisionStore:
                     observation_id TEXT UNIQUE NOT NULL);
                 CREATE TABLE IF NOT EXISTS evaluation_dispatch_starts (
                     artifact_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS reservation_authorities (
+                    reservation_seq INTEGER PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS attempt_usage (
+                    reservation_seq INTEGER PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(reservations)")}
             for name, kind in (("observation_id", "TEXT"), ("attempt", "INTEGER")):
@@ -75,6 +245,8 @@ class DecisionStore:
                     "evaluation_runs",
                     "evaluation_dispatches",
                     "evaluation_dispatch_starts",
+                    "reservation_authorities",
+                    "attempt_usage",
                 ):
                     db.execute(
                         f"CREATE TRIGGER IF NOT EXISTS {table}_{action.lower()} BEFORE {action} "
@@ -82,7 +254,153 @@ class DecisionStore:
                     )
 
     def connect(self):
+        if getattr(self, "_read_only", False):
+            return sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=10)
         return sqlite3.connect(self.path, timeout=10)
+
+    @staticmethod
+    def _record(db, table, identity, value):
+        payload = canonical_json(value)
+        db.execute(f"INSERT INTO {table} VALUES(?,?,?)", (identity, digest(payload), payload))
+
+    @staticmethod
+    def _read_record(db, table, identity):
+        row = db.execute(
+            f"SELECT hash,payload FROM {table} WHERE reservation_seq=?", (identity,)
+        ).fetchone()
+        if row is None:
+            return None
+        if digest(row[1]) != row[0]:
+            raise ValueError("provider usage authority hash differs")
+        return json.loads(row[1])
+
+    def _charges(self, db, *, run_id=None, day=None, at=None, observation_id=None):
+        """Reverify authority in the caller's admission/read transaction."""
+        db.row_factory = sqlite3.Row
+        if observation_id is not None:
+            where, args = "observation_id=?", (observation_id,)
+        elif day is not None:
+            where, args = "(run_id=? OR day=?)", (run_id, day)
+        else:
+            where, args = "run_id=?", (run_id,)
+        values = []
+        for row in db.execute(
+            "SELECT * FROM reservations WHERE " + where + " ORDER BY seq", args
+        ).fetchall():
+            reservation = dict(row)
+            if at is not None and reservation["at"] > at.timestamp():
+                continue
+            admission = self._read_record(db, "reservation_authorities", row["seq"])
+            stored = self._read_record(db, "attempt_usage", row["seq"])
+            attempts = [
+                dict(a)
+                for a in db.execute(
+                    "SELECT * FROM attempts WHERE observation_id=? AND attempt=? ORDER BY seq",
+                    (row["observation_id"], row["attempt"]),
+                )
+            ]
+            usage = None
+            tokens, cost, breaches = row["reserved_tokens"], row["reserved_cost"], ()
+            if admission is not None:
+                from src.decision.service import OperatingLimits
+
+                request = DecisionRequest.model_validate(admission["request"])
+                limits = OperatingLimits.model_validate(admission["limits"])
+                expected_tokens = (
+                    len(canonical_json(request.wire()).encode())
+                    + 1024
+                    + len(request.questions) * 256
+                )
+                price = limits.input_usd_per_million
+                if (
+                    set(admission) != {"reservation_hash", "request", "limits"}
+                    or admission["reservation_hash"] != digest(canonical_json(reservation))
+                    or request.context.run_id != row["run_id"]
+                    or row["day"]
+                    != datetime.fromtimestamp(row["at"], timezone.utc).date().isoformat()
+                    or expected_tokens != row["reserved_tokens"]
+                    or row["reserved_cost"]
+                    != (expected_tokens * price / 1_000_000 if price is not None else None)
+                    or len(attempts) > 1
+                    or bool(attempts) != (stored is not None)
+                ):
+                    raise ValueError("provider usage admission/attempt linkage differs")
+                if stored is not None:
+                    usage = AttemptUsage.model_validate(stored)
+                    if (
+                        usage
+                        != _derive_usage(reservation, admission, attempts[0], usage.recorded_at)
+                        or usage.recorded_at.timestamp() < row["at"]
+                    ):
+                        raise ValueError(
+                            "provider usage differs from original raw response/admission"
+                        )
+                    if at is None or usage.recorded_at <= at:
+                        tokens, cost, breaches = (
+                            usage.charged_tokens,
+                            usage.charged_cost_usd,
+                            usage.breaches,
+                        )
+                    else:
+                        usage = None
+            elif stored is not None:
+                raise ValueError("provider usage lacks original admission authority")
+            else:
+                # Do not rewrite legacy exports/receipt hashes. Existing raw usage
+                # can still fence a historical overrun before the next admission.
+                original = db.execute(
+                    "SELECT result_json,request_json FROM observations WHERE observation_id=?",
+                    (row["observation_id"],),
+                ).fetchone()
+                result = DecisionResult.model_validate_json(original[0]) if original else None
+                if at is None or (result is not None and result.completed_at <= at):
+                    expected_model = (
+                        DecisionRequest.model_validate_json(original[1]).policy.model
+                        if original
+                        else None
+                    )
+                    for attempt in attempts:
+                        model, ti, to, ambiguous = response_usage(attempt["body"])
+                        tokens = max(tokens, sum(v for v in (ti, to) if v is not None))
+                        if ambiguous:
+                            breaches += ("legacy_ambiguous_usage_response",)
+                        if (
+                            model is not None
+                            and expected_model is not None
+                            and model != expected_model
+                        ):
+                            breaches += ("legacy_response_model_unverifiable",)
+                    if tokens > row["reserved_tokens"]:
+                        breaches += ("legacy_token_reservation_exceeded",)
+                if original is not None:
+                    if result.attempts == row["attempt"] and (
+                        at is None or result.completed_at <= at
+                    ):
+                        if result.cost_usd is not None and cost is not None:
+                            cost = max(cost, result.cost_usd)
+                            if cost > row["reserved_cost"]:
+                                breaches += ("legacy_cost_reservation_exceeded",)
+            values.append(
+                {
+                    "reservation": reservation,
+                    "admission": admission,
+                    "usage": usage.model_dump(mode="json") if usage else None,
+                    "charged_tokens": tokens,
+                    "charged_cost_usd": cost,
+                    "breaches": list(breaches),
+                }
+            )
+        return values
+
+    def budget_usage(self, run_id, *, at=None):
+        with self.connect() as db:
+            db.execute("BEGIN")
+            return self._charges(db, run_id=run_id, at=at)
+
+    def budget_fences(self, run_id, day, *, at=None):
+        with self.connect() as db:
+            db.execute("BEGIN")
+            return [v for v in self._charges(db, run_id=run_id, day=day, at=at) if v["breaches"]]
 
     def _append_evaluation(self, value):
         """Owned EvaluationService write boundary; never a supplied pass flag."""
@@ -346,18 +664,59 @@ class DecisionStore:
 
     def attempt(self, observation_id, attempt, status, body, elapsed_ms, failure=None):
         with self.connect() as db:
-            db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            db.row_factory = sqlite3.Row
+            reservations = db.execute(
+                "SELECT * FROM reservations WHERE observation_id=? AND attempt=?",
+                (observation_id, attempt),
+            ).fetchall()
+            if len(reservations) != 1:
+                raise ValueError("attempt requires exactly its original reservation")
+            reservation = dict(reservations[0])
+            admission = self._read_record(db, "reservation_authorities", reservation["seq"])
+            if db.execute(
+                "SELECT 1 FROM attempts WHERE observation_id=? AND attempt=?",
+                (observation_id, attempt),
+            ).fetchone():
+                raise ValueError("provider attempt already recorded")
+            cursor = db.execute(
                 "INSERT INTO attempts(observation_id,attempt,status,body,elapsed_ms,"
                 "failure) VALUES(?,?,?,?,?,?)",
                 (observation_id, attempt, status, body, elapsed_ms, failure),
             )
+            if admission is not None:
+                raw_attempt = dict(
+                    db.execute("SELECT * FROM attempts WHERE seq=?", (cursor.lastrowid,)).fetchone()
+                )
+                usage = _derive_usage(
+                    reservation, admission, raw_attempt, datetime.now(timezone.utc)
+                )
+                self._record(db, "attempt_usage", reservation["seq"], usage.model_dump(mode="json"))
+                # Validate the whole atomic write before exposing the raw response
+                # or permitting the next admission in another process.
+                self._charges(db, observation_id=observation_id)
+                return usage
+            return None
 
     def reserve(
-        self, *, run_id, day, tokens, cost, now, limits, observation_id=None, attempt=None
+        self,
+        *,
+        run_id,
+        day,
+        tokens,
+        cost,
+        now,
+        limits,
+        observation_id=None,
+        attempt=None,
+        request=None,
     ) -> tuple[bool, str, float]:
         """Atomic reservation; rate delay returned before consuming a request."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            charges = self._charges(db, run_id=run_id, day=day)
+            if any(v["breaches"] for v in charges):
+                return False, "durable provider usage breach fences run or original UTC day", 0
             admitted = db.execute(
                 "SELECT frozen_id FROM evaluation_runs WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -392,12 +751,13 @@ class DecisionStore:
                 ("run_id", run_id, limits.run_requests, limits.run_tokens, limits.run_spend_usd),
                 ("day", day, limits.day_requests, limits.day_tokens, limits.day_spend_usd),
             ):
-                row = db.execute(
-                    f"SELECT count(*),coalesce(sum(reserved_tokens),0),"
-                    f"coalesce(sum(reserved_cost),0),count(*)-count(reserved_cost) "
-                    f"FROM reservations WHERE {column}=?",
-                    (value,),
-                ).fetchone()
+                scope = [v for v in charges if v["reservation"][column] == value]
+                row = (
+                    len(scope),
+                    sum(v["charged_tokens"] for v in scope),
+                    sum(v["charged_cost_usd"] or 0 for v in scope),
+                    sum(v["charged_cost_usd"] is None for v in scope),
+                )
                 if row[0] >= requests or row[1] + tokens > max_tokens:
                     return False, "request/token budget exhausted", 0
                 if max_cost is not None and (cost is None or row[3] or row[2] + cost > max_cost):
@@ -406,11 +766,31 @@ class DecisionStore:
             wait = max(0, (recent or 0) + limits.min_interval_seconds - now)
             if wait:
                 return False, "rate_limit", wait
-            db.execute(
+            cursor = db.execute(
                 "INSERT INTO reservations(run_id,day,reserved_tokens,reserved_cost,at,observation_id,attempt) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (run_id, day, tokens, cost, now, observation_id, attempt),
             )
+            if request is not None:
+                request = DecisionRequest.model_validate(request.model_dump())
+                if not observation_id or type(attempt) is not int or attempt < 1:
+                    raise ValueError("source-bound reservation requires an exact attempt")
+                row = dict(
+                    db.execute(
+                        "SELECT * FROM reservations WHERE seq=?", (cursor.lastrowid,)
+                    ).fetchone()
+                )
+                self._record(
+                    db,
+                    "reservation_authorities",
+                    row["seq"],
+                    {
+                        "reservation_hash": digest(canonical_json(row)),
+                        "request": request.model_dump(mode="json"),
+                        "limits": limits.model_dump(mode="json"),
+                    },
+                )
+                self._charges(db, observation_id=observation_id)
             return True, "", 0
 
     def export_observation(self, observation_id: str) -> dict:
@@ -426,6 +806,7 @@ class DecisionStore:
             raise ValueError("cyclic or excessive observation reuse")
         seen.add(observation_id)
         with self.connect() as db:
+            db.execute("BEGIN")
             db.row_factory = sqlite3.Row
             row = db.execute(
                 "SELECT * FROM observations WHERE observation_id=?", (observation_id,)
@@ -448,6 +829,7 @@ class DecisionStore:
                     (observation_id,),
                 )
             ]
+            charges = self._charges(db, observation_id=observation_id)
         if (
             result.observation_id != observation_id
             or result.request_hash != request.content_hash()
@@ -464,6 +846,31 @@ class DecisionStore:
             r["run_id"] != result.run_id for r in reservations
         ):
             raise ValueError("missing authoritative Jev admission linkage")
+        extended = {}
+        if any(v["admission"] is not None for v in charges):
+            if any(
+                v["admission"] is None
+                or v["admission"]["request"] != request.model_dump(mode="json")
+                for v in charges
+            ):
+                raise ValueError("observation differs from admitted source/question/model request")
+            settled = [AttemptUsage.model_validate(v["usage"]) for v in charges if v["usage"]]
+            if any(v.recorded_at > result.completed_at for v in settled):
+                raise ValueError("usage receipt completed after original observation")
+            last = charges[-1]["usage"] if charges else None
+            if last and (
+                result.actual_model,
+                result.input_tokens,
+                result.output_tokens,
+                result.cost_usd,
+            ) != (
+                last["actual_model"],
+                last["input_tokens"],
+                last["output_tokens"],
+                last["actual_cost_usd"],
+            ):
+                raise ValueError("observation accounting differs from original final attempt")
+            extended["usage_authority"] = charges
         return {
             "request": request.model_dump(mode="json"),
             "result": result.model_dump(mode="json"),
@@ -472,4 +879,5 @@ class DecisionStore:
             "reused": self._export_observation(result.reused_observation_id, seen)
             if result.reused_observation_id
             else None,
+            **extended,
         }
