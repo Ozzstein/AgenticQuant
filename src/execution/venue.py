@@ -638,7 +638,7 @@ class VenueExecution:
                 raise LedgerError("reconcile unresolved outcomes before dispatching another intent")
             if as_of < intent.eligible_at:
                 raise LedgerError("intent is not yet eligible for submission")
-            if intent.expires_at is not None and as_of > intent.expires_at:
+            if intent.expires_at is not None and as_of >= intent.expires_at:
                 self.ledger.cancel(self.account_id, intent_id, as_of, "expired before submission")
                 self._status(intent_id, "expired")
                 return self.state(intent_id)
@@ -865,6 +865,69 @@ class VenueExecution:
             return self.state(intent_id)
         self.ingest(intent_id, report)
         return self.state(intent_id)
+
+    def expire_orders(self, *, as_of: datetime) -> tuple[dict, ...]:
+        """Reconcile actual fills, then request cancellation of due remote orders.
+
+        Only a never-dispatched intent expires locally. A deadline is not a
+        native cancellation receipt; ambiguous outcomes retain their reservation.
+        Call on restart and each scheduler boundary before publishing valuation.
+        """
+        as_of = _utc(as_of)
+        due = []
+        with self.ledger.atomic():
+            for row in self.ledger.db.execute(
+                "SELECT intent,state FROM venue_outbox WHERE account=? AND state NOT IN "
+                "('filled','cancelled','expired','rejected') ORDER BY rowid",
+                (self.account_id,),
+            ).fetchall():
+                intent = self.ledger.order(self.account_id, row["intent"])["intent"]
+                if intent.expires_at is None or intent.expires_at > as_of:
+                    continue
+                due.append(intent.intent_id)
+                key = "venue-expiry-request:" + intent.intent_id
+                previous = self.ledger.db.execute(
+                    "SELECT payload FROM events WHERE account=? AND id=?", (self.account_id, key)
+                ).fetchone()
+                if previous:
+                    receipt = json.loads(previous[0])
+                    if (
+                        receipt["intent_hash"] != intent.content_hash()
+                        or receipt["expires_at"] != intent.expires_at.isoformat()
+                        or not intent.expires_at
+                        <= _utc(datetime.fromisoformat(receipt["requested_at"]))
+                        <= as_of
+                    ):
+                        raise LedgerError("retained venue expiry request differs or is future")
+                else:
+                    self.ledger.record_event(
+                        self.account_id,
+                        key,
+                        json.dumps(
+                            {
+                                "intent_hash": intent.content_hash(),
+                                "expires_at": intent.expires_at.isoformat(),
+                                "requested_at": as_of.isoformat(),
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                if row["state"] == "prepared":
+                    self.ledger.cancel(
+                        self.account_id, intent.intent_id, as_of, "expired before submission"
+                    )
+                    self._status(intent.intent_id, "expired")
+        # This also recovers original submissions with lost acknowledgements.
+        # Native executions may have occurred before expiry but arrived later.
+        self.reconcile_all(as_of=as_of)
+        for identity in due:
+            state = self.state(identity)
+            if (
+                state["state"] not in ("filled", "cancelled", "expired", "rejected")
+                and state["venue_id"] is not None
+            ):
+                self.cancel(identity, as_of=as_of)
+        return tuple(self.state(identity) for identity in due)
 
     def reconcile_balances(self, *, as_of: datetime) -> dict:
         as_of = _utc(as_of)

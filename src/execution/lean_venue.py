@@ -415,6 +415,8 @@ class LeanVenue:
         try:
             rules.require_order(intent, now)
             require_trailing_support(self.deployment, intent)
+            if intent.expires_at is not None and now >= intent.expires_at:
+                raise LedgerError("LEAN order expired before actual submission")
             if intent.fx_rate != 1 or intent.tif not in ("GTC", "DAY"):
                 raise LedgerError("LEAN requires supported exact cash currency/time-in-force")
             if intent.expires_at is not None and intent.tif != "DAY":

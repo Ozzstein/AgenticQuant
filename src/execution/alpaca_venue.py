@@ -236,7 +236,7 @@ class AlpacaVenue:
             now - self.balances(now).observed_at
         ).total_seconds() > self.maximum_operation_delay_seconds:
             raise LedgerError("refresh actual remote funding before submission")
-        if intent.expires_at is not None and now > intent.expires_at:
+        if intent.expires_at is not None and now >= intent.expires_at:
             raise DefinitiveRejection("order expired before actual submission")
         if not self.ledger.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='venue_outbox'"

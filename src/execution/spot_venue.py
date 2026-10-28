@@ -251,7 +251,7 @@ class CCXTSpotVenue:
             return
         try:
             rules.require_order(intent, now)
-            if intent.expires_at and now > intent.expires_at:
+            if intent.expires_at and now >= intent.expires_at:
                 raise LedgerError("native order expired before submission")
             if not 0 <= (now - self.balances(now).observed_at).total_seconds() <= 30:
                 raise LedgerError("refresh native funding before submission")

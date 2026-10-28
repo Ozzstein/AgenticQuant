@@ -348,7 +348,7 @@ class PortfolioLedger:
             if order["status"] not in ("pending", "partial") or fill.quantity > order["remaining"]:
                 raise LedgerError("fill exceeds open order quantity")
             if fill.executed_at < intent.eligible_at or (
-                intent.expires_at and fill.executed_at > intent.expires_at
+                intent.expires_at and fill.executed_at >= intent.expires_at
             ):
                 raise LedgerError("fill outside eligible execution interval")
             if intent.order_type == "limit":

@@ -485,7 +485,7 @@ class LeanOperatingBridge:
     def pump(self):
         with self.lock, self._operation():
             runtime, execution = self.adapter.runtime, self.execution
-            execution.reconcile_all(as_of=runtime.now())
+            execution.expire_orders(as_of=runtime.now())
             if execution.ledger.db.execute(
                 "SELECT 1 FROM venue_outbox WHERE account=? AND state IN "
                 "('submitting','ambiguous','cancel_pending','reconciliation_required') LIMIT 1",

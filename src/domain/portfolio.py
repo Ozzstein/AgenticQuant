@@ -111,8 +111,8 @@ class OrderIntent(VersionedContract):
             raise ValueError("trailing terms require a trailing stop order")
         if self.tif == "DAY" and self.expires_at is None:
             raise ValueError("DAY order needs explicit calendar session expiry")
-        if self.expires_at is not None and self.expires_at < self.eligible_at:
-            raise ValueError("expiry precedes eligibility")
+        if self.expires_at is not None and self.expires_at <= self.eligible_at:
+            raise ValueError("expiry must follow eligibility for a nonempty execution interval")
         return self
 
     @model_serializer(mode="wrap")

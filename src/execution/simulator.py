@@ -164,7 +164,7 @@ class PaperExecution:
                     continue
                 if order.instrument.instrument_id != event.instrument.instrument_id:
                     continue
-                if order.expires_at and event.opened_at > order.expires_at:
+                if order.expires_at and event.opened_at >= order.expires_at:
                     self.ledger.cancel(self.account_id, order.intent_id, event.opened_at, "expired")
                     continue
                 if order.eligible_at > event.opened_at:
