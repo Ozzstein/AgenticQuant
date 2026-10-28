@@ -114,7 +114,7 @@ def sources_page(view):
     st.dataframe(pd.json_normalize(view.get('sources',[])),hide_index=True)
 
 
-def operations_page(operations,budgets):
+def operations_page(operations,budgets,decision_budgets):
     st.title('Operations')
     if not _unavailable(operations,'Operating store'):
         rows = operations.get('runs',[])
@@ -126,7 +126,7 @@ def operations_page(operations,budgets):
         st.dataframe(pd.DataFrame(operations.get('schedule_ticks',[])),hide_index=True)
         st.subheader('Alerts and delivery receipts')
         st.dataframe(pd.DataFrame(operations.get('alerts',[])),hide_index=True)
-    st.subheader('Model usage and budget charges')
+    st.subheader('Generative model usage and budget charges')
     if not _unavailable(budgets,'Durable model budget'):
         cols = st.columns(3)
         for column,label,key in zip(cols,('Observed cost','Budget charged','Unknown usage reserved'),
@@ -134,6 +134,19 @@ def operations_page(operations,budgets):
             column.metric(label,f"USD {Decimal(budgets[key]):,.6f}")
         st.caption('Costs use reported tokens at configured rates; they are not provider invoice claims. Unknown usage retains its reservation.')
         st.dataframe(pd.DataFrame(budgets['calls']),hide_index=True)
+    st.subheader('Jev decision usage')
+    if not _unavailable(decision_budgets,'Verified decision budget'):
+        usage = decision_budgets['day_usage']
+        st.caption(f"UTC admission day {decision_budgets['day']} · recorded through {decision_budgets['as_of']}")
+        cols = st.columns(3)
+        for column,label,key in zip(cols,('Known reported cost','Total reported cost','Conservative budget charge'),
+                                    ('known_cost_usd','total_cost_usd','conservative_cost_usd'),strict=True):
+            value = usage[key]
+            column.metric(label,'Unknown' if value is None else f"USD {Decimal(str(value)):,.6f}")
+        st.caption(f"{usage['requests']} admitted attempts · {usage['unknown_usage_reservations']} with uncertain usage. Charges retain the greater of the reservation and verified reported usage; these are not provider invoices.")
+        if usage['breached']:
+            st.error('A recorded provider usage breach blocks further admission for this UTC day and the affected runs.')
+            st.dataframe(pd.DataFrame(usage['breaches']),hide_index=True)
 
 
 def main():
@@ -151,7 +164,7 @@ def main():
     elif page == 'Data & Evidence':
         sources_page(view['evidence'])
     else:
-        operations_page(view['operations'],view['budgets'])
+        operations_page(view['operations'],view['budgets'],view['decision_budgets'])
 
 
 if __name__=='__main__':

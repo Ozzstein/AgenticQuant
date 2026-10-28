@@ -8,7 +8,8 @@ from src.utils.config import AppConfig
 def test_missing_stores_remain_unknown_and_are_not_created(tmp_path):
     config = AppConfig(output_dir=str(tmp_path/'missing'),_env_file=None)
     result = system_view(config)
-    assert all(section['status']=='missing' for section in result.values())
+    assert all(section['status']=='missing' for name,section in result.items() if name!='decision_budgets')
+    assert result['decision_budgets'] == {'status':'unavailable','reason':'decision_store_missing'}
     assert result['budgets']['actual_cost_usd'] is None
     assert not (tmp_path/'missing').exists()
 

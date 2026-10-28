@@ -112,7 +112,7 @@ def agent_experiment(experiment,tmp_path_factory):  # noqa: F811
             def now(cls, tz=None):
                 return clock.astimezone(tz or timezone.utc)
         with pytest.MonkeyPatch.context() as patch:
-            for module in ('src.agents.budget','src.agents.receipts','src.agents.history','src.decision.service'):
+            for module in ('src.agents.budget','src.agents.receipts','src.agents.history','src.decision.service','src.decision.store'):
                 patch.setattr(importlib.import_module(module),'datetime',FixtureClock)
             for key,instrument in identities.items():
                 context = numeric.inputs.context.model_copy(update={'account_id':snapshot.account_id,'mode':'paper',

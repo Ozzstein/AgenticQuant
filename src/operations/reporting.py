@@ -66,6 +66,22 @@ def budget_view(path: str | Path, *, day: str | None = None) -> dict:
             'calls_with_unknown_usage':len(unknown),'calls':rows}
 
 
+def decision_budget_view(path: str | Path, *, day: str | None = None,
+                         run_id: str | None = None, as_of: datetime | None = None) -> dict:
+    """Use the decision store's verified charge authority without copying its math."""
+    from src.decision.store import read_usage_summary
+
+    cutoff = as_of or datetime.now(timezone.utc)
+    try:
+        return read_usage_summary(path, day=day or cutoff.astimezone(timezone.utc).date().isoformat(),
+                                  run_id=run_id, as_of=cutoff)
+    except Exception as exc:
+        # A monitoring failure must never turn corrupt/missing charge evidence
+        # into a measured zero or expose raw requests through an exception.
+        return {'status':'unavailable','reason':'decision_usage_authority_invalid',
+                'error_type':type(exc).__name__}
+
+
 def research_view(path: str | Path) -> dict:
     if not Path(path).is_file():
         return {'status':'missing','candidates':[],'activations':[], 'active':[],
@@ -99,6 +115,7 @@ def system_view(config) -> dict:
     sections = {'operations':lambda:operating_view(config.operations.store_path),
                 'portfolio':lambda:portfolio_view(config.paper_ledger_path,config.paper_account_id),
                 'budgets':lambda:budget_view(config.agents.budget_store_path),
+                'decision_budgets':lambda:decision_budget_view(Path(config.output_dir)/'decisions.sqlite'),
                 'research':lambda:research_view(config.operations.research_registry_path),
                 'evidence':lambda:evidence_view(config.operations.evidence_store_path)}
     result = {}

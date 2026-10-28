@@ -655,3 +655,39 @@ and unused imports, plus ambiguous local names). The CI production lint scope
 is unchanged; the test tree is not represented as lint-clean. Changed-file lint
 and diff checks pass. No authenticated provider, Docker, LEAN or capital calls
 were made during this audit.
+
+### Jev usage authority and read-only reporting
+
+Jev `84aa388` integrated as `01aff7a`. Actual response usage is now retained
+atomically with the original attempt, independently of semantic acceptance.
+Admission charges the greater of reservation and verified reported usage, retains
+unknown prior charges, and permanently fences a violated run and its original UTC
+reservation day. Restart or a differently named run cannot clear that day fence.
+
+Root reporting calls only `src.decision.store.read_usage_summary` against the
+canonical `output_dir/decisions.sqlite`; it does not duplicate charge arithmetic.
+The operations status CLI and Streamlit view expose verified known cost, nullable
+total cost, conservative charges and sanitized breach identities. Missing or
+corrupt authority is unavailable, never zero. These are configured-rate charges,
+not provider invoices. The reader creates no store and does not mutate evidence.
+
+Root's broad decision/experiment/history/graph run passed 296 cases with two
+historical advice fixture setup errors: that fixture froze the service response
+clock but omitted the new store-level measured usage clock. Adding the store to
+the fixture's existing clock patch preserves actual runtime clock checks. The
+final reporting/dashboard/CLI/advice run passed all 13 cases in 45.11s:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  .venv/bin/python -m pytest tests/test_decision_usage_reporting.py \
+  tests/test_dashboard_smoke.py tests/test_operations_cli.py \
+  tests/test_registered_agent_strategy.py -q --disable-socket --allow-unix-socket
+```
+
+The five new reporting cases exercise actual DecisionService/DecisionStore with
+synthetic HTTP responses, authority tampering, exact read-only file preservation,
+CLI sanitization and real Streamlit rendering of breach/unknown totals. Logs:
+`/tmp/quantagentlab-root-jev-usage.log` and
+`/tmp/quantagentlab-root-usage-reporting-advice.log`. Production/script and changed
+test lint plus diff checks pass. The full-suite audit above predates this change;
+the positive income/full-cycle and external acceptance gaps remain unchanged.
