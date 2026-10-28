@@ -201,10 +201,26 @@ class ValidationSuite:
                 False,
                 "Persisted ledger required for independent journal/state reconciliation.",
             )
+            check(
+                "execution_compliance", False, "Current persisted execution authority is required."
+            )
         else:
             ledger = None
+            compliant = False
+            compliance_detail = "Current execution authority could not be opened."
             try:
                 ledger = PortfolioLedger(ledger_path, read_only=True)
+                try:
+                    audit = ledger.execution_compliance(result.account_id)
+                    compliant = audit.status == "PASS"
+                    compliance_detail = (
+                        f"Current {audit.lineage} execution authority {audit.content_hash()}: "
+                        f"{audit.status}; {len(audit.violations)} admission violations, "
+                        f"{len(audit.unresolved_sources)} unresolved sources; "
+                        f"blocking codes={','.join(audit.blocking_codes) or 'none'}."
+                    )
+                except (ValueError, KeyError, TypeError, OSError, sqlite3.Error) as exc:
+                    compliance_detail = f"Current execution authority is unverified: {exc}"
                 ledger.reconcile(result.account_id)
                 inputs = recorded_replay_inputs(ledger, result)
                 require_matching_inputs(result, inputs)
@@ -265,6 +281,7 @@ class ValidationSuite:
             finally:
                 if ledger is not None:
                     ledger.close()
+            check("execution_compliance", compliant, compliance_detail)
         if _accounting_only:
             reliable = all(c.verdict == CheckVerdict.PASS for c in checks)
             return ValidationReport(

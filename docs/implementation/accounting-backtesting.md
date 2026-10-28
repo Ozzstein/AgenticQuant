@@ -786,3 +786,15 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-a
 The final complete audit module then passed **28 tests in 5.73s**, using the same command/environment restricted to `tests/test_execution_compliance.py`; changed-file Ruff and whitespace checks pass. Earlier combined audit/source/venue/ledger regression passed 80 tests in 22.02s. Fixtures retain the documented closed-archive versus live-WAL distinction, TCP disabled and Unix self-pipes only. No native/provider/runtime acceptance is implied.
 
 This checkpoint supplies source/audit APIs for gates, **not gate completion**. Root still must bind current operator-owned ledger authority and all ancestor accounts for activation/resolve/rollback/status; a frozen historical PASS cannot substitute for that current lookup. H owns uncached new-risk/dispatch admission checks and existing historical receipt replay. Accounting next wires the distinct validation check and native prepare/claim/LEAN gates. Resource/closure assessment and any economic settlement remain separate; no `settle_discrepancies` method, private expiry exception, new corrective order or group schema exists. Sufficient income source, external venue/LEAN acceptance and the remaining full plan are still unverified requirements.
+
+## Required validation compliance gate
+
+`ValidationSuite.validate` now emits a distinct required `execution_compliance` check from the exact replay ledger opened read-only. It is independent of `durable_accounting`: a mathematically exact run cannot pass the accounting-only verifier when retained native lineage is missing/unverified or the current audit fails. Missing/unopenable ledger authority produces its own FAIL check. The explanation binds the current audit content hash, actual lineage, violation/source counts and blocking codes; it is never an archived permission to ignore later authority. The full numeric/model-free/cost/benchmark checks and exact replay comparison are unchanged. Root still owns current operator-bound ancestor authority outside the replay account.
+
+Tests cover ordinary replay PASS for this check, missing ledger FAIL without creating a file, and a new retained unverified native footprint on an otherwise exact replay: NAV arithmetic and durable accounting remain PASS while compliance blocks it. Regression **36 passed in 35.35s**, zero skips:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-accounting-validation-compliance-output AIQUANT_LOG_DIR=/tmp/quantagent-accounting-validation-compliance-log /tmp/quantagentlab-review-venv/bin/python -m pytest tests/test_validation.py tests/test_replay_artifact_binding.py tests/test_core_backtest.py tests/test_replay_decision_provider.py -q --disable-socket --allow-unix-socket
+```
+
+Changed-file Ruff/diff pass. No WF/model bridge, shared schemas/dependencies, provider actions or settlement enabled. Native prepare/claim gates remain the next owned checkpoint; root/H current authority integration remains required.

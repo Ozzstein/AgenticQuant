@@ -22,6 +22,7 @@ def test_missing_evidence_blocks_even_reconciled_nav(tmp_path):
     verdict = {c.name: c.verdict for c in report.checks}
     assert verdict["nav_arithmetic"] == CheckVerdict.PASS
     assert verdict["durable_accounting"] == CheckVerdict.PASS
+    assert verdict["execution_compliance"] == CheckVerdict.PASS
     assert verdict["fill_realism"] == CheckVerdict.PASS
     assert verdict["historical_provenance"] == CheckVerdict.FAIL
     assert verdict["purged_oos"] == CheckVerdict.FAIL
@@ -49,6 +50,7 @@ def test_future_fill_and_no_ledger_are_failures(tmp_path):
     verdict = {c.name: c.verdict for c in report.checks}
     assert verdict["fill_realism"] == CheckVerdict.FAIL
     assert verdict["durable_accounting"] == CheckVerdict.FAIL
+    assert verdict["execution_compliance"] == CheckVerdict.FAIL
 
 
 def test_metric_manifest_and_full_fill_tampering_fail(tmp_path):
@@ -92,6 +94,35 @@ def test_metric_manifest_and_full_fill_tampering_fail(tmp_path):
         next(c for c in report.checks if c.name == "durable_accounting").verdict
         == CheckVerdict.FAIL
     )
+
+
+def test_unverified_native_lineage_blocks_otherwise_exact_replay_validation(tmp_path):
+    from src.execution.ledger import PortfolioLedger
+
+    path = tmp_path / "replay.db"
+    result = PortfolioReplay(path).run(**replay_inputs())
+    ledger = PortfolioLedger(path)
+    # A retained unknown native ancestor/source cannot acquire replay authority
+    # merely because current replay cash and NAV still reconcile exactly.
+    with ledger.atomic():
+        ledger.record_event(result.account_id, "remote-binding:alpaca", "{}")
+    ledger.close()
+    report = ValidationSuite().validate(result, ledger_path=path, _accounting_only=True)
+    verdict = {check.name: check.verdict for check in report.checks}
+    assert verdict["nav_arithmetic"] == CheckVerdict.PASS
+    assert verdict["durable_accounting"] == CheckVerdict.PASS
+    assert verdict["execution_compliance"] == CheckVerdict.FAIL
+    assert report.overall == "NOT RELIABLE"
+
+
+def test_execution_compliance_missing_database_is_a_separate_required_failure(tmp_path):
+    result = PortfolioReplay(tmp_path / "actual.db").run(**replay_inputs())
+    missing = tmp_path / "missing.db"
+    report = ValidationSuite().validate(result, ledger_path=missing, _accounting_only=True)
+    verdict = {check.name: check.verdict for check in report.checks}
+    assert verdict["durable_accounting"] == CheckVerdict.FAIL
+    assert verdict["execution_compliance"] == CheckVerdict.FAIL
+    assert not missing.exists()
 
 
 def test_model_free_requires_injected_authority_bound_to_exact_replay(tmp_path):
@@ -172,7 +203,7 @@ def test_model_free_requires_injected_authority_bound_to_exact_replay(tmp_path):
     report = ValidationSuite().validate(result, advice_verifier=verifier)
     assert len(seen) == before  # missing canonical ledger cannot be approved by an authority
     assert report.overall == "NOT RELIABLE"
-    invented = result.model_copy(update={"cross_sectional_ic": {"2024-01-02": .8}})
+    invented = result.model_copy(update={"cross_sectional_ic": {"2024-01-02": 0.8}})
     report = ValidationSuite().validate(invented, ledger_path=path, advice_verifier=verifier)
     claim = next(c for c in report.checks if c.name == "authoritative_advice_history")
     assert claim.verdict == CheckVerdict.FAIL and "cannot claim numerical" in claim.explanation
