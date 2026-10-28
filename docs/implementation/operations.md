@@ -124,6 +124,9 @@ use synthetic wire fixtures; no vendor calls or authenticated acceptance occurre
 
 ## Income source admission
 
+Current acquisition checklist and candidate disposition:
+[income source acceptance](income-source-acceptance.md).
+
 Operating refresh permits two additional closed GET operations:
 `alpaca_cash_dividend_sources` and `alpaca_account_dividend_sources`. Both require
 an explicit instrument and `started_at`/`ended_at`; the account operation also
