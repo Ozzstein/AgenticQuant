@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import joblib
 import numpy as np
@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 from src.data.evidence.store import canonical_bytes, digest
 from src.data.features.metrics import prediction_metrics
 from src.domain.common import RunContext
-from src.domain.market import ModelArtifact
+from src.domain.market import EnsembleChildSpec, EnsembleComposition, ModelArtifact, ModelFileProof
 from src.utils.config import PROJECT_ROOT, AppConfig, get_config
 from src.utils.exceptions import ModelError
 from src.utils.logger import get_logger
@@ -73,7 +73,8 @@ class ModelWrapper:
     train / predict / evaluate / save / load API.
     """
 
-    def __init__(self, model_name: str = "LightGBM", config: AppConfig | None = None) -> None:
+    def __init__(self, model_name: str = "LightGBM", config: AppConfig | None = None, *,
+                 _exact_parameters: dict | None = None) -> None:
         """Initialise the wrapper.
 
         Args:
@@ -88,9 +89,11 @@ class ModelWrapper:
                 f"Unknown model '{model_name}'. Available: {list(REGISTRY.keys())}"
             )
         self.model_name = model_name
-        self.config = config or get_config()
+        # Canonical builds never consult ambient config, YAML or environment.
+        # Keep the original diagnostic constructor and serialization unchanged.
+        self.config = config if _exact_parameters is not None else config or get_config()
         self.model: Any = None
-        self._params: dict[str, Any] = self._load_params()
+        self._params: dict[str, Any] = dict(_exact_parameters) if _exact_parameters is not None else self._load_params()
         self._feature_names: tuple[str, ...] = ()
         self._imputer = None
         self._scaler = None
@@ -423,3 +426,53 @@ class ModelWrapper:
         except Exception as exc:
             raise ModelError(f"Failed to load versioned model: {exc}") from exc
         return self
+
+
+class ModelProtocol(Protocol):
+    model_name: str
+    artifact: ModelArtifact | None
+
+    def train(self, X_train, y_train, **temporal_metadata): ...
+    def predict(self, X, **temporal_metadata): ...
+    def save(self, path): ...
+    def load(self, path): ...
+    def evaluate(self, X, y): ...
+    def get_feature_importance(self): ...
+
+
+def resolved_child_spec(model_name: str, parameters=()) -> EnsembleChildSpec:
+    """Freeze coded defaults + explicit overrides now, never at ensemble fit time."""
+    overrides = EnsembleChildSpec(model_name=model_name, parameters=tuple(parameters))
+    resolved = {**DEFAULT_PARAMS[model_name], **dict(overrides.parameters)}
+    return EnsembleChildSpec(model_name=model_name, parameters=tuple(sorted(resolved.items())))
+
+
+def build_model(model_name: str, *, parameters=(),
+                ensemble_composition: EnsembleComposition | None = None) -> ModelProtocol:
+    """Canonical explicit construction; this performs no approval or fitting."""
+    if model_name == "Ensemble":
+        if parameters or not isinstance(ensemble_composition, EnsembleComposition):
+            raise ModelError("canonical Ensemble requires composition and empty parent parameters")
+        from src.core.ensemble import EnsembleModel
+        return EnsembleModel(composition=ensemble_composition)
+    if ensemble_composition is not None or model_name not in REGISTRY:
+        raise ModelError("unsupported model/composition combination")
+    spec = resolved_child_spec(model_name, parameters)
+    return ModelWrapper(model_name, _exact_parameters=dict(spec.parameters))
+
+
+def model_file_proof(path: str | Path) -> ModelFileProof:
+    """Check exact file/component identities, without deserialization or authority."""
+    from src.data.model_artifacts import checked_pair
+    _, sidecar, artifact = checked_pair(path)
+    from src.domain.market import EnsembleArtifact
+    return ModelFileProof(model_name=artifact.model_name, payload_hash=artifact.payload_hash,
+                          sidecar_hash=digest(sidecar), artifact_hash=artifact.content_hash(),
+                          ensemble_composition_hash=artifact.composition.content_hash() if isinstance(artifact, EnsembleArtifact) else None)
+
+
+def load_model(path: str | Path, *, expected: ModelFileProof,
+               ensemble_composition: EnsembleComposition | None = None) -> ModelProtocol:
+    """Load application-owned bytes after all expected file/component checks."""
+    from src.data.model_artifacts import load_canonical_model
+    return load_canonical_model(path, expected=expected, composition=ensemble_composition)

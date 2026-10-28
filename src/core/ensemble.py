@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,10 @@ import pandas as pd
 
 from src.core.model_zoo import REGISTRY, ModelWrapper
 from src.data.evidence.store import canonical_bytes
+from src.data.features.identity import training_frame_identity
 from src.data.features.metrics import prediction_metrics
+from src.domain.common import RunContext
+from src.domain.market import EnsembleComposition
 from src.utils.config import AppConfig, get_config
 from src.utils.exceptions import ModelError
 from src.utils.logger import get_logger
@@ -35,6 +39,8 @@ class EnsembleModel:
         custom_weights: dict[str, float] | None = None,
         val_fraction: float = 0.15,
         config: AppConfig | None = None,
+        *,
+        composition: EnsembleComposition | None = None,
     ) -> None:
         """Initialise EnsembleModel.
 
@@ -51,7 +57,23 @@ class EnsembleModel:
         Raises:
             ModelError: If any name in model_names is not in REGISTRY.
         """
-        self.config = config or get_config()
+        self._composition = composition
+        self.artifact = None
+        self._selection_models = {}
+        self._training_frames = None
+        self._selection_frames = None
+        self._validation_proof = None
+        self._canonical_pair = None
+        self._canonical_fingerprint = None
+        if composition is not None:
+            # A canonical composition is the complete constructor authority.
+            # Even a supplied diagnostic config cannot override it.
+            config = None
+            model_names = [c.model_name for c in composition.children]
+            weighting = composition.weighting
+            custom_weights = dict(composition.custom_weights)
+            val_fraction = composition.validation_fraction or .15
+        self.config = config if composition is not None else config or get_config()
         self._weighting = weighting
         self._val_fraction = val_fraction
         self._custom_weights = custom_weights or {}
@@ -77,7 +99,17 @@ class EnsembleModel:
     @property
     def model_name(self) -> str:
         """Human-readable name showing constituent models."""
+        return "Ensemble" if self._composition is not None else self.display_name
+
+    @property
+    def display_name(self) -> str:
         return f"Ensemble({'+'.join(self._model_names)})"
+
+    def _new_child(self, name):
+        if self._composition is not None:
+            spec = next(c for c in self._composition.children if c.model_name == name)
+            return ModelWrapper(name, _exact_parameters=dict(spec.parameters))
+        return ModelWrapper(name, self.config)
 
     def _to_df_series(
         self,
@@ -122,13 +154,40 @@ class EnsembleModel:
         if X_df.empty or not X_df.index.equals(y_s.index) or not X_df.index.is_unique:
             raise ModelError("ensemble feature/label identity mismatch")
         self._validate_fit_inputs(X_df, y_s, temporal_metadata)
+        if self._composition is not None:
+            if not isinstance(temporal_metadata.get("context"), RunContext) or temporal_metadata.get("label_end_at") is None:
+                raise ModelError("canonical ensemble requires actual context and true label_end_at")
+            if any(not isinstance(temporal_metadata.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", temporal_metadata[key]) for key in ("feature_spec_hash", "data_snapshot_hash")):
+                raise ModelError("canonical feature and data SHA256 identities required")
+            if pd.Timestamp(temporal_metadata["context"].as_of).value % 1000:
+                raise ModelError("canonical datetime contracts cannot round sub-microsecond fit cutoff")
+            if not isinstance(X_df.index, pd.MultiIndex) or X_df.index.names != ["datetime", "instrument"] or X_df.index.nlevels != 2:
+                raise ModelError("canonical datetime/instrument identities required")
+            if any(not isinstance(v, str) or not v for v in X_df.index.get_level_values("instrument")):
+                raise ModelError("canonical instrument IDs required")
+            policy = temporal_metadata.get("availability_policy", "decision-time-vintage-1")
+            purge = "outcome-end-before-validation-1" if policy == "captured-vintage-at-fit-1" else "label-availability-before-validation-1"
+            if self._weighting == "ic_weighted" and self._composition.purge_policy != purge:
+                raise ModelError("composition purge differs from training availability policy")
+            from src.data.model_artifacts import validate_canonical_inputs
+            validate_canonical_inputs(X_df, y_s, **{name:temporal_metadata[name]
+                for name in ("feature_available_at", "label_available_at", "label_end_at")})
         # Once a new fit starts, failure must not leave old executable weights
         # paired with new validation evidence or partially refitted children.
         self._trained = False
         self._models = {}
         self._weights = {}
         self.validation_evidence = {}
+        self.artifact = None
+        self._selection_models = {}
+        self._selection_frames = None
+        self._validation_proof = None
+        self._canonical_pair = None
+        self._canonical_fingerprint = None
         self._train_metadata = temporal_metadata
+        if self._composition is not None:
+            self._training_frames = training_frame_identity(X_df, y_s, temporal_metadata["feature_available_at"],
+                temporal_metadata["label_available_at"], temporal_metadata["label_end_at"])
         n = len(X_df)
 
         if self._weighting == "equal":
@@ -138,13 +197,13 @@ class EnsembleModel:
         elif self._weighting == "custom":
             if set(self._custom_weights) != set(self._model_names):
                 raise ModelError("custom weights must cover exactly the configured models")
-            weights = self._normalise(self._custom_weights)
+            weights = dict(self._custom_weights) if self._composition is not None else self._normalise(self._custom_weights)
         else:
             raise ModelError("unsupported weighting")
 
         # Re-train all sub-models on the full dataset
         for name in self._model_names:
-            wrapper = ModelWrapper(name, self.config)
+            wrapper = self._new_child(name)
             try:
                 wrapper.train(X_df, y_s, **temporal_metadata)
             except Exception as exc:
@@ -251,16 +310,30 @@ class EnsembleModel:
         if metadata.get("context") is not None and cutoff is not None and not captured:
             metadata["context"] = metadata["context"].model_copy(update={"as_of": (cutoff - pd.Timedelta(nanoseconds=1000)).to_pydatetime()})
         ics = {}
+        predictions = {}
         for name in self._model_names:
-            wrapper = ModelWrapper(name, self.config)
+            wrapper = self._new_child(name)
             wrapper.train(X_sub, y_sub, **metadata)
             # Intentionally non-contextual: this is internal retrospective
             # selection after whole-input eligibility checks, not external
             # temporal inference at a fabricated post-fit timestamp.
-            ic = prediction_metrics(wrapper.predict(X_val), y_val)["ic"]
+            prediction = wrapper.predict(X_val)
+            ic = prediction_metrics(prediction, y_val)["ic"]
             if not math.isfinite(ic):
                 raise ModelError(f"undefined validation IC for {name}")
             ics[name] = ic
+            if self._composition is not None:
+                self._selection_models[name] = wrapper
+                predictions[name] = prediction
+        if self._composition is not None:
+            from src.data.model_artifacts import validation_proof
+            self._selection_frames = tuple(training_frame_identity(X.loc[mask], y.loc[mask],
+                self._train_metadata["feature_available_at"].loc[mask],
+                self._train_metadata["label_available_at"].loc[mask],
+                self._train_metadata["label_end_at"].loc[mask]) for mask in (train_mask, val_mask))
+            self._validation_proof = validation_proof(y_val, predictions,
+                **{field:self._train_metadata[field].loc[val_mask]
+                   for field in ("feature_available_at", "label_available_at", "label_end_at")})
         fit_context = self._train_metadata.get("context")
         weight_context = metadata.get("context")
         self.validation_evidence = {
@@ -357,6 +430,10 @@ class EnsembleModel:
     def save(self, path: str | Path) -> None:
         if not self._trained:
             raise ModelError("Cannot save an untrained EnsembleModel.")
+        if self._composition is not None:
+            from src.data.model_artifacts import save_ensemble
+            save_ensemble(self, path)
+            return
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
         models = {}
@@ -371,6 +448,18 @@ class EnsembleModel:
         os.replace(temporary, target / "manifest.json")
 
     def load(self, path: str | Path) -> "EnsembleModel":
+        if self._composition is not None:
+            from src.core.model_zoo import load_model, model_file_proof
+            model = load_model(path, expected=model_file_proof(path), ensemble_composition=self._composition)
+            self.__dict__.update(model.__dict__)
+            return self
+        # Backward-compatible direct diagnostic API only; shared canonical
+        # loader never falls back to legacy directories.
+        return self.load_legacy_directory(path)
+
+    def load_legacy_directory(self, path: str | Path) -> "EnsembleModel":
+        self.artifact = None
+        self._composition = None
         try:
             target = Path(path)
             manifest = json.loads((target / "manifest.json").read_text())
