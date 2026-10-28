@@ -40,7 +40,12 @@ class USQlibScenario(VersionedContract):
             raise ValueError("explicit US scenario and positive label horizon required")
 
 
-def export_bundle(snapshot: MarketSnapshot, path: str | Path, *, require_vwap: bool = True) -> dict:
+def _daily_inputs(snapshot: MarketSnapshot, *, require_vwap: bool):
+    """Validate the declared daily grid before writing or admitting a bundle.
+
+    Each instrument's supplied endpoints bound the checked grid. No listing,
+    delisting or index-membership coverage is inferred outside those endpoints.
+    """
     if snapshot.gaps:
         raise ValueError("cannot export a bundle with unresolved coverage gaps")
     if not snapshot.bars or any(b.market_type != "equity" for b in snapshot.bars):
@@ -50,24 +55,42 @@ def export_bundle(snapshot: MarketSnapshot, path: str | Path, *, require_vwap: b
         raise ValueError("Qlib bundle requires one explicit price convention")
     if require_vwap and any(b.vwap is None for b in snapshot.bars):
         raise ValueError("Alpha158 requires actual VWAP; OHLC typical-price substitution is forbidden")
+    first, last = min(b.session for b in snapshot.bars), max(b.session for b in snapshot.bars)
+    schedule = sessions(first, last, calendar="XNYS")
+    calendar = list(schedule)
+    offsets = {day: i for i, day in enumerate(calendar)}
     records = {e.evidence_id: e for e in snapshot.evidence}
+    grouped, seen = {}, set()
     for bar in snapshot.bars:
+        key = (bar.instrument.instrument_id, bar.session)
+        if key in seen:
+            raise ValueError("duplicate daily instrument/session in Qlib snapshot")
+        seen.add(key)
+        if bar.calendar != "XNYS" or bar.session not in schedule:
+            raise ValueError("Qlib daily bar requires an actual XNYS session/calendar")
+        if (bar.opened_at, bar.closed_at) != schedule[bar.session]:
+            raise ValueError("Qlib daily bar must span the actual XNYS session open/close")
         records[bar.evidence_id].require_available(bar.closed_at)
+        grouped.setdefault(bar.instrument.instrument_id, []).append(bar)
+    for identity, bars in grouped.items():
+        start, stop = min(offsets[b.session] for b in bars), max(offsets[b.session] for b in bars)
+        observed = {b.session for b in bars}
+        missing = [day for day in calendar[start:stop+1] if day not in observed]
+        if missing:
+            raise ValueError(f"unresolved internal daily session gap for {identity}: {missing[0]}")
+    return calendar, grouped, bases
+
+
+def export_bundle(snapshot: MarketSnapshot, path: str | Path, *, require_vwap: bool = True) -> dict:
+    calendar, grouped, bases = _daily_inputs(snapshot, require_vwap=require_vwap)
     root = Path(path)
     if root.exists() and any(root.iterdir()):
         raise ValueError("bundle target must be empty; published bundles are immutable")
     root.mkdir(parents=True, exist_ok=True)
-    first, last = min(b.session for b in snapshot.bars), max(b.session for b in snapshot.bars)
-    calendar = list(sessions(first, last, calendar="XNYS"))
     offsets = {day: i for i, day in enumerate(calendar)}
     for directory in ("calendars", "instruments", "features"):
         (root / directory).mkdir(exist_ok=True)
     (root / "calendars/day.txt").write_text("\n".join(calendar) + "\n")
-    grouped = {}
-    for bar in snapshot.bars:
-        if bar.session not in offsets:
-            raise ValueError("equity bar on non-session day")
-        grouped.setdefault(bar.instrument.instrument_id, []).append(bar)
     instrument_map, instrument_lines = {}, []
     fields = ("open", "high", "low", "close", "volume", "vwap")
     for identity, bars in sorted(grouped.items()):
@@ -103,7 +126,13 @@ def verify_bundle(scenario: USQlibScenario) -> dict:
     if digest(raw) != scenario.bundle_hash:
         raise ValueError("Qlib bundle manifest hash mismatch")
     manifest = json.loads(raw)
-    if manifest["region"] != "us" or manifest["price_basis"] != scenario.price_basis:
+    snapshot = MarketSnapshot.model_validate(manifest["snapshot"])
+    # Older published files may have valid hashes but an invalid daily grid.
+    # Verification never repairs/re-exports them in place.
+    expected_calendar, _, _ = _daily_inputs(snapshot, require_vwap=False)
+    if (manifest["region"] != "us" or manifest.get("calendar") != "XNYS"
+            or manifest["price_basis"] != scenario.price_basis
+            or {b.price_basis for b in snapshot.bars} != {scenario.price_basis}):
         raise ValueError("Qlib bundle market/convention mismatch")
     for filename, expected in manifest["files"].items():
         file_path = root / filename
@@ -112,7 +141,10 @@ def verify_bundle(scenario: USQlibScenario) -> dict:
     ids = set(manifest["instrument_map"].values())
     if not set(scenario.universe) <= ids or scenario.benchmark not in ids:
         raise ValueError("Qlib scenario instrument/benchmark coverage missing")
-    calendar = pd.DatetimeIndex(pd.to_datetime((root / "calendars/day.txt").read_text().splitlines()))
+    calendar_lines = (root / "calendars/day.txt").read_text().splitlines()
+    if calendar_lines != expected_calendar:
+        raise ValueError("Qlib calendar differs from actual snapshot XNYS sessions")
+    calendar = pd.DatetimeIndex(pd.to_datetime(calendar_lines))
     for interval in (scenario.train, scenario.valid, scenario.test):
         if pd.Timestamp(interval[0]) < calendar[0] or pd.Timestamp(interval[1]) > calendar[-1]:
             raise ValueError("scenario dates outside bundle coverage")
