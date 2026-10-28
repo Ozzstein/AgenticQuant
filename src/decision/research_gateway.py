@@ -33,6 +33,7 @@ import httpx
 from pydantic import Field, field_validator, model_validator
 
 from src.agents.budget import AgentBudgetError, AgentCallBudget
+from src.agents.receipts import ACCOUNTING_POLICY, capture_openai_usage, read_usage_summary
 from src.domain.common import NonEmptyString, UtcTimestamp, VersionedContract
 
 CHAT_PATH = "/v1/chat/completions"
@@ -222,41 +223,33 @@ class ResearchGateway:
 
     def receipt(self):
         """No keys, bearer hashes, prompts, generated content or filesystem paths."""
-        with self._connect() as db:
-            db.row_factory = sqlite3.Row
-            db.execute("BEGIN")
-            rows = db.execute(
-                "SELECT * FROM calls WHERE run_id=?", (self.config.run_id,)
-            ).fetchall()
-            day_rows = db.execute(
-                "SELECT charged_tokens,charged_cost FROM calls WHERE day=?",
-                (datetime.now(timezone.utc).date().isoformat(),),
-            ).fetchall()
-        known = [r for r in rows if r["input_tokens"] is not None]
-        uncertain = [r for r in rows if r["input_tokens"] is None]
-        charged_cost = sum((Decimal(r["charged_cost"]) for r in rows), Decimal(0))
-        charged_tokens = sum(r["charged_tokens"] for r in rows)
-        expired = datetime.now(timezone.utc) >= self.config.expires_at
-        price_ready = all(
-            p.effective_at <= datetime.now(timezone.utc)
-            for p in (self.config.chat, self.config.embedding)
+        now = datetime.now(timezone.utc)
+        summary = read_usage_summary(
+            self.config.budget_store_path,
+            day=now.date().isoformat(),
+            run_id=self.config.run_id,
+            as_of=now,
         )
-        blocked = any(r["status"] in ("usage_overrun", "model_mismatch") for r in rows)
+        if summary["status"] != "available":
+            raise ValueError("verified gateway accounting unavailable")
+        run, day = summary["run_usage"], summary["day_usage"]
+        charged_cost = Decimal(run["conservative_cost_usd"])
+        charged_tokens = run["conservative_tokens"]
+        expired = now >= self.config.expires_at
+        price_ready = all(p.effective_at <= now for p in (self.config.chat, self.config.embedding))
+        blocked = run["breached"] or day["breached"]
         remaining = {
-            "requests": max(0, self.config.max_requests - len(rows)),
+            "requests": max(0, self.config.max_requests - run["requests"]),
             "tokens": max(0, self.config.max_tokens - charged_tokens),
             "cost_usd": str(max(Decimal(0), self.config.max_cost_usd - charged_cost)),
         }
         day_remaining = {
-            "requests": max(0, self.config.max_requests_per_day - len(day_rows)),
-            "tokens": max(
-                0, self.config.max_tokens_per_day - sum(r["charged_tokens"] for r in day_rows)
-            ),
+            "requests": max(0, self.config.max_requests_per_day - day["requests"]),
+            "tokens": max(0, self.config.max_tokens_per_day - day["conservative_tokens"]),
             "cost_usd": str(
                 max(
                     Decimal(0),
-                    self.config.max_cost_per_day_usd
-                    - sum((Decimal(r["charged_cost"]) for r in day_rows), Decimal(0)),
+                    self.config.max_cost_per_day_usd - Decimal(day["conservative_cost_usd"]),
                 )
             ),
         }
@@ -289,7 +282,16 @@ class ResearchGateway:
             "admission_available": admission_available,
             "provider_configured": bool(self._provider_key.strip()),
             "authenticated_provider_validation": "unverified",
-            "cost_semantics": "reported_tokens_at_configured_rates",
+            "cost_semantics": "verified_usage_with_reservation_floor",
+            "accounting": {
+                "schema_version": "2.0",
+                "policy": ACCOUNTING_POLICY,
+                "run_id": self.config.run_id,
+                "as_of": summary["as_of"],
+                "day_id": summary["day"],
+                "run": run,
+                "day": day,
+            },
             "expired": expired,
             "blocked": blocked,
             "models": {
@@ -309,28 +311,23 @@ class ResearchGateway:
             "remaining": remaining,
             "day_remaining": day_remaining,
             "charged": {
-                "requests": len(rows),
+                "requests": run["requests"],
                 "tokens": charged_tokens,
                 "cost_usd": str(charged_cost),
             },
             "actual": {
-                "requests_with_usage": len(known),
-                "input_tokens": sum(r["input_tokens"] for r in known),
-                "output_tokens": sum(r["output_tokens"] for r in known),
-                "cost_usd": str(sum((Decimal(r["charged_cost"]) for r in known), Decimal(0))),
+                "requests_with_usage": run["requests"] - run["unpriced_requests"],
+                "input_tokens": run["known_input_tokens"],
+                "output_tokens": run["known_output_tokens"],
+                "cost_usd": run["actual_cost_usd"],
             },
             "uncertain": {
-                "requests": len(uncertain),
-                "reserved_tokens": sum(r["charged_tokens"] for r in uncertain),
-                "reserved_cost_usd": str(
-                    sum((Decimal(r["charged_cost"]) for r in uncertain), Decimal(0))
-                ),
+                "requests": run["unpriced_requests"],
+                "reserved_tokens": run["uncertain_tokens"],
+                "reserved_cost_usd": run["uncertain_cost_usd"],
             },
-            "observed_models": sorted({r["actual_model"] for r in rows if r["actual_model"]}),
-            "statuses": {
-                status: sum(r["status"] == status for r in rows)
-                for status in sorted({r["status"] for r in rows})
-            },
+            "observed_models": run["observed_models"],
+            "statuses": run["statuses"],
             "streaming": False,
         }
 
@@ -374,7 +371,10 @@ class ResearchGateway:
             )
             try:
                 call_id, price, remaining = budget.reserve_bound(
-                    model.model, input_bound, output_limit
+                    model.model,
+                    input_bound,
+                    output_limit,
+                    request_hash=hashlib.sha256(_json_bytes(payload)).hexdigest(),
                 )
             except AgentBudgetError:
                 raise GatewayError(
@@ -387,7 +387,7 @@ class ResearchGateway:
             return exc.status, {
                 "error": {"message": exc.message, "type": "gateway_error", "code": exc.code}
             }
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, ValueError):
             return 503, {
                 "error": {
                     "message": "Budget storage unavailable",
@@ -569,10 +569,11 @@ class ResearchGateway:
                     return response.status_code, b"".join(chunks)
 
     def _call(self, path, payload, count, call_id, price, budget, timeout):
-        started, response, raw, status = time.monotonic(), None, None, "failed"
+        started, response, evidence, status = time.monotonic(), None, None, "failed"
         failure = None
         try:
             code, response = asyncio.run(self._post(path, payload, timeout))
+            evidence = capture_openai_usage(response, embedding=path == EMBEDDING_PATH)
             if code != 200:
                 status = "upstream_error"
                 raise GatewayError(
@@ -587,14 +588,6 @@ class ResearchGateway:
                     502, "invalid_response", "Malformed provider response; reservation retained"
                 ) from None
             actual_model = result.get("model")
-            raw = SimpleNamespace(
-                usage_metadata={},
-                response_metadata={
-                    "model": actual_model
-                    if isinstance(actual_model, str) and len(actual_model) <= 160
-                    else None
-                },
-            )
             if actual_model != payload["model"]:
                 status = "model_mismatch"
                 raise GatewayError(
@@ -617,7 +610,6 @@ class ResearchGateway:
                 raise GatewayError(
                     502, status, "Provider usage is unavailable or invalid; reservation retained"
                 )
-            raw.usage_metadata = {"input_tokens": input_tokens, "output_tokens": output_tokens}
             if chat and output_tokens > payload["max_completion_tokens"]:
                 status = "usage_overrun"
                 raise GatewayError(502, status, "Provider exceeded the output limit; run blocked")
@@ -640,16 +632,16 @@ class ResearchGateway:
             budget.finish(
                 call_id,
                 price,
-                raw=raw,
+                evidence=evidence,
                 status=status,
                 elapsed_ms=(time.monotonic() - started) * 1000,
             )
-        except AgentBudgetError:
-            status = "usage_overrun"
+        except AgentBudgetError as exc:
+            status = exc.status or "accounting_unavailable"
             failure = GatewayError(
                 502,
                 status,
-                "Provider usage exceeded reservation; actual charge recorded and run blocked",
+                "Provider accounting failed verification; available usage and conservative charge retained",
             )
         with self._connect() as db:
             db.execute(

@@ -548,4 +548,8 @@ def test_abrupt_termination_reservation_persists_without_false_actual_usage(gate
     assert before["uncertain"]["reserved_tokens"] == 10100
     assert before["actual"]["requests_with_usage"] == 0
     assert restarted.dispatch("GET", RECEIPT_PATH, "Bearer " + BEARER)[0] == 200
-    assert restarted.receipt() == before
+    after = restarted.receipt()
+    before_clock = before["accounting"].pop("as_of")
+    after_clock = after["accounting"].pop("as_of")
+    assert datetime.fromisoformat(after_clock) >= datetime.fromisoformat(before_clock)
+    assert after == before
