@@ -88,6 +88,9 @@ def _order_binding(archive, reference):
         and at >= intent.expires_at
     ):
         raise LedgerError("native original submission claim identity/admission clock differs")
+    from src.execution.execution_admission import _read_submission_sources
+
+    _read_submission_sources(archive, intent, claim)
     identity_hash = digest(
         {key: outbox[key] for key in ("account", "intent", "venue", "client_id", "rules")}
     )
@@ -220,19 +223,9 @@ def _alpaca_report(archive, report, intent, native_client):
         and raw.get("params") == {"client_order_id": native_client}
         and raw.get("request") is None
     )
-    submission = {
-        "symbol": symbol,
-        "qty": str(intent.quantity),
-        "side": intent.side,
-        "type": intent.order_type,
-        "time_in_force": intent.tif.lower(),
-        "client_order_id": native_client,
-        "extended_hours": False,
-        "order_class": "simple",
-    }
-    for name in ("limit_price", "stop_price", "trail_price", "trail_percent"):
-        if getattr(intent, name) is not None:
-            submission[name] = str(getattr(intent, name))
+    from src.execution.native_submission_terms import submission_payload
+
+    submission = submission_payload("alpaca", intent, native_client, symbol=symbol)
     submitted = (
         raw["method"] == "POST"
         and raw["path"] == "/v2/orders"

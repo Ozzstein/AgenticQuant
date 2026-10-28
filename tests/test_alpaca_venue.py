@@ -482,7 +482,7 @@ def test_explicit_account_binding_and_no_direct_owner_bypass(tmp_path):
     adapter.capture()
     with pytest.raises(LedgerError, match="unowned"):
         engine.reconcile_balances(as_of=T)
-    with pytest.raises(LedgerError, match="unowned"):
+    with pytest.raises(LedgerError, match="execution compliance FAIL"):
         engine.prepare(order, {A.instrument_id: metadata()}, as_of=T)
     assert not engine.ledger.pending(order.account_id)
     engine.ledger.close()

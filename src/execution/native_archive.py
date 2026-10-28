@@ -113,13 +113,16 @@ class NativeArchive:
         return value, self.reference("ledger-event", record_id, row["payload"]), row["rowid"]
 
     def raw(self, record_id, venue, network):
+        return self._response(record_id, venue, network, statuses=(200,))
+
+    def _response(self, record_id, venue, network, *, statuses):
         if not record_id.startswith(venue + "-http:"):
             raise LedgerError("wrong native raw source namespace")
         value, reference, sequence = self.event(record_id, content_addressed=True)
         at = _utc(datetime.fromisoformat(value["observed_at"]))
         if (
             value.get("complete") is not True
-            or value.get("status") != 200
+            or value.get("status") not in statuses
             or value.get("content_encoding") not in ("", "identity")
             or value.get("error")
             or at > self.as_of

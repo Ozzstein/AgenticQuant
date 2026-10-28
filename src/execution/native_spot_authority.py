@@ -406,22 +406,9 @@ def binance_report(archive, report, intent, native_client):
         if params not in allowed:
             raise LedgerError("native Binance original order query differs")
     elif method == "POST":
-        from src.execution.binance_venue import order_type, trailing_delta
+        from src.execution.native_submission_terms import submission_payload
 
-        expected_params = {
-            "symbol": market.symbol,
-            "side": intent.side.upper(),
-            "type": order_type(intent),
-            "quantity": str(intent.quantity),
-            "newClientOrderId": native_client,
-            "newOrderRespType": "RESULT",
-        }
-        if intent.order_type == "limit":
-            expected_params.update(price=str(intent.limit_price), timeInForce=intent.tif)
-        if intent.order_type == "stop":
-            expected_params["stopPrice"] = str(intent.stop_price)
-        elif intent.order_type == "trailing_stop":
-            expected_params["trailingDelta"] = trailing_delta(intent)
+        expected_params = submission_payload("binance", intent, native_client, symbol=market.symbol)
         if params != expected_params:
             raise LedgerError("native Binance original submission payload differs")
     else:

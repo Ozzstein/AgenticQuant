@@ -69,22 +69,9 @@ class BinanceVenue(CCXTSpotVenue):
         # These explicit validation/auth rejection codes do not mean acceptance.
         # Matching-engine -2010 can include duplicate client identity; preserve
         # uncertainty and query it, never automatically retry an order.
-        definite = {
-            -1013,
-            -1100,
-            -1101,
-            -1102,
-            -1103,
-            -1111,
-            -1116,
-            -1117,
-            -1118,
-            -1121,
-            -1130,
-            -2014,
-            -2015,
-        }
-        if submitting and status == 400 and code in definite:
+        from src.execution.native_submission_terms import definitive_rejection
+
+        if submitting and definitive_rejection(self.venue, status, value):
             raise DefinitiveRejection("Binance rejected native order; receipt " + evidence)
         raise LedgerError("Binance native request unresolved/rejected; receipt " + evidence)
 
@@ -387,20 +374,12 @@ class BinanceVenue(CCXTSpotVenue):
     @bounded
     def submit(self, intent, client_order_id, rules, as_of):
         self._claim(intent, client_order_id, rules, as_of)
-        params = {
-            "symbol": self._market(intent.instrument).symbol,
-            "side": intent.side.upper(),
-            "type": order_type(intent),
-            "quantity": str(intent.quantity),
-            "newClientOrderId": client_order_id,
-            "newOrderRespType": "RESULT",
-        }
-        if intent.order_type == "limit":
-            params.update(price=str(intent.limit_price), timeInForce=intent.tif)
-        if intent.order_type == "stop":
-            params["stopPrice"] = str(intent.stop_price)
-        elif intent.order_type == "trailing_stop":
-            params["trailingDelta"] = trailing_delta(intent)
+        from src.execution.native_submission_terms import submission_payload
+
+        market = self._market(intent.instrument)
+        params = submission_payload(
+            self.venue, intent, client_order_id, symbol=market.symbol, native_id=market.native_id
+        )
         order, observed, reference = self._request(
             "order", method="POST", params=params, submitting=True
         )

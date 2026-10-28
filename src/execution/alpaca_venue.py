@@ -261,6 +261,12 @@ class AlpacaVenue:
             raise LedgerError("Alpaca submission requires the exact durable submitting claim")
         with self.ledger.atomic():
             key = "alpaca-submit-attempt:" + intent.intent_id
+            from src.execution.execution_admission import require_execution_admission
+
+            try:
+                require_execution_admission(self.ledger, self.account_id)
+            except LedgerError as exc:
+                raise SubmissionNotAttempted(str(exc)) from None
             if self.ledger.db.execute(
                 "SELECT 1 FROM events WHERE account=? AND id=?", (self.account_id, key)
             ).fetchone():
@@ -279,6 +285,9 @@ class AlpacaVenue:
                     }
                 ),
             )
+            from src.execution.execution_admission import _record_submission_claimed
+
+            _record_submission_claimed(self.ledger, self.account_id, intent.intent_id)
 
     def _request(self, method, path, *, params=None, payload=None, missing=False, submitting=False):
         # httpx performs no implicit order retry. A timeout after POST acceptance
@@ -333,7 +342,9 @@ class AlpacaVenue:
                 code = json.loads(content).get("code")
             except (ValueError, AttributeError):
                 pass
-            if submitting and status in (400, 401, 403, 422) and str(code) != "42210000":
+            from src.execution.native_submission_terms import definitive_rejection
+
+            if submitting and definitive_rejection(self.venue, status, {"code": code}):
                 raise DefinitiveRejection(
                     f"Alpaca rejected submission: HTTP {status}, evidence {evidence_id}"
                 )
@@ -620,19 +631,9 @@ class AlpacaVenue:
                 "Alpaca trailing path requires whole shares and GTC/DAY before submission"
             )
         self._require_claim(intent, client_order_id, rules, as_of)
-        payload = {
-            "symbol": rules.symbol,
-            "qty": str(intent.quantity),
-            "side": intent.side,
-            "type": intent.order_type,
-            "time_in_force": intent.tif.lower(),
-            "client_order_id": client_order_id,
-            "extended_hours": False,
-            "order_class": "simple",
-        }
-        for key in ("limit_price", "stop_price", "trail_price", "trail_percent"):
-            if getattr(intent, key) is not None:
-                payload[key] = str(getattr(intent, key))
+        from src.execution.native_submission_terms import submission_payload
+
+        payload = submission_payload(self.venue, intent, client_order_id, symbol=rules.symbol)
         order, observed, reference = self._request(
             "POST", "/v2/orders", payload=payload, submitting=True
         )

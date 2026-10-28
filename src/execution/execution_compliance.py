@@ -414,6 +414,33 @@ def collect(ledger, account_id):
                 reference.record_id for _, exported in verified for _, reference in exported.sources
             }
             known_sources.update(row["evidence"] for row, _ in verified)
+            # Missing report indexes/state flags cannot assert absence after an
+            # actual transmission. Only a verified report or the closed native
+            # rejection parser closes an original attempt without execution.
+            resolved_intents = {row["intent"] for row, _ in verified}
+            for row in retained:
+                if row["id"].startswith("venue-submission-claimed:"):
+                    from src.execution.execution_admission import _read_submission_sources
+
+                    try:
+                        claimed = decode(row["payload"])
+                        claim, _, _ = archive.event(claimed["attempt_id"])
+                        intent = ledger.order(account_id, row["id"].split(":", 1)[1])["intent"]
+                        _read_submission_sources(archive, intent, claim)
+                    except _INVALID:
+                        failed("missing_original_submission_attempt", row)
+                if "-submit-attempt:" not in row["id"] or row["id"].split("-submit-attempt:", 1)[
+                    0
+                ] not in (*_NATIVE, "lean"):
+                    continue
+                intent_id = row["id"].split("-submit-attempt:", 1)[1]
+                if intent_id not in resolved_intents:
+                    from src.execution.native_rejections import reexport_rejection
+
+                    try:
+                        reexport_rejection(archive, intent_id)
+                    except _INVALID:
+                        failed("unresolved_submission_attempt", row)
             for row in retained:
                 try:
                     if row["id"].startswith(tuple(venue + "-http:" for venue in _NATIVE)):
@@ -450,12 +477,21 @@ def collect(ledger, account_id):
                     failed("unproved_booked_execution")
             if any(identity not in fills for identity in authorities):
                 failed("unapplied_native_execution")
-            if any(
-                row["state"]
-                in ("submitting", "ambiguous", "reconciliation_required", "cancel_pending")
+            pending = [
+                row
                 for row in tables["venue_outbox"]
-            ):
-                failed("unresolved_native_outbox")
+                if row["state"]
+                in ("submitting", "ambiguous", "reconciliation_required", "cancel_pending")
+            ]
+            if pending:
+                from src.execution.execution_admission import _unstarted_submission
+
+                try:
+                    fresh = len(pending) == 1 and _unstarted_submission(archive, pending[0])
+                except _INVALID:
+                    fresh = False
+                if not fresh:
+                    failed("unresolved_native_outbox")
 
         violations = {}
         for authority in authorities.values():

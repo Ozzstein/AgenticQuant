@@ -262,6 +262,12 @@ class CCXTSpotVenue:
             ) from None
         with self.ledger.atomic():
             identity = self.venue + "-submit-attempt:" + intent.intent_id
+            from src.execution.execution_admission import require_execution_admission
+
+            try:
+                require_execution_admission(self.ledger, self.account_id)
+            except LedgerError as exc:
+                raise SubmissionNotAttempted(str(exc)) from None
             if self.ledger.db.execute(
                 "SELECT 1 FROM events WHERE account=? AND id=?", (self.account_id, identity)
             ).fetchone():
@@ -279,6 +285,9 @@ class CCXTSpotVenue:
                     }
                 ),
             )
+            from src.execution.execution_admission import _record_submission_claimed
+
+            _record_submission_claimed(self.ledger, self.account_id, intent.intent_id)
 
     def _fill(
         self,

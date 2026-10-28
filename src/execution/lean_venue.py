@@ -452,6 +452,12 @@ class LeanVenue:
             ) from None
         with self.ledger.atomic():
             key = "lean-submit-attempt:" + intent.intent_id
+            from src.execution.execution_admission import require_execution_admission
+
+            try:
+                require_execution_admission(self.ledger, self.account_id)
+            except LedgerError as exc:
+                raise SubmissionNotAttempted(str(exc)) from None
             if self.ledger.db.execute(
                 "SELECT 1 FROM events WHERE account=? AND id=?", (self.account_id, key)
             ).fetchone():
@@ -471,6 +477,9 @@ class LeanVenue:
                     }
                 ),
             )
+            from src.execution.execution_admission import _record_submission_claimed
+
+            _record_submission_claimed(self.ledger, self.account_id, intent.intent_id)
         return binding
 
     def submit(self, intent, client_order_id, rules, as_of):

@@ -76,29 +76,9 @@ class KrakenVenue(CCXTSpotVenue):
         errors = value.get("error") if isinstance(value, dict) else None
         if missing and status == 200 and errors == ["EOrder:Unknown order"]:
             return None, at, evidence
-        definite = {
-            "EAPI:Invalid key",
-            "EAPI:Invalid signature",
-            "EAPI:Invalid nonce",
-            "EGeneral:Permission denied",
-            "EOrder:Insufficient funds",
-            "EOrder:Order minimum not met",
-            "EOrder:Cost minimum not met",
-            "EOrder:Tick size check failed",
-            "EOrder:Orders limit exceeded",
-            "EOrder:Invalid price",
-        }
-        if (
-            submitting
-            and status == 200
-            and isinstance(errors, list)
-            and errors
-            and all(
-                isinstance(error, str)
-                and (error in definite or error.startswith("EGeneral:Invalid arguments:"))
-                for error in errors
-            )
-        ):
+        from src.execution.native_submission_terms import definitive_rejection
+
+        if submitting and definitive_rejection(self.venue, status, value):
             raise DefinitiveRejection("Kraken rejected native order; receipt " + evidence)
         raise LedgerError("Kraken native response unresolved/rejected; receipt " + evidence)
 
@@ -324,21 +304,12 @@ class KrakenVenue(CCXTSpotVenue):
     @bounded
     def submit(self, intent, client_order_id, rules, as_of):
         self._claim(intent, client_order_id, rules, as_of)
-        params = {
-            "pair": self._market(intent.instrument).native_id,
-            "type": intent.side,
-            "ordertype": order_type(intent),
-            "volume": str(intent.quantity),
-            "cl_ord_id": client_order_id,
-            "oflags": "fciq",
-            "timeinforce": intent.tif,
-        }
-        if intent.order_type == "trailing_stop":
-            params.update(price=trailing_price(intent), trigger="last")
-        elif intent.order_type != "market":
-            params["price"] = str(
-                intent.limit_price if intent.order_type == "limit" else intent.stop_price
-            )
+        from src.execution.native_submission_terms import submission_payload
+
+        market = self._market(intent.instrument)
+        params = submission_payload(
+            self.venue, intent, client_order_id, symbol=market.symbol, native_id=market.native_id
+        )
         native, _, _ = self._request("AddOrder", params=params, submitting=True)
         identities = result(native).get("txid")
         if (

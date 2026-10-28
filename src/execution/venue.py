@@ -461,6 +461,9 @@ class VenueExecution:
                     raise LedgerError("venue target identity changed")
                 intents = [OrderIntent.model_validate(o) for o in payload["intents"]]
             else:
+                from src.execution.execution_admission import require_execution_admission
+
+                require_execution_admission(self.ledger, self.account_id)
                 if self.ledger.pending(self.account_id):
                     raise LedgerError("reconcile/cancel outstanding orders before target routing")
                 if target.sleeve_contributions:
@@ -539,6 +542,9 @@ class VenueExecution:
         if existing:
             self.ledger.submit(intent)
             return self.state(intent.intent_id)
+        from src.execution.execution_admission import require_execution_admission
+
+        require_execution_admission(self.ledger, self.account_id)
         rules = self.adapters[venue].rules(intent.instrument, as_of)
         if rules.venue != venue:
             raise LedgerError("venue rule source mismatch")
@@ -559,6 +565,7 @@ class VenueExecution:
             if existing:
                 self.ledger.submit(intent)  # immutable retry check
                 return self.state(intent.intent_id)
+            require_execution_admission(self.ledger, self.account_id)
             self._require_applied_receipts()
             if self.ledger.db.execute(
                 "SELECT 1 FROM venue_outbox WHERE account=? AND state IN ('submitting','ambiguous','cancel_pending','reconciliation_required')",
@@ -649,8 +656,15 @@ class VenueExecution:
                 self._status(intent_id, "expired")
                 return self.state(intent_id)
             VenueRules.model_validate_json(state["rules"]).require_order(intent, as_of)
+            from src.execution.execution_admission import require_execution_admission
+
+            require_execution_admission(self.ledger, self.account_id)
             self.reconcile_balances(as_of=as_of)
             self._status(intent_id, "submitting")
+            if self.owner == "lean" or state["venue"] in ("alpaca", "binance", "kraken"):
+                from src.execution.execution_admission import _record_submission_start
+
+                _record_submission_start(self.ledger, self.account_id, intent_id, as_of)
         # The durable submitting claim precedes I/O. No network call is retried here.
         try:
             report = self.adapters[state["venue"]].submit(
@@ -1037,6 +1051,16 @@ class PaperVenue:
     def submit(self, intent, client_order_id, rules, as_of):
         rules.require_order(intent, as_of)
         with self.ledger.atomic():
+            if not self.ledger.db.execute(
+                "SELECT 1 FROM events WHERE account=? AND id=?",
+                (self.account_id, "paper-accepted:" + intent.intent_id),
+            ).fetchone():
+                from src.execution.execution_admission import require_execution_admission
+
+                try:
+                    require_execution_admission(self.ledger, self.account_id)
+                except LedgerError as exc:
+                    raise SubmissionNotAttempted(str(exc)) from None
             self.ledger._clock(self.account_id, as_of)
             self.ledger.record_event(
                 self.account_id, "paper-accepted:" + intent.intent_id, intent.content_hash()
