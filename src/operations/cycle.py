@@ -82,6 +82,32 @@ from src.utils.config import AppConfig, QlibConfig
 
 D = Decimal
 PASSIVE = frozenset({"HOLD", "ABSTAIN", "VETO"})
+CURRENT_COMPLIANCE_STAGES = frozenset(
+    {"agent_desk", "allocation", "strategies", "optimization", "target", "prepare", "dispatch"}
+)
+
+
+class ExecutionComplianceBlocked(ValueError):
+    """Current retained authority denies new risk; historical evidence stays readable."""
+
+    def __init__(self, account_id, audit=None):
+        self.account_id, self.audit = account_id, audit
+        super().__init__(
+            "current execution compliance failed"
+            if audit
+            else "current execution compliance unavailable"
+        )
+
+    def reference(self):
+        return {
+            "account_id": self.account_id,
+            "audit_hash": self.audit.content_hash() if self.audit else None,
+            "authority_prefix_hash": self.audit.authority_prefix_hash if self.audit else None,
+            "blocking_codes": list(self.audit.blocking_codes)
+            if self.audit
+            else ["authority_unavailable"],
+            "audit": self.audit.model_dump(mode="json") if self.audit else None,
+        }
 
 
 def cycle_config_hash(config) -> str:
@@ -220,6 +246,34 @@ class PaperCycleService:
         )
         self.policy, self.llm_factory, self.resolver = decision_policy, llm_factory, resolver
         self.history = DeskHistoryStore(Path(config.output_dir) / "desk-history.sqlite3")
+
+    def _require_current_execution_compliance(self, account_id):
+        # No as_of or old PASS receipt can hide later retained execution sources.
+        from src.execution.discrepancies import ExecutionComplianceAudit
+
+        try:
+            actual = self.ledger.execution_compliance(account_id)
+            audit = ExecutionComplianceAudit.model_validate(actual.model_dump())
+            if audit.account_id != account_id:
+                raise ValueError("current audit account differs")
+        except Exception as exc:
+            raise ExecutionComplianceBlocked(account_id) from exc
+        if audit.status != "PASS":
+            raise ExecutionComplianceBlocked(account_id, audit)
+        return audit
+
+    def _cycle_stage(self, plan, name, operation, *, recoverable=True):
+        # This check is deliberately OUTSIDE stage-cache lookup, including
+        # prepare/dispatch receipts from a partially completed earlier attempt.
+        if name in CURRENT_COMPLIANCE_STAGES:
+            self._require_current_execution_compliance(plan.inputs.account.account_id)
+        return self.operations.stage(
+            plan.inputs.context.run_id,
+            name,
+            {"plan_hash": plan.content_hash()},
+            operation,
+            recoverable=recoverable,
+        )
 
     def _source_values(self, sources, as_of):
         if not sources:
@@ -911,6 +965,11 @@ class PaperCycleService:
             }:
                 raise RecoveryRequired("ambiguous dispatch requires authoritative reconciliation")
             if state["state"] == "prepared" and intent.eligible_at <= now:
+                # Canonical dispatch expires an already-expired prepared order
+                # before its new submitting claim. This is cleanup, never a
+                # permission to accept a late native fill or send a new order.
+                if intent.expires_at is None or now < intent.expires_at:
+                    self._require_current_execution_compliance(execution.account_id)
                 states.append(execution.dispatch(intent.intent_id, as_of=now))
         if any(
             s["state"] in {"ambiguous", "submitting", "cancel_pending", "reconciliation_required"}
@@ -1361,6 +1420,7 @@ class PaperCycleService:
         # Commit the complete deterministic local funding operation atomically.
         # Existing invested capital cannot be transferred as though it were cash.
         with self.ledger.atomic():
+            self._require_current_execution_compliance(book.account_id)
             for donor in sorted(donors):
                 for receiver in sorted(receivers):
                     amount = min(donors[donor], receivers[receiver])
@@ -1693,13 +1753,7 @@ class PaperCycleService:
             manifest_hash = self.operations.admit(manifest, plan.model_dump(mode="json"))
 
             def stage(name, operation, recoverable=True):
-                return self.operations.stage(
-                    plan.inputs.context.run_id,
-                    name,
-                    {"plan_hash": plan.content_hash()},
-                    operation,
-                    recoverable=recoverable,
-                )
+                return self._cycle_stage(plan, name, operation, recoverable=recoverable)
 
             prior = self.operations.status(plan.inputs.context.run_id)
             if prior["status"] == "completed":
@@ -1892,6 +1946,9 @@ class PaperCycleService:
                     }
 
                 reconciled = stage("reconcile", reconcile)
+                # Observed evidence and canonical cancellation/reconciliation
+                # precede this gate; no new model/desk work inherits an old PASS.
+                self._require_current_execution_compliance(book.account_id)
                 datasets = self.materialize_features(plan)
                 stage(
                     "features",
@@ -2074,7 +2131,15 @@ class PaperCycleService:
                     run_id=plan.inputs.context.run_id,
                     severity="critical",
                     code="paper_cycle_" + status,
-                    payload={"error_type": type(exc).__name__, "plan_hash": plan.content_hash()},
+                    payload={
+                        "error_type": type(exc).__name__,
+                        "plan_hash": plan.content_hash(),
+                        **(
+                            {"execution_compliance": exc.reference()}
+                            if isinstance(exc, ExecutionComplianceBlocked)
+                            else {}
+                        ),
+                    },
                 )
             state = self.operations.status(plan.inputs.context.run_id)
             result = CycleResult(

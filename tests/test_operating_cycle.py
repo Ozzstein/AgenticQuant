@@ -2366,3 +2366,326 @@ def test_native_income_gaps_block_cycle_before_economic_or_provider_admission(
     assert state["stages"]["account"]["state"] == "pending"
     assert state["stages"]["verified_inputs"]["state"] == "failed"
     assert not runtime.ledger.fills(plan.inputs.account.account_id)
+
+
+@pytest.fixture
+def compliance_cycle(tmp_path):
+    """Actual local paper outbox/ledger; no income source or audit is mocked."""
+    from src.domain.portfolio import OrderIntent
+    from src.execution.venue import PaperVenue, VenueExecution
+
+    at = pd.Timestamp("2026-10-01T12:00:00Z").to_pydatetime()
+    instrument = Instrument(
+        instrument_id="audit:equity", symbol="AUDIT", asset_class="equity", quote_currency="USD"
+    )
+    spec = AccountSpec(
+        account_id="paper:compliance",
+        mode="paper",
+        base_currency="USD",
+        initial_cash=100000,
+        opened_at=at,
+    )
+    ledger = PortfolioLedger(tmp_path / "compliance.sqlite")
+    ledger.create_account(spec)
+    rules = VenueRules(
+        venue="paper",
+        instrument=instrument,
+        symbol=instrument.symbol,
+        available_at=at,
+        quantity_step=1,
+        price_tick=".01",
+        minimum_quantity=D(1),
+        minimum_notional=D(1),
+        market_type="equity",
+        active=True,
+        time_in_force=("GTC", "DAY"),
+    )
+    costs = FillPolicy(equity_cost_bps=0)
+    venue = PaperVenue(
+        ledger, spec.account_id, {instrument.instrument_id: rules}, fill_policy=costs
+    )
+    execution = VenueExecution(
+        ledger,
+        spec.account_id,
+        {"paper": venue},
+        {instrument.instrument_id: "paper"},
+        owner="direct",
+        fill_policy=costs,
+    )
+    metadata = {
+        instrument.instrument_id: InstrumentRisk(
+            instrument=instrument, sector="fixture", adv_base=100000000, as_of=at, lot_size=1
+        )
+    }
+    order = OrderIntent(
+        intent_id="first",
+        account_id=spec.account_id,
+        run_id="compliance",
+        instrument=instrument,
+        side="buy",
+        quantity=10,
+        reference_price=100,
+        decision_at=at,
+        eligible_at=at + timedelta(seconds=1),
+        strategy_id="owned",
+    )
+    service = object.__new__(PaperCycleService)
+    service.ledger = ledger
+    service.operations = OperationsStore(tmp_path / "operations.sqlite")
+    context = RunContext(
+        run_id="compliance",
+        mode="paper",
+        as_of=at,
+        config_hash="a" * 64,
+        code_version="fixture",
+        account_id=spec.account_id,
+    )
+    identity = {"context": context.model_dump(mode="json"), "account": spec.model_dump(mode="json")}
+    plan = SimpleNamespace(
+        inputs=SimpleNamespace(context=context, account=spec),
+        content_hash=lambda: digest(canonical_bytes(identity)),
+    )
+    yield SimpleNamespace(
+        service=service,
+        ledger=ledger,
+        execution=execution,
+        venue=venue,
+        metadata=metadata,
+        order=order,
+        account=spec,
+        plan=plan,
+        identity=identity,
+        at=at,
+    )
+    ledger.close()
+
+
+def retain_unresolved_native_source(ledger, account):
+    # This is deliberately incomplete native source evidence. It must be
+    # investigated; it is not a source-confirmed fill or a settlement authority.
+    ledger.record_event(
+        account,
+        "alpaca-http:unresolved-fixture",
+        '{"status":200,"payload":{"id":"unresolved-native-order"}}',
+    )
+
+
+def economic_rows(ledger):
+    return {
+        row[0]: [
+            tuple(v) for v in ledger.db.execute('SELECT * FROM "' + row[0] + '" ORDER BY rowid')
+        ]
+        for row in ledger.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    "stage_name",
+    ["agent_desk", "allocation", "strategies", "optimization", "target", "prepare", "dispatch"],
+)
+def test_current_compliance_rechecks_cached_risk_stage_before_any_operation(
+    compliance_cycle, stage_name
+):
+    from src.operations.cycle import ExecutionComplianceBlocked
+    from src.operations.store import RunManifest
+
+    r = compliance_cycle
+    manifest = RunManifest(
+        context=r.plan.inputs.context,
+        kind="paper_cycle",
+        input_hash=r.plan.content_hash(),
+        scheduled_for=r.at,
+        stages=(stage_name, "unfinished"),
+    )
+    r.service.operations.admit(manifest, r.identity)
+    original = r.service._cycle_stage(
+        r.plan,
+        stage_name,
+        lambda: r.ledger.execution_compliance(r.account.account_id).model_dump(mode="json"),
+    )
+    assert original["status"] == "PASS"
+    assert r.service.operations.status("compliance")["stages"][stage_name]["state"] == "completed"
+    retain_unresolved_native_source(r.ledger, r.account.account_id)
+    before = economic_rows(r.ledger)
+    called = []
+    with pytest.raises(ExecutionComplianceBlocked) as blocked:
+        r.service._cycle_stage(r.plan, stage_name, lambda: called.append(True))
+    assert (
+        blocked.value.audit.status == "FAIL"
+        and blocked.value.audit.account_id == r.account.account_id
+    )
+    assert blocked.value.audit.authority_prefix_hash != original["authority_prefix_hash"]
+    assert blocked.value.reference()["audit_hash"] == blocked.value.audit.content_hash()
+    assert blocked.value.reference()["audit"] == blocked.value.audit.model_dump(mode="json")
+    assert not called and economic_rows(r.ledger) == before
+    # The old immutable receipt is still readable; it grants no current permission.
+    row = r.service.operations.status("compliance")["stages"][stage_name]
+    assert r.service.operations.artifact(row["output_hash"]) == original
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_current_compliance_blocks_unexpired_new_dispatch_including_sell(compliance_cycle, side):
+    from src.domain.portfolio import Fill, PriceMark
+    from src.operations.cycle import ExecutionComplianceBlocked
+
+    r = compliance_cycle
+    if side == "sell":
+        original = r.order.model_copy(update={"intent_id": "owned-before", "quantity": D(20)})
+        r.ledger.submit(original)
+        r.ledger.apply_fill(
+            Fill(
+                fill_id="original-paper-fill",
+                intent_id=original.intent_id,
+                account_id=r.account.account_id,
+                quantity=20,
+                price=100,
+                fee=0,
+                executed_at=original.eligible_at,
+                event_id="original-paper-price",
+            )
+        )
+        r.ledger.mark(
+            r.account.account_id,
+            [PriceMark(instrument=original.instrument, price=100, as_of=original.eligible_at)],
+        )
+    order = r.order.model_copy(
+        update={
+            "side": side,
+            "decision_at": r.order.eligible_at,
+            "eligible_at": r.order.eligible_at + timedelta(seconds=1),
+        }
+    )
+    r.execution.prepare(order, r.metadata, as_of=order.decision_at)
+    assert r.service._require_current_execution_compliance(r.account.account_id).status == "PASS"
+    retain_unresolved_native_source(r.ledger, r.account.account_id)
+    before = economic_rows(r.ledger)
+    with pytest.raises(ExecutionComplianceBlocked):
+        r.service._dispatch(r.execution, order.eligible_at)
+    assert economic_rows(r.ledger) == before
+    assert r.execution.state(order.intent_id)["state"] == "prepared"
+    # Canonical cancellation remains usable and releases its original reservation.
+    r.execution.cancel(order.intent_id, as_of=order.eligible_at)
+    assert r.ledger.order(r.account.account_id, order.intent_id)["reserved"] == 0
+    assert r.ledger.execution_compliance(r.account.account_id).status == "FAIL"
+
+
+def test_current_compliance_is_read_between_actual_dispatches(compliance_cycle, monkeypatch):
+    from src.operations.cycle import ExecutionComplianceBlocked
+
+    r = compliance_cycle
+    second = r.order.model_copy(update={"intent_id": "second"})
+    for order in (r.order, second):
+        r.execution.prepare(order, r.metadata, as_of=r.at)
+    dispatched = []
+    actual = r.execution.dispatch
+
+    def first_receipt_then_new_source(identity, *, as_of):
+        result = actual(identity, as_of=as_of)
+        dispatched.append(identity)
+        retain_unresolved_native_source(r.ledger, r.account.account_id)
+        return result
+
+    monkeypatch.setattr(r.execution, "dispatch", first_receipt_then_new_source)
+    with pytest.raises(ExecutionComplianceBlocked):
+        r.service._dispatch(r.execution, r.order.eligible_at)
+    assert len(dispatched) == 1
+    assert r.execution.state(dispatched[0])["state"] == "new"
+    remaining = ({r.order.intent_id, second.intent_id} - set(dispatched)).pop()
+    assert r.execution.state(remaining)["state"] == "prepared"
+    assert r.ledger.execution_compliance(r.account.account_id).status == "FAIL"
+
+
+def test_current_compliance_does_not_block_expired_prepared_cleanup(compliance_cycle):
+    r = compliance_cycle
+    order = r.order.model_copy(update={"tif": "DAY", "expires_at": r.at + timedelta(seconds=2)})
+    r.execution.prepare(order, r.metadata, as_of=r.at)
+    retain_unresolved_native_source(r.ledger, r.account.account_id)
+    states = r.service._dispatch(r.execution, order.expires_at)
+    assert states[0]["state"] == "expired"
+    assert r.ledger.order(r.account.account_id, order.intent_id)["reserved"] == 0
+    assert r.ledger.execution_compliance(r.account.account_id).status == "FAIL"
+
+
+def test_current_compliance_missing_account_is_unavailable_without_creating_authority(
+    compliance_cycle,
+):
+    from src.operations.cycle import ExecutionComplianceBlocked
+
+    r = compliance_cycle
+    before = economic_rows(r.ledger)
+    with pytest.raises(ExecutionComplianceBlocked) as error:
+        r.service._require_current_execution_compliance("paper:missing")
+    assert error.value.audit is None and error.value.reference()["audit_hash"] is None
+    assert economic_rows(r.ledger) == before
+
+
+def test_current_compliance_retains_actual_native_expiry_violation_readonly(tmp_path):
+    from src.operations.cycle import ExecutionComplianceBlocked
+    from tests.test_native_authority import alpaca_receipt, readonly_proof
+
+    path, order, _, _ = alpaca_receipt(tmp_path, expired=True)
+    with readonly_proof(path) as ledger:
+        service = object.__new__(PaperCycleService)
+        service.ledger = ledger
+        with pytest.raises(ExecutionComplianceBlocked) as blocked:
+            service._require_current_execution_compliance(order.account_id)
+        actual = ledger.execution_compliance(order.account_id)
+        assert blocked.value.audit == actual
+        assert actual.status == "FAIL" and actual.lineage == "native" and actual.violations
+
+
+def test_current_compliance_fences_local_sleeve_transfer_inside_existing_transaction(
+    compliance_cycle, tmp_path
+):
+    from src.core.macro_regime import CausalRegimeResult
+    from src.execution.sleeves import SleeveBook
+    from src.operations.cycle import ExecutionComplianceBlocked
+
+    r = compliance_cycle
+    specs = tuple(baseline_specs().values())
+    selected = next(s for s in specs if "neutral" in s.regimes)
+    donor = next(s for s in specs if s.name != selected.name)
+    book = SleeveBook(r.ledger, r.account.account_id).initialize(
+        {s.name: D(100000) if s == donor else D(0) for s in specs}
+    )
+    context = r.plan.inputs.context
+    snapshot = r.ledger.snapshot(
+        r.account.account_id, context.as_of, 86400, persist=False
+    ).model_copy(update={"sleeves": book.snapshot(context.as_of)})
+    r.service.attribution = AttributedPerformanceStore(tmp_path / "transfer-attribution.sqlite")
+    r.service.resolver = None
+    r.service.config = SimpleNamespace(
+        operations=SimpleNamespace(approved_baseline_hashes=[s.content_hash() for s in specs])
+    )
+    policy = AllocationPolicy(
+        selector="manual", optimizer="risk_parity", manual_strategy=selected.name
+    )
+    plan = SimpleNamespace(allocation=policy, strategies=specs, content_hash=r.plan.content_hash)
+    # Typed test-only selector input: this test claims no fitted HMM/source acceptance.
+    regime = CausalRegimeResult(
+        context=context,
+        status="available",
+        regime="neutral",
+        confidence=0.8,
+        state_probabilities=(
+            ("risk_on", 0.1),
+            ("neutral", 0.8),
+            ("risk_off", 0.05),
+            ("crisis", 0.05),
+        ),
+        model_hash="a" * 64,
+        trained_through=r.at - timedelta(days=1),
+        input_hash="b" * 64,
+        evidence_ids=("fixture-macro-input",),
+        held_reason=None,
+    )
+    assert r.service._require_current_execution_compliance(r.account.account_id).status == "PASS"
+    retain_unresolved_native_source(r.ledger, r.account.account_id)
+    before = economic_rows(r.ledger)
+    with pytest.raises(ExecutionComplianceBlocked):
+        r.service._allocation(plan, book, context, regime, snapshot)
+    assert economic_rows(r.ledger) == before
+    assert book.snapshot(context.as_of)[donor.name].portfolio.cash == 100000
+    assert book.snapshot(context.as_of)[selected.name].portfolio.cash == 0
