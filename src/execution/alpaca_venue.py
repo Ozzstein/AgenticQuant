@@ -238,6 +238,9 @@ class AlpacaVenue:
             raise LedgerError("refresh actual remote funding before submission")
         if intent.expires_at is not None and now >= intent.expires_at:
             raise DefinitiveRejection("order expired before actual submission")
+        day = self.validate_day(intent, as_of=as_of)
+        if intent.expires_at is not None and self._now() >= intent.expires_at:
+            raise SubmissionNotAttempted("order expired during native preflight")
         if not self.ledger.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='venue_outbox'"
         ).fetchone():
@@ -272,6 +275,7 @@ class AlpacaVenue:
                         "client_order_id": client_order_id,
                         "intent_hash": intent.content_hash(),
                         "at": self._now().isoformat(),
+                        **({"day_calendar_hash": _hash(day)} if day is not None else {}),
                     }
                 ),
             )
@@ -514,6 +518,9 @@ class AlpacaVenue:
         raise LedgerError("activity pagination bound exceeded; execution coverage unverified")
 
     def _report(self, intent, client_order_id, order, observed, references):
+        from src.execution.alpaca_calendar import read as read_day
+
+        read_day(self, intent)
         if (
             not order.get("id")
             or order.get("extended_hours") is not False
@@ -610,6 +617,18 @@ class AlpacaVenue:
             executions_complete=quantity == cumulative and status != "unknown",
             evidence_id=evidence_id,
         )
+
+    @_bounded
+    def validate_day(self, intent, *, as_of):
+        """Bind original native regular-session authority before a DAY submit."""
+        from src.execution.alpaca_calendar import bind
+
+        try:
+            return bind(self, intent, as_of)
+        except (LedgerError, ValueError, KeyError, TypeError, httpx.HTTPError, TimeoutError) as exc:
+            raise SubmissionNotAttempted(
+                "Alpaca DAY preflight denied before submission: " + str(exc)
+            ) from None
 
     @_bounded
     def submit(self, intent: OrderIntent, client_order_id, rules, as_of):

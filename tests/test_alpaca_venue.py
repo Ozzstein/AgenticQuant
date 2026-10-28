@@ -81,6 +81,10 @@ class Wire:
             )
         if path == "/v2/positions":
             return httpx.Response(200, json=self.positions)
+        if path == "/v2/calendar":
+            return httpx.Response(
+                200, json=[{"date": "2024-01-02", "open": "09:30", "close": "16:00"}]
+            )
         if path == "/v2/assets/A":
             return httpx.Response(
                 200,

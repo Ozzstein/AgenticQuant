@@ -412,6 +412,7 @@ class LeanVenue:
             raise LedgerError("LEAN operation differs from exact durable execution claim")
         if cancel:
             return binding
+        day = None
         try:
             rules.require_order(intent, now)
             require_trailing_support(self.deployment, intent)
@@ -439,7 +440,12 @@ class LeanVenue:
                         reader._notional_reference = previous
                 elif reader.venue == "kraken":
                     reader._check_order(intent, now)
+                elif reader.venue == "alpaca":
+                    day = reader.validate_day(intent, as_of=now)
             self.runtime.preflight(intent)
+            now = self.runtime.now()
+            if intent.expires_at is not None and now >= intent.expires_at:
+                raise LedgerError("LEAN order expired during actual preflight")
         except (LedgerError, ValueError) as exc:
             raise SubmissionNotAttempted(
                 "LEAN preflight denied before submission: " + str(exc)
@@ -461,6 +467,7 @@ class LeanVenue:
                         "client_order_id": client,
                         "runtime_id": binding["runtime_id"],
                         "at": now.isoformat(),
+                        **({"day_calendar_hash": digest(day)} if day is not None else {}),
                     }
                 ),
             )
