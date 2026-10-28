@@ -41,7 +41,7 @@ enabled. This register supersedes the bootstrap table.
 | J5 text features | partial | Exact source/question/model/transformation and generation-time availability | Actual feature evaluation and prospective benefit |
 | J7 auxiliary macro | pending | Conditional only; HMM authoritative | Demonstrated incremental value |
 | F1 five optimizers | offline_verified | Actual LW covariance, deterministic HRP, BL views, feasible constrained fallback and exact target conversion | Real histories and all venue fee/lot interactions |
-| F2 durable execution | offline_verified | Exclusive owner, pre-I/O claim, partial/ambiguous receipt recovery, opening capacity identity; expiry reconciles before requesting cancel and keeps uncertain reservations | Authenticated lifecycle, explicit post-deadline settlement and unsupported historical reconciliation |
+| F2 durable execution | offline_verified | Exclusive owner, pre-I/O claim, partial/ambiguous receipt recovery, opening capacity identity; expiry reconciles before requesting cancel and keeps uncertain reservations; new fills fence both base and sleeve-only publications | Authenticated lifecycle, explicit post-deadline settlement and unsupported historical reconciliation |
 | F3 Alpaca | external_unverified | Typed bounded REST/activity adapter, actual FILL/FEE parsing, trailing and account/order reconciliation; original native DAY calendar proof bound to direct/LEAN submit claims | Actual paper account, bracket/contingent and full lifecycle |
 | F4 crypto venues | partial | Typed Binance/Kraken spot adapters, native gross settlement, actual inventory-fee ledger/sleeves, bounded signing/native predicates; exact native trailing terms and frozen references | Contingent/OCO, expiry/settlement and authenticated/testnet acceptance |
 | F5 LEAN | partial | Canonical exclusive outbox/native fills/frozen references/original ticket recovery; trailing, runtime DayTimeInForce and independent native Alpaca DAY calendar proofs | Contingent orders, discrepancy settlement and actual LEAN/.NET/Docker acceptance |
@@ -54,7 +54,7 @@ enabled. This register supersedes the bootstrap table.
 | H1 operating cycle | partial | Shared six-strategy models/HMM/desk/optimizer/ledger, actual mixed-calendar recovery verified before income guard | Fresh positive acceptance now blocked by insufficient income source; retained tests fail visibly |
 | H2 scheduler/entry points | partial | Same application services, frozen jobs, independent lanes, immutable rolling refresh templates with measured invocation cutoffs and exact-plan recovery; completed-receipt cursor recovery avoids redispatch after interruption | Rolling source-complete build/retrain/cycle composition and full intraday production operation |
 | H3 dashboard/alerts | partial | Verified read-only registry snapshots, historical/current eligibility distinction, narrow native recovery state; actual ledger/usage; durable notification outbox | Authenticated delivery, resource monitoring, backup/restore and deployment |
-| I1 full integration | partial | Latest full pinned audit: 2,081 passed, 3 failed, 18 setup errors, 1 skipped; prior 14 retired-interface failures resolved | Positive source/cycle requirements and subsequent checkpoint integration |
+| I1 full integration | partial | Latest full pinned audit `7520957`: 2,434 passed, 3 failed, 18 setup errors, 1 skipped; all failures/errors retain the fresh income-source dependency | Positive source/cycle requirements and subsequent checkpoint integration |
 | I2 external release | external_unverified | Explicit unavailable/blocked states | Clean host/Docker, provider/venue/native runs and labeled agent calibration |
 | I3 prospective release | pending | Thresholds retained in full plan | Three-month paper/required run count, quant-only/veto/full-agent comparison and release decision |
 
@@ -83,7 +83,7 @@ credential tests passed in 10.83s; 159 transport/source/refresh tests passed in
 43.01s after the streamed HTTP cap. These overlapping checks are not a full-suite
 green claim. See the linked implementation notes for exact pins and commands.
 
-Latest complete audit: immutable archive `a0ec996acd360d7caad2edd0be56b35e53fa1332`,
+Previous complete audit: immutable archive `a0ec996acd360d7caad2edd0be56b35e53fa1332`,
 2,103 tests in 1,107.76s: **2,081 passed, 3 failed, 18 setup errors, 1 skipped**.
 Every failure/error is the retained fresh positive income-policy/source dependency;
 none was skipped or replaced with a fabricated positive authority. The one skip
@@ -92,3 +92,20 @@ That exact pinned-template test subsequently passed in the main checkout in
 2.03s using the installed isolated environment; this is template rendering, not
 Docker/native job acceptance. Stop/remote/ledger/artifact integration separately
 passed 248 tests in 33.57s. Original full-audit counts remain unchanged.
+
+Latest complete audit: immutable archive `7520957eb738e16ea8884990609202d4db16293e`,
+2,456 tests in 1,255.70s: **2,434 passed, 3 failed, 18 setup errors, 1 skipped**.
+Every failure/error was inspected in the JUnit report and has the same explicit
+fresh income-policy/source requirement as the previous audit. The three failed
+tests require a complete six-sleeve cycle, source preparation, and canonical
+application/CLI completed-cycle replay; the 18 setup errors depend on that fresh
+cycle. No new runtime failure category appeared. The separate native environment
+is absent from this immutable archive, accounting for the single template-test
+skip; actual Docker/LEAN acceptance is still unavailable. Two warnings record
+deliberately blocked socket probes. No positive source fixture was substituted.
+
+This audit predates scheduler cursor recovery `aa48c8c` (49 focused tests passed
+in 14.80s) and fill publication fencing `c92e037` (87 focused tests passed in
+23.93s). Production/script Ruff checks pass; the wider test-tree scan records
+48 import-order/unused/ambiguous-name lint findings and is not claimed clean.
+Logs and exact invocation are recorded in the root operations evidence note.

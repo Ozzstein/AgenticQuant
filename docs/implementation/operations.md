@@ -608,7 +608,50 @@ All 49 scheduler/rolling-refresh/refresh/CLI/store/monitoring cases passed in
 `/tmp/quantagentlab-root-scheduler-cursor.log`.
 
 The new whole-suite audit is pinned to immutable archive `7520957` and therefore
-predates this cursor fix. Its outcome is not yet recorded here. Jev's separately
+predates this cursor fix. Its final outcome is recorded below. Jev's separately
 reproduced known-usage overrun admission gap is assigned to its existing budget
 store/service authority; no financial efficacy or positive income acceptance
 is implied by these local checks.
+
+### Full integration audit at 7520957 and publication fencing
+
+Immutable checkout `/tmp/quantagentlab-root-audit-7520957-ydktqsm3`, full commit
+`7520957eb738e16ea8884990609202d4db16293e`. Exact command from that checkout:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  /home/ozzstein/AgenticQuant/.venv/bin/python -m pytest tests -q \
+  --disable-socket --allow-unix-socket \
+  --junitxml=/tmp/quantagentlab-root-7520957-full.xml
+```
+
+Result: **2,434 passed, 3 failed, 18 setup errors, 1 skipped, 2 warnings**, 2,456
+collected, in **1,255.70s**. Log `/tmp/quantagentlab-root-7520957-full.log` and
+the JUnit file above retain the exact output. Every failure/error was inspected:
+the two fresh H cycle/preparation cases and canonical application completed-cycle
+case reject missing explicit sourced income policy; 18 dependent H fixture
+setups fail at the same gate. No test was disabled or positive income authority
+invented. The one native template test skips because its separately installed
+environment is not in `git archive`; its earlier main-checkout result remains
+distinct and is not actual Docker execution. Both warnings are intentional
+blocked-socket probes in MCP tests. This is not a whole-system green result or
+financial/prospective release acceptance.
+
+Accounting `cb89665` integrated afterward as `c92e037`. New ordinary fills now
+check published canonical snapshots, legacy sleeve observations and full sleeve
+receipts at or after execution, regardless of whether a later observation clock
+was supplied. Exact duplicate fills return their original receipt first.
+Publication checks and monetary changes share the existing ledger transaction;
+no exception economics or caller waiver is introduced. All 87 root fill-fence,
+historical-sleeve, durable-ledger, venue, replay-artifact and original advice
+portfolio tests passed in 23.93s. Log:
+`/tmp/quantagentlab-root-fill-publication.log`. H's same-clock close/open batch
+publishes its period only after those economic events; an already published
+earlier-cycle snapshot cannot be silently amended by a newly arrived fill.
+
+Repository-wide production/script lint (`ruff check src scripts`) passes. A
+separate wider `ruff check tests` found 48 lint findings (mostly import ordering
+and unused imports, plus ambiguous local names). The CI production lint scope
+is unchanged; the test tree is not represented as lint-clean. Changed-file lint
+and diff checks pass. No authenticated provider, Docker, LEAN or capital calls
+were made during this audit.
