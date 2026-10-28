@@ -691,3 +691,55 @@ CLI sanitization and real Streamlit rendering of breach/unknown totals. Logs:
 `/tmp/quantagentlab-root-usage-reporting-advice.log`. Production/script and changed
 test lint plus diff checks pass. The full-suite audit above predates this change;
 the positive income/full-cycle and external acceptance gaps remain unchanged.
+
+### Opening publication parity and staged discrepancy review
+
+H `6ee5a48` integrated as `093fa4f`: actual source-backed midnight crypto close
+and next-open events are ordered before one sleeve publication, even with reversed
+caller order. The grouped case ends with three units and exact NAV 9991; completed
+cycle publication blocks a new late opening. This exercises the economic boundary
+directly and does not bypass fresh-cycle income admission.
+
+That regression also exposed a distinct sleeve-only case: fill arithmetic refused
+the late fill, but the paper simulator could already have marked the print and
+rejected the order. Accounting `882e166`, integrated as `3cbcda4`, now shares the
+ledger's exact base/legacy/full-sleeve publication predicate at the opening's
+pre-mutation gate. Original retries and authenticated consumed-print aliases
+remain ahead of that gate. Entire database state remains unchanged on rejection.
+
+All 74 selected root opening/fill publication, source-identity, opening-event,
+venue and H midnight/expiry tests passed in 7.23s, with 37 unrelated H cases
+deselected (not a full H success claim). Exact command:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  .venv/bin/python -m pytest tests/test_opening_publication_fence.py \
+  tests/test_fill_publication_fence.py tests/test_opening_source_identity.py \
+  tests/test_opening_events.py tests/test_venue_execution.py \
+  tests/test_operating_cycle.py \
+  -k 'not test_operating_cycle or crypto_same_clock or open_only_close_mark_expires' \
+  -q --disable-socket --allow-unix-socket
+```
+
+Log: `/tmp/quantagentlab-root-open-publication.log`. Production/script and changed
+test lint plus diff checks passed. Only synthetic native HTTP fixtures were used.
+
+Discrepancy proposal `2fef8f0` integrated as documentation-only `4ea07e9` and was
+reviewed for staged implementation. Stage one authorizes closed immutable types,
+pure retained-source reexport, metadata-only detection/assessment and the public
+read-only `PortfolioLedger.execution_compliance(account_id)` audit. It does not
+authorize reachable settlement, an expiry exception, group economics or a waiver.
+Permanent compliance FAIL must survive factual reconciliation, report application,
+restart and deletion of a derived discrepancy index. Missing source closure fails.
+
+Before economic settlement can be enabled, accounting must wire the distinct
+ValidationSuite check and native prepare/claim/LEAN gates; H must check current
+authority before new-risk stages and dispatch, including partial resumes. Root
+must bind operator-selected current ledger authorities for research eligibility
+and recursively recheck native execution ancestry at activation, resolve,
+rollback and status. A frozen evaluation PASS or a newly named empty account is
+not a clearance. Existing AgentAuthorityPaths supplies source-account ledgers for
+advice verification, but registry current-authority binding is still design work.
+Historical completed receipts remain immutable; cancellation, capture and factual
+inspection remain possible. No settlement enablement or release acceptance is
+claimed by this checkpoint.
