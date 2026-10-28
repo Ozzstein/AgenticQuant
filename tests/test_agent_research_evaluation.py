@@ -44,6 +44,27 @@ def test_model_free_evaluation_reproduces_real_advice_receipts_and_no_numeric_me
     assert not {'purged_oos','factor_ic','factor_correlation'} & checks.keys()
     assert registry.active('strategy:'+plan.strategy.name) is None
 
+    from src.execution.ledger import PortfolioLedger
+    from src.research.execution_authority import EvaluationExecutionBindings, require_current
+    with registry._connection() as db:
+        binding_hash = db.execute('SELECT hash FROM evaluation_execution_bindings WHERE trial=?',
+                                 (trial.trial_id,)).fetchone()[0]
+    binding = EvaluationExecutionBindings.model_validate_json(registry.blob(binding_hash))
+    assert len(binding.ledgers) == 1 + len(outcome.actual_decision_hashes)
+    assert {v.role for v in binding.ledgers} == {'replay', *('advice:'+key for key in outcome.actual_decision_hashes)}
+    require_current(registry,outcome,binding)
+    original = next(v for v in binding.ledgers if v.role.startswith('advice:'))
+    ledger = PortfolioLedger(original.path)
+    try:
+        ledger.record_event(original.account_id,'alpaca-submit-attempt:later-unproved-native-history','{}')
+        assert ledger.reconcile(original.account_id)['reconciled']
+    finally:
+        ledger.close()
+    with pytest.raises(RegistryError,match='execution'):
+        require_current(registry,outcome,binding)
+    assert checks['current_execution_authority_binding']['verdict'] == 'PASS'
+    assert registry.blob(outcome.replay_hash)  # Frozen historical result remains intact.
+
 
 def test_operator_authority_config_never_creates_missing_sources(tmp_path):
     cfg=AgentAuthorityPaths(history_store=tmp_path/'history.db',decision_store=tmp_path/'decision.db',

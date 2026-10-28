@@ -11,7 +11,7 @@ from src.research.monitoring import research_snapshot
 from src.research.native_recovery import NativeRecoveryEvent
 from src.research.registry import Activation, RegistryError, ResearchRegistry, content_hash
 from tests.test_native_lifecycle_registry import bound
-from tests.test_research_registry import T, admitted
+from tests.test_research_registry import T, admitted, record_bound_evaluation
 
 pytest_plugins = ('tests.test_native_lifecycle_registry',)
 
@@ -154,7 +154,7 @@ def test_current_eligibility_is_separate_from_legacy_native_activation_history(t
 def test_verified_active_generation_retains_resolver_checks(tmp_path):
     registry = ResearchRegistry(tmp_path/'registry.db')
     _, trial, evaluation, policy = admitted(registry)
-    registry.record_evaluation(evaluation)
+    record_bound_evaluation(registry,evaluation)
     activation = registry.activate('factor', trial.trial_id, policy,
                                    expected_generation=0, at=T+timedelta(hours=2))
     view = research_view(registry.path)

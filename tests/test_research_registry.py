@@ -43,7 +43,15 @@ def admitted(registry, key="one", *, synthetic=False, family="family", p_value=0
                   registered_at=T, purpose="holdout", holdout_id=key,
                   evaluation_start=T-timedelta(days=400), evaluation_end=T-timedelta(days=1))
     snapshot = registry.register_trial(trial)
-    artifacts = [registry.archive((key + suffix).encode()) for suffix in ("replay", "manifest", "validation", "model")]
+    from src.core.backtester import PortfolioReplay
+    from src.research.registry import canonical
+    from tests.test_core_backtest import replay_inputs
+
+    replay_path = registry.path.parent / ('registry-'+key+'.sqlite3')
+    replay = PortfolioReplay(replay_path).run(**replay_inputs())
+    artifacts = [registry.archive(canonical(replay.model_dump(mode='json'))),
+                 registry.archive(canonical(replay.manifest)),
+                 registry.archive((key+'validation').encode()), registry.archive((key+'model').encode())]
     evaluation = Evaluation(trial_id=key, candidate_hash=candidate.content_hash(), inputs_hash=inputs,
                             replay_hash=artifacts[0], manifest_hash=artifacts[1], validation_hash=artifacts[2],
                             registry_snapshot_hash=snapshot, completed_at=T+timedelta(hours=1), status="complete",
@@ -51,6 +59,15 @@ def admitted(registry, key="one", *, synthetic=False, family="family", p_value=0
                             sharpe=1.2, ic=0.04, icir=0.6, max_factor_correlation=0.3,
                             unadjusted_p_value=p_value)
     return candidate, trial, evaluation, policy
+
+
+def record_bound_evaluation(registry, evaluation):
+    """Protocol metrics remain synthetic; account binding uses the actual replay ledger."""
+    from src.research.execution_authority import freeze
+
+    candidate = registry.trial(evaluation.trial_id).candidate_id
+    binding = freeze(registry,evaluation,ledger_path=registry.path.parent/('registry-'+candidate+'.sqlite3'))
+    registry.record_evaluation(evaluation,execution_binding=binding)
 
 
 def test_immutable_payload_lineage_and_idempotent_trial(registry):
@@ -115,10 +132,10 @@ def test_failed_and_unfinished_trials_increase_multiplicity(registry):
 
 def test_atomic_generation_restart_asof_and_rollback(registry):
     _, _, first, policy = admitted(registry)
-    registry.record_evaluation(first)
+    record_bound_evaluation(registry,first)
     a = registry.activate("factor", "one", policy, expected_generation=0, at=T+timedelta(hours=2))
     _, _, second, _ = admitted(registry, "two")
-    registry.record_evaluation(second)
+    record_bound_evaluation(registry,second)
     with pytest.raises(RegistryError, match="manifest changed"):
         registry.activate("factor", "two", policy, expected_generation=0, at=T+timedelta(hours=3))
     registry.activate("factor", "two", policy, expected_generation=1, at=T+timedelta(hours=3))
@@ -133,7 +150,7 @@ def test_atomic_generation_restart_asof_and_rollback(registry):
 
 def test_activation_cannot_precede_result(registry):
     _, _, outcome, policy = admitted(registry)
-    registry.record_evaluation(outcome)
+    record_bound_evaluation(registry,outcome)
     with pytest.raises(RegistryError, match="precedes"):
         registry.activate("factor", "one", policy, expected_generation=0, at=T)
 

@@ -351,6 +351,9 @@ def test_upgrade_refuses_preexisting_native_activation_and_rollback(tmp_path, mo
     with monkeypatch.context() as old:
         # The previous registry admitted these origins through its normal APIs.
         old.setattr(ResearchRegistry, "_require_audited_origin", staticmethod(lambda *args: None))
+        # This historical version also predates current execution locators.
+        # Restore both modern guards before asserting upgraded eligibility.
+        old.setattr(ResearchRegistry, "_require_current_execution", lambda *args: None)
         _, _, parent, policy = admitted(registry, "native", origin="native_rd_agent")
         registry.record_evaluation(parent)
         registry.activate(

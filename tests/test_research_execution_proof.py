@@ -75,3 +75,24 @@ def test_paired_baseline_is_reexecuted_and_excess_returns_are_actual(experiment,
         verified_paired_returns(registry,registry.archive(canonical(tampered)))
     with pytest.raises(RegistryError,match='requires exactly'):
         verify_execution(registry,store,name,actual.result,artifact_dir=actual.artifact_dir)
+
+    outcome = ExperimentEvaluator(registry,store).evaluate(name,actual.result,
+        ledger_path=actual.ledger_path,artifact_dir=actual.artifact_dir,
+        completed_at=datetime.now(timezone.utc),paired_baseline=reference)
+    from src.execution.ledger import PortfolioLedger
+    from src.research.execution_authority import EvaluationExecutionBindings, require_current
+    with registry._connection() as db:
+        binding_hash = db.execute('SELECT hash FROM evaluation_execution_bindings WHERE trial=?',
+                                 (name,)).fetchone()[0]
+    binding = EvaluationExecutionBindings.model_validate_json(registry.blob(binding_hash))
+    assert {v.role for v in binding.ledgers} == {'replay','paired'}
+    require_current(registry,outcome,binding)
+    original = next(v for v in binding.ledgers if v.role == 'paired')
+    ledger = PortfolioLedger(original.path)
+    try:
+        ledger.record_event(original.account_id,'alpaca-submit-attempt:later-unproved-paired-history','{}')
+        assert ledger.reconcile(original.account_id)['reconciled']
+    finally:
+        ledger.close()
+    with pytest.raises(RegistryError,match='execution'):
+        require_current(registry,outcome,binding)

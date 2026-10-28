@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -328,5 +329,27 @@ class ExperimentEvaluator:
                 else None if candidate.kind == 'regime' else block_bootstrap_p_value(result.daily_returns),
             synthetic=inputs.synthetic or candidate.synthetic,
             diagnostics=tuple(f"{c.name}: {c.explanation}" for c in all_checks if c.verdict != CheckVerdict.PASS))
-        self.registry.record_evaluation(outcome)
+        from src.research.execution_authority import freeze, require_current
+        binding = None
+        try:
+            binding = freeze(self.registry,outcome,ledger_path=ledger_path,
+                             source_ledgers=self.authorities.portfolio_ledgers if self.authorities else None,
+                             paired_ledger_path=paired_baseline.ledger_path if paired_baseline else None)
+            require_current(self.registry,outcome,binding)
+        except (ValueError,KeyError,TypeError,OSError,AttributeError,sqlite3.Error):
+            check = CheckResult(name='current_execution_authority_binding', verdict=CheckVerdict.FAIL,
+                                explanation='Original execution authority unavailable, incomplete or noncompliant.')
+        else:
+            check = CheckResult(name='current_execution_authority_binding', verdict=CheckVerdict.PASS,
+                                explanation='Original replay/advice/paired accounts bound and current canonical audits passed.')
+        reliable = outcome.validation_reliable and check.verdict == CheckVerdict.PASS
+        report = report.model_copy(update={'checks':[*report.checks,check],
+                                          'overall':'RELIABLE' if reliable else 'NOT RELIABLE'})
+        outcome = outcome.model_copy(update={'validation_reliable':reliable,
+            'validation_hash':self.registry.archive(canonical(report.model_dump(mode='json'))),
+            'diagnostics':outcome.diagnostics if check.verdict == CheckVerdict.PASS else
+                (*outcome.diagnostics, check.name+': '+check.explanation)})
+        if binding is not None:
+            binding = binding.model_copy(update={'evaluation_hash':outcome.content_hash()})
+        self.registry.record_evaluation(outcome,execution_binding=binding)
         return outcome

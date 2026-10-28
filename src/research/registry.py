@@ -182,6 +182,8 @@ class ResearchRegistry:
                     family TEXT NOT NULL, holdout TEXT UNIQUE REFERENCES holdouts(id), payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS outcomes(trial TEXT PRIMARY KEY REFERENCES trials(id), hash TEXT NOT NULL,
                     payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS evaluation_execution_bindings(
+                    trial TEXT PRIMARY KEY REFERENCES trials(id), hash TEXT NOT NULL REFERENCES blobs(hash));
                 CREATE TABLE IF NOT EXISTS trial_snapshots(trial TEXT PRIMARY KEY REFERENCES trials(id), hash TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS activations(slot TEXT NOT NULL, generation INTEGER NOT NULL,
                     payload TEXT NOT NULL, PRIMARY KEY(slot,generation));
@@ -193,7 +195,7 @@ class ResearchRegistry:
                 CREATE TABLE IF NOT EXISTS native_recoveries(id TEXT NOT NULL, sequence INTEGER NOT NULL,
                     hash TEXT NOT NULL, PRIMARY KEY(id,sequence));
             """)
-            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "trial_snapshots", "activations", "discovery_exposures", "discovery_results", "native_launches", "native_containers", "native_recoveries"):
+            for table in ("blobs", "candidates", "holdouts", "trials", "outcomes", "evaluation_execution_bindings", "trial_snapshots", "activations", "discovery_exposures", "discovery_results", "native_launches", "native_containers", "native_recoveries"):
                 for action in ("UPDATE", "DELETE"):
                     db.execute(f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{action} BEFORE {action} ON {table} "
                                "BEGIN SELECT RAISE(ABORT, 'research history is immutable'); END")
@@ -728,15 +730,37 @@ class ResearchRegistry:
     def trial_count_at_admission(self, trial_id: str) -> int:
         return int(json.loads(self.blob(self.trial_snapshot(trial_id)))['family_trials_at_admission'])
 
-    def record_evaluation(self, evaluation: Evaluation) -> None:
+    def record_evaluation(self, evaluation: Evaluation, *, execution_binding=None) -> None:
         """Persist independently computed outcome, with exact referenced evidence."""
         self._require_writable()
+        if execution_binding is not None:
+            from src.research.execution_authority import EvaluationExecutionBindings
+            execution_binding = EvaluationExecutionBindings.model_validate(execution_binding)
+            if (execution_binding.evaluation_hash != evaluation.content_hash()
+                    or execution_binding.trial_id != evaluation.trial_id):
+                raise RegistryError('execution binding belongs to another evaluation')
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT hash FROM outcomes WHERE trial=?", (evaluation.trial_id,)).fetchone()
             if old:
                 if old[0] != evaluation.content_hash():
                     raise RegistryError("trial outcome is immutable")
+                if execution_binding is not None:
+                    bound = db.execute('SELECT hash FROM evaluation_execution_bindings WHERE trial=?',
+                                       (evaluation.trial_id,)).fetchone()
+                    if bound is None:
+                        raise RegistryError('original execution binding cannot be added or replaced on replay')
+                    blob = db.execute('SELECT content FROM blobs WHERE hash=?',(bound[0],)).fetchone()
+                    if blob is None or content_hash(blob[0]) != bound[0]:
+                        raise RegistryError('original execution binding bytes differ')
+                    prior = EvaluationExecutionBindings.model_validate_json(blob[0])
+                    # A repeated verification retains the original measured receipt.
+                    # Legitimate appended history can change a fresh audit hash.
+                    if (prior.evaluation_hash != execution_binding.evaluation_hash
+                            or prior.trial_id != execution_binding.trial_id
+                            or [v.model_dump(exclude={'original_audit_hash'}) for v in prior.ledgers]
+                            != [v.model_dump(exclude={'original_audit_hash'}) for v in execution_binding.ledgers]):
+                        raise RegistryError('original execution binding cannot be added or replaced on replay')
                 return
             row = db.execute("SELECT payload FROM trials WHERE id=?", (evaluation.trial_id,)).fetchone()
             if row is None:
@@ -753,6 +777,9 @@ class ResearchRegistry:
                                           evaluation.paired_evaluation_hash) if key)):
                 if not db.execute("SELECT 1 FROM blobs WHERE hash=?", (key,)).fetchone():
                     raise RegistryError("evaluation evidence/model artifact is missing")
+            if execution_binding is not None:
+                key = self._blob(db, canonical(execution_binding.model_dump(mode='json')))
+                db.execute('INSERT INTO evaluation_execution_bindings VALUES (?,?)', (evaluation.trial_id,key))
             db.execute("INSERT INTO outcomes VALUES (?,?,?)", (evaluation.trial_id, evaluation.content_hash(),
                                                              evaluation.model_dump_json()))
 
@@ -798,6 +825,45 @@ class ResearchRegistry:
                     raise RegistryError('candidate lineage is incomplete')
                 pending.append(Candidate.model_validate_json(record[0]))
 
+    def _require_current_execution(self, db, candidate):
+        from src.research.execution_authority import EvaluationExecutionBindings, require_current
+
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='evaluation_execution_bindings'").fetchone():
+            raise RegistryError('current execution authority binding is unavailable')
+        pending, seen = [candidate], set()
+        while pending:
+            item = pending.pop()
+            if item.candidate_id in seen:
+                continue
+            seen.add(item.candidate_id)
+            for parent in item.parent_ids:
+                row = db.execute('SELECT hash,payload FROM candidates WHERE id=?',(parent,)).fetchone()
+                if row is None:
+                    raise RegistryError('current execution ancestor is unavailable')
+                value = Candidate.model_validate_json(row[1])
+                if value.candidate_id != parent or value.content_hash() != row[0]:
+                    raise RegistryError('current execution ancestor identity differs')
+                pending.append(value)
+            for trial_id, in db.execute('SELECT id FROM trials WHERE candidate=?',(item.candidate_id,)):
+                row = db.execute('SELECT hash,payload FROM outcomes WHERE trial=?',(trial_id,)).fetchone()
+                bound = db.execute('SELECT hash FROM evaluation_execution_bindings WHERE trial=?',(trial_id,)).fetchone()
+                if row is None or bound is None:
+                    raise RegistryError('current execution authority missing for candidate or ancestor trial')
+                evaluation = Evaluation.model_validate_json(row[1])
+                if (evaluation.content_hash() != row[0] or evaluation.candidate_hash != item.content_hash()
+                        or evaluation.trial_id != trial_id):
+                    raise RegistryError('current execution evaluation identity differs')
+                try:
+                    blob = db.execute('SELECT content FROM blobs WHERE hash=?',(bound[0],)).fetchone()
+                    if blob is None or content_hash(blob[0]) != bound[0]:
+                        raise RegistryError('current execution binding bytes differ')
+                    binding = EvaluationExecutionBindings.model_validate_json(blob[0])
+                    require_current(self,evaluation,binding)
+                except RegistryError:
+                    raise
+                except (ValueError,KeyError,TypeError,OSError,AttributeError,sqlite3.Error) as exc:
+                    raise RegistryError('current execution authority unavailable or invalid') from exc
+
     def _eligible(self, db, trial_id: str, policy: PromotionPolicy):
         trow = db.execute("SELECT payload FROM trials WHERE id=?", (trial_id,)).fetchone()
         erow = db.execute("SELECT payload FROM outcomes WHERE trial=?", (trial_id,)).fetchone()
@@ -833,6 +899,7 @@ class ResearchRegistry:
         trials = db.execute("SELECT count(*) FROM trials").fetchone()[0]
         if evaluation.unadjusted_p_value is None or evaluation.unadjusted_p_value > policy.familywise_alpha / trials:
             raise RegistryError("multiple-trial significance gate failed")
+        self._require_current_execution(db,candidate)
         return candidate, evaluation
 
     def activate(self, slot: str, trial_id: str, policy: PromotionPolicy, *, expected_generation: int,
@@ -877,11 +944,12 @@ class ResearchRegistry:
             candidate = Candidate.model_validate_json(db.execute("SELECT payload FROM candidates WHERE id=?",
                                                                   (prior.candidate_id,)).fetchone()[0])
             self._require_audited_origin(db,candidate)
+            self._require_current_execution(db,candidate)
             return self._activate(db, slot, candidate, prior.evaluation_hash, prior.policy_hash,
                                   expected_generation, at, "rollback")
 
     def active(self, slot: str, *, as_of: datetime | None = None) -> Activation | None:
-        """Pin a complete generation at run start, optionally at a historical cutoff."""
+        """Select a generation by cutoff, then require current execution authority."""
         with self._connection() as db:
             rows = db.execute("SELECT payload FROM activations WHERE slot=? ORDER BY generation DESC", (slot,)).fetchall()
         cutoff = _utc(as_of) if as_of is not None else None
@@ -890,7 +958,9 @@ class ResearchRegistry:
             if cutoff is None or activation.activated_at <= cutoff:
                 self.blob(activation.payload_hash)
                 with self._connection() as db:
-                    self._require_audited_origin(db,self.candidate(activation.candidate_id))
+                    candidate = self.candidate(activation.candidate_id)
+                    self._require_audited_origin(db,candidate)
+                    self._require_current_execution(db,candidate)
                 return activation
         return None
 
@@ -899,6 +969,7 @@ class ResearchRegistry:
 
         A YAML flag cannot grant admission. Both the pinned artifact and its
         recorded evaluation must still be present and internally consistent.
+        The cutoff selects history; it never hides later execution violations.
         """
         activation = self.active(slot, as_of=as_of)
         if activation is None or activation.payload_hash != payload_hash:
@@ -935,6 +1006,7 @@ class ResearchRegistry:
                 candidate=Candidate.model_validate_json(db.execute('SELECT payload FROM candidates WHERE id=?',(value.candidate_id,)).fetchone()[0])
                 try:
                     self._require_audited_origin(db,candidate)
+                    self._require_current_execution(db,candidate)
                 except RegistryError as exc:
                     blocked.append({'activation':value.model_dump(mode='json'),'reason':str(exc)})
                 else:
