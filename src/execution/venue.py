@@ -415,6 +415,12 @@ class VenueExecution:
             raise LedgerError("intent has no durable venue route")
         return dict(row)
 
+    def detect_discrepancies(self, *, as_of):
+        """Retain independently proved violation metadata; never settle executions."""
+        from src.execution.execution_compliance import detect_discrepancies
+
+        return detect_discrepancies(self.ledger, self.account_id, as_of=as_of)
+
     def _require_applied_receipts(self):
         if self.ledger.db.execute(
             "SELECT 1 FROM venue_reports WHERE applied=0 AND rowid IN (SELECT MAX(rowid) FROM venue_reports WHERE account=? GROUP BY intent) LIMIT 1",

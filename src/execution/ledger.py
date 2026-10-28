@@ -851,6 +851,12 @@ class PortfolioLedger:
             )
         ]
 
+    def execution_compliance(self, account_id: str):
+        """Current retained execution authority; read-only, with no temporal bypass."""
+        from src.execution.execution_compliance import execution_compliance
+
+        return execution_compliance(self, account_id)
+
     def reconcile(self, account: str) -> dict:
         """Independently replay persisted economic fills/actions to check cash/basis."""
         from src.execution.dividends import (
