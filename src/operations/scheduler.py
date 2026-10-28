@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, model_serializer, model_validator
 
 from src.domain.common import NonEmptyString, UtcTimestamp, VersionedContract, _utc
+from src.operations.rolling import RollingRefreshTemplate
 from src.operations.store import OperationBusy, OperationError, OperationsStore, canonical, digest
 
 
@@ -28,13 +29,18 @@ class ScheduleSpec(VersionedContract):
     interval_seconds: int | None = Field(default=None,ge=60,le=86400*7)
     calendar: Literal['XNYS','24/7'] = '24/7'
     max_lag_seconds: int = Field(default=3600,ge=0,le=86400*7)
-    input_directory: NonEmptyString
+    input_directory: NonEmptyString | None = None
+    refresh_template: RollingRefreshTemplate | None = None
 
     @model_serializer(mode='wrap')
     def legacy_identity(self, handler):
         value = handler(self)
         if self.execution_lane == 'operating':
             value.pop('execution_lane', None)
+        if self.refresh_template is None:
+            value.pop('refresh_template', None)
+        if self.input_directory is None:
+            value.pop('input_directory', None)
         return value
 
     @model_validator(mode='after')
@@ -44,7 +50,11 @@ class ScheduleSpec(VersionedContract):
             raise ValueError('interval schedule needs an explicit interval only')
         if any(c in self.schedule_id for c in ('/','\\','..')):
             raise ValueError('schedule ID must be a simple directory identity')
-        if not Path(self.input_directory).is_absolute():
+        if (self.input_directory is None) == (self.refresh_template is None):
+            raise ValueError('schedule needs exactly one input directory or rolling refresh template')
+        if self.refresh_template is not None and self.execution_lane != 'operating':
+            raise ValueError('rolling refresh belongs to the operating lane')
+        if self.input_directory is not None and not Path(self.input_directory).is_absolute():
             raise ValueError('schedule input directory must be absolute')
         return self
 
@@ -75,6 +85,8 @@ class ScheduleSpec(VersionedContract):
         raise OperationError('no exchange session within bounded schedule search')
 
     def input_path(self, at: datetime) -> Path:
+        if self.input_directory is None:
+            raise OperationError('rolling refresh has no mutable per-window input path')
         return Path(self.input_directory)/self.schedule_id/at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ.json')
 
 
@@ -129,7 +141,7 @@ class ScheduleSupervisor:
             old = db.execute('SELECT * FROM schedule_ticks WHERE schedule=? AND at=?',(spec.schedule_id,at.isoformat())).fetchone()
         if old and old['state'] in ('failed','uncertain','running'):
             return {'schedule_id':spec.schedule_id,'status':'recovery_required','scheduled_for':at.isoformat()}
-        path = spec.input_path(at)
+        path = spec.input_path(at) if spec.input_directory is not None else None
         identity = None
         state,error_type,receipt = 'waiting',None,None
         retry = old is not None and old['state'] == 'retry'
@@ -137,17 +149,27 @@ class ScheduleSupervisor:
             state = 'missed'
             self.store.alert(run_id=None,severity='critical',code='scheduled_input_missed',
                              payload={'schedule':spec.schedule_id,'scheduled_for':at.isoformat()})
-        elif retry or path.is_file():
+        elif retry or spec.refresh_template is not None or path.is_file():
             # Stage source bytes before any dispatch; subsequent file replacement
             # can only fail its identity check in the operating bundle handler.
-            payload = canonical(self.store.artifact(old['input_hash'])) if retry else path.read_bytes()
+            if retry:
+                payload = canonical(self.store.artifact(old['input_hash']))
+            elif spec.refresh_template is not None:
+                plan = spec.refresh_template.materialize(spec.schedule_id, scheduled_for=at, invoked_at=now)
+                payload = canonical({'kind': 'data_refresh', 'plan': plan.model_dump(mode='json')})
+            else:
+                payload = path.read_bytes()
             identity = old['input_hash'] if retry else digest(payload)
             with self.store.connection() as db:
                 db.execute('BEGIN IMMEDIATE')
                 self.store._archive(db,payload)
                 db.execute('INSERT INTO schedule_ticks VALUES (?,?,?,?,?,?) ON CONFLICT(schedule,at) DO UPDATE SET input_hash=excluded.input_hash,state=excluded.state',
                            (spec.schedule_id,at.isoformat(),identity,'running',None,None))
-                self.store._event(db,'schedule:'+spec.schedule_id,None,'claimed',{'scheduled_for':at.isoformat(),'input_hash':identity})
+                claim = {'scheduled_for':at.isoformat(),'input_hash':identity}
+                if spec.refresh_template is not None:
+                    claim['refresh_template_hash'] = spec.refresh_template.content_hash()
+                    claim['invoked_at'] = now.isoformat()
+                self.store._event(db,'schedule:'+spec.schedule_id,None,'claimed',claim)
             try:
                 import json
                 archived = self.store.archive(json.loads(payload))

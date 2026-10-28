@@ -447,3 +447,51 @@ endpoints is inferred. Existing valid layout/schema remains unchanged; malformed
 published source grids fail without rewriting their files. Native admission
 continues its separate full snapshot-to-binary reconstruction. File hashes alone
 are not presented as that numerical proof.
+
+### Frozen evaluation and native trailing integration, 2026-10-28
+
+Accounting `badabba` integrated as `2cdef9e`: 192 root native trailing,
+frozen-reference, LEAN compatibility, venue, ledger, inventory, sleeve and stop
+tests passed in 18.09s. LEAN `13b89f1` integrated as `800d475`: 183 focused LEAN
+trailing/runtime/native recovery/reference/signal/venue/ledger tests passed in
+15.10s. These are offline protocol checks, not actual SDK/vendor acceptance.
+LEAN DAY/calendar expiry and contingent/OCO remain open.
+
+Jev `1b753cb` integrated as `528c8db`: 270 experiment, evaluated-policy, contract,
+service, workflow, desk, history, memory and desk-clock tests passed in 50.56s.
+The installed `aiquant decision evaluate schema` delegates to the exact same
+`EvaluationManifest` CLI. Use `freeze|run|report|inspect` with explicit
+`--store` and `--evidence`; report inspection uses `--kind report`. Freeze needs
+an operator-reviewed source/label manifest; no production examples or efficacy
+passes are supplied. Every cohort is admitted before dispatch under one immutable
+budget, selection/calibration cannot publish, unknown earlier retry costs remain
+unknown, and report completeness is distinct from release eligibility. No
+automatic publication or registry promotion occurs. Root report consumers must
+call `ExperimentService.inspect` / `verify_report`, not trust a JSON pass flag.
+The subsequent audit reproduced a shadow semantic label path into debate prompts
+and undelivered-document coverage claims; owned fixes are active and those
+boundaries are not claimed accepted.
+
+### Rolling refresh templates
+
+`ScheduleSpec` accepts exactly one immutable `refresh_template` or legacy
+`input_directory`. `RollingRefreshTemplate(plan, bindings)` keeps all provider,
+instrument, source-reference and budget arguments fixed; only listed closed
+temporal arguments can bind scheduled/actual invocation time with nonpositive
+offsets. The seed's prior snapshot approvals are prohibited. The generated run
+ID binds schedule/window/template, its context uses actual invocation time, and
+the full input is archived transactionally before existing scheduled dispatch.
+Recovery reuses the exact original plan and normal refresh stage receipts. This
+does not re-date a source or make captured history usable under an old cutoff.
+Old schedule serializers omit the new absent key, retaining original identities.
+
+100 root rolling/scheduler/refresh/CLI/store/config tests passed in 23.35s with
+TCP disabled (Unix self-pipe allowed). Actual FMP parsing and evidence/operations
+stores over synthetic HTTP verify two windows, later archive availability,
+canonical application dispatch, restart deduplication and a lost scheduler
+completion after durable refresh without refetch. Closed derivative/date windows,
+old identity shape, expired windows and invalid bindings are covered. Initial
+two derivative fixture failures used an invalid zero-width seed window; corrected
+to a real positive interval, with no runtime gate relaxation. Log:
+`/tmp/quantagentlab-root-rolling-integration.log`. This closes rolling fetch-plan
+materialization, not full source-complete unattended build/retrain/operation.

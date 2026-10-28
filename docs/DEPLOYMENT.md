@@ -76,8 +76,10 @@ The dashboard's local binding can be reached over an authenticated operator
 tunnel. An accessible dashboard or running container alone is not a successful
 cycle. Inspect durable run stages, reconciliation, source gaps and actual usage.
 
-Schedules require explicit `ScheduleSpec` JSON, including the immutable job
-payload and its execution lane. Examples below assume those files were staged:
+Schedules require explicit `ScheduleSpec` JSON and its execution lane. Choose
+exactly one source: `input_directory` for frozen per-window job files, or
+`refresh_template` for rolling data refresh. Examples below assume the schedule
+and preparation files were staged:
 
 ```bash
 docker compose run --rm app python -m src.scheduler register --input /app/data/schedule.json
@@ -86,6 +88,28 @@ docker compose run --rm app aiquant pipeline build --input /app/data/preparation
 docker compose run --rm app aiquant pipeline run --input /app/data/cycle.json
 docker compose run --rm app aiquant pipeline dispatch-pending --input /app/data/cycle.json
 ```
+
+`refresh_template` contains an approved `RefreshPlan` under `plan`, plus a
+`bindings` array. Each binding names `task_id`, an existing temporal `argument`,
+an `anchor` (`scheduled_for` or `invoked_at`) and nonpositive integer
+`offset_seconds`. Only the existing adapters' closed date/time arguments can
+vary. For example, FRED `start` can use `scheduled_for` minus 31 days and `end`
+can use `invoked_at`; units and series identity stay frozen. Date endpoints are
+UTC dates; native event endpoints retain exact UTC timestamps and their adapter's
+inclusive/exclusive semantics. No source receipt time is rewritten.
+
+The seed plan must have no `data_snapshot_ids`. Its run identity, decision cutoff
+and scheduled time are replaced per window; configuration, account, tasks,
+instruments and budgets remain fixed. The run ID binds schedule/window/template;
+the generated plan also binds actual invocation time. The scheduler archives it
+before dispatch. Explicit recovery reuses those exact bytes and calls the same
+durable refresh service, so already completed fetches are not repeated. Changing
+the template requires a new schedule identity. Missed windows still produce
+alerts, and ambiguous/failed work still requires explicit recovery.
+
+Rolling refresh does not automatically produce or authorize a paper cycle.
+Source-complete preparation, approved model recipes and income coverage remain
+required at the builder/cycle boundary.
 
 The builder reads authoritative completed refresh receipts, exact source
 bindings, model/macro recipes and contextual/income authorities. A fresh plan
