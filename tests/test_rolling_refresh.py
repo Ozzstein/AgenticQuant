@@ -132,6 +132,44 @@ def test_failed_post_refresh_tick_reuses_exact_plan_and_no_provider_retry(tmp_pa
         client.close()
 
 
+def test_completed_rolling_refresh_cursor_crash_never_rebuilds_or_fetches(tmp_path, monkeypatch):
+    calls, client = real_adapter_fetcher(monkeypatch)
+    ops = OperationsStore(tmp_path / 'ops.sqlite')
+    evidence = EvidenceStore(tmp_path / 'data.sqlite')
+    plans = []
+
+    def handler(path, at):
+        job = WORK.validate_json(path.read_bytes())
+        plans.append(job.plan)
+        return RefreshService(ops, evidence, fetcher=refresh._fetch).run(job.plan)
+
+    now = datetime.now(timezone.utc)
+    spec = schedule(template(), now)
+    supervisor = ScheduleSupervisor(ops, handler)
+    supervisor.register(spec)
+    try:
+        with monkeypatch.context() as patch:
+            def crash(*_):
+                raise KeyboardInterrupt('after tick receipt commit')
+            patch.setattr(ScheduleSpec, 'next_at', crash)
+            with pytest.raises(KeyboardInterrupt):
+                supervisor.tick(now)
+        with ops.connection() as db:
+            original = dict(db.execute('SELECT * FROM schedule_ticks').fetchone())
+        assert original['state'] == 'completed'
+        restarted = ScheduleSupervisor(OperationsStore(ops.path), handler)
+        result = restarted.tick(now + timedelta(seconds=181))[0]
+        assert result['status'] == 'completed'
+        assert result['receipt_hash'] == original['receipt_hash']
+        assert len(calls) == len(plans) == 1
+        assert plans[0].context.as_of == now
+        with ops.connection() as db:
+            assert dict(db.execute('SELECT * FROM schedule_ticks').fetchone()) == original
+        assert ops.pending_alerts('local') == []
+    finally:
+        client.close()
+
+
 def test_temporal_bindings_keep_schedule_and_invocation_clocks_separate():
     task = FetchTask(
         task_id="macro",

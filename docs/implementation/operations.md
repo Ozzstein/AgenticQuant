@@ -582,3 +582,33 @@ cutoff before fitting. It does not by itself make an ensemble an approved
 strategy or operating model. The live catalog was rechecked and this task was
 explicitly assigned Codex GPT-6.1-Sol, xhigh reasoning, Standard tier; root remains
 Astra/high and the accounting/Jev authority lanes remain Astra/xhigh/Standard.
+
+### Temporal ensemble integration and completed scheduler recovery
+
+Data `21e78e7` integrated as `7520957`. All 108 root ensemble temporal-policy,
+temporal-model, ensemble, actual local Qlib and walk-forward tests passed in
+42.21s. Captured fitting now checks the complete indexed population at the actual
+fit cutoff and purges training outcomes by their explicit economic end before
+the validation boundary. Internal predictions remain non-contextual retrospective
+weight selection, labeled as such; strict historical publication purging remains.
+The canonical parent artifact and strategy/H recipe admission are still pending.
+Log: `/tmp/quantagentlab-root-ensemble-temporal.log`.
+
+A root scheduler regression interrupted execution after the completed tick
+receipt committed but before advancing the schedule cursor. Previously, restart
+could dispatch again within the lag window or misreport the completed job as
+missed afterward. Recovery now verifies both original archived input and completed
+receipt, advances only the cursor, and returns the original receipt without
+reading a replacement input or executing the handler. Missing/corrupt/incomplete
+receipt authority blocks advancement. Tests cover both lag cases, changed inbox
+contents, real RefreshService/adapter/store execution with synthetic HTTP,
+unchanged first invocation clock and exactly one fetch, and invalid authority.
+All 49 scheduler/rolling-refresh/refresh/CLI/store/monitoring cases passed in
+14.80s, offline; Ruff and diff checks passed. Log:
+`/tmp/quantagentlab-root-scheduler-cursor.log`.
+
+The new whole-suite audit is pinned to immutable archive `7520957` and therefore
+predates this cursor fix. Its outcome is not yet recorded here. Jev's separately
+reproduced known-usage overrun admission gap is assigned to its existing budget
+store/service authority; no financial efficacy or positive income acceptance
+is implied by these local checks.

@@ -139,6 +139,21 @@ class ScheduleSupervisor:
             if current != at.isoformat():
                 return {'schedule_id':spec.schedule_id,'status':'already_advanced'}
             old = db.execute('SELECT * FROM schedule_ticks WHERE schedule=? AND at=?',(spec.schedule_id,at.isoformat())).fetchone()
+        if old and old['state'] == 'completed':
+            # Completion and cursor advancement can be separated by a process
+            # crash. The original immutable receipt remains authoritative even
+            # after the lag window or replacement of the mutable input file.
+            self.store.artifact(old['input_hash'])
+            completed = self.store.artifact(old['receipt_hash'])
+            if not isinstance(completed, dict) or completed.get('status') != 'completed' or old['error_type'] is not None:
+                raise OperationError('completed schedule lacks its original completion receipt')
+            next_at = spec.next_at(at)
+            with self.store.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute('UPDATE schedules SET next_at=? WHERE id=? AND next_at=?',
+                           (next_at.isoformat(),spec.schedule_id,at.isoformat()))
+            return {'schedule_id':spec.schedule_id,'scheduled_for':at.isoformat(),'status':'completed',
+                    'receipt_hash':old['receipt_hash'],'error_type':None}
         if old and old['state'] in ('failed','uncertain','running'):
             return {'schedule_id':spec.schedule_id,'status':'recovery_required','scheduled_for':at.isoformat()}
         path = spec.input_path(at) if spec.input_directory is not None else None

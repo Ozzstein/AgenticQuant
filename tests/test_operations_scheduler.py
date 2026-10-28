@@ -55,6 +55,44 @@ def test_completed_tick_is_not_reexecuted_on_restart(tmp_path):
     assert restarted.tick(T) == [] and len(calls)==1
 
 
+@pytest.mark.parametrize('delay', [1, 121])
+def test_completed_receipt_survives_crash_before_schedule_advances(tmp_path, monkeypatch, delay):
+    store = OperationsStore(tmp_path/'ops.db')
+    spec = interval(tmp_path)
+    path = spec.input_path(T)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"run_id":"original"}')
+    calls = []
+
+    def handler(file, at):
+        calls.append(json.loads(file.read_text()))
+        return {'status':'completed', 'actual_run':'original'}
+
+    scheduler = ScheduleSupervisor(store, handler)
+    scheduler.register(spec)
+    with monkeypatch.context() as patch:
+        def crash(*_):
+            raise KeyboardInterrupt('after durable completion, before cursor advance')
+        patch.setattr(ScheduleSpec, 'next_at', crash)
+        with pytest.raises(KeyboardInterrupt):
+            scheduler.tick(T)
+    with store.connection() as db:
+        before = dict(db.execute('SELECT * FROM schedule_ticks').fetchone())
+        assert before['state'] == 'completed'
+        assert db.execute('SELECT next_at FROM schedules').fetchone()[0] == T.isoformat()
+    path.write_text('{"run_id":"replacement"}')
+    restarted = ScheduleSupervisor(OperationsStore(store.path), handler)
+    # Even after the lag window, recorded completion wins over redispatch/missed.
+    result = restarted.tick(T+timedelta(seconds=delay))[0]
+    assert result['status'] == 'completed'
+    assert result['receipt_hash'] == before['receipt_hash']
+    assert calls == [{'run_id':'original'}]
+    with store.connection() as db:
+        assert dict(db.execute('SELECT * FROM schedule_ticks').fetchone()) == before
+        assert db.execute('SELECT next_at FROM schedules').fetchone()[0] == (T+timedelta(seconds=60)).isoformat()
+    assert store.pending_alerts('local') == []
+
+
 def test_failed_tick_needs_exact_explicit_recovery_and_uses_frozen_input(tmp_path):
     store = OperationsStore(tmp_path/'ops.db')
     spec = interval(tmp_path)
@@ -78,3 +116,29 @@ def test_failed_tick_needs_exact_explicit_recovery_and_uses_frozen_input(tmp_pat
         return {'status':'completed'}
     scheduler.handler=recover
     assert scheduler.tick(T)[0]['status'] == 'completed'
+
+
+@pytest.mark.parametrize('damage', ['input', 'receipt', 'incomplete_receipt'])
+def test_completed_cursor_recovery_requires_original_artifacts(tmp_path, monkeypatch, damage):
+    store = OperationsStore(tmp_path/'ops.db')
+    spec = interval(tmp_path)
+    path = spec.input_path(T)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"run_id":"original"}')
+    scheduler = ScheduleSupervisor(store, lambda *_: {'status':'completed'})
+    scheduler.register(spec)
+    with monkeypatch.context() as patch:
+        def crash(*_):
+            raise KeyboardInterrupt('after receipt')
+        patch.setattr(ScheduleSpec, 'next_at', crash)
+        with pytest.raises(KeyboardInterrupt):
+            scheduler.tick(T)
+    replacement = store.archive({'status':'failed'}) if damage == 'incomplete_receipt' else '0'*64
+    with store.connection() as db:
+        column = 'input_hash' if damage == 'input' else 'receipt_hash'
+        db.execute(f'UPDATE schedule_ticks SET {column}=?', (replacement,))
+    restarted = ScheduleSupervisor(OperationsStore(store.path), lambda *_: pytest.fail('no redispatch'))
+    with pytest.raises(OperationError, match='artifact absent or corrupt|original completion receipt'):
+        restarted.tick(T)
+    with store.connection() as db:
+        assert db.execute('SELECT next_at FROM schedules').fetchone()[0] == T.isoformat()
