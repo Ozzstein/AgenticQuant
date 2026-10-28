@@ -100,15 +100,27 @@ class RuntimeFixture:
             "instrument_id": self.instrument.instrument_id,
             "quantity": str(sign * order.quantity),
             "filled_quantity": "0",
-            "order_type": {"market": "Market", "limit": "Limit", "stop": "StopMarket"}[
-                order.order_type
-            ],
+            "order_type": {
+                "market": "Market",
+                "limit": "Limit",
+                "stop": "StopMarket",
+                "trailing_stop": "TrailingStop",
+            }[order.order_type],
             "limit_price": str(order.limit_price) if order.limit_price else None,
             "stop_price": str(order.stop_price) if order.stop_price else None,
             "status": "Submitted",
             "broker_ids": ["native-fixture-ticket"],
             "events": [self._event(1, "0", "0", "0", "Submitted")],
         }
+        if order.order_type == "trailing_stop":
+            percentage = order.trail_percent is not None
+            amount = order.trail_percent / 100 if percentage else order.trail_price
+            offset = self.price * amount if percentage else amount
+            self.ticket.update(
+                trailing_amount=str(amount),
+                trailing_as_percentage=percentage,
+                stop_price=str(self.price + sign * offset),
+            )
         if self.lose_ack:
             raise RuntimeError("fixture runtime accepted, acknowledgement lost")
         return copy.deepcopy(self.ticket)
@@ -221,16 +233,19 @@ def admit(runtime, execution, adapter, order):
     return execution.dispatch(order.intent_id, as_of=runtime.at)
 
 
-def test_unimplemented_trailing_type_cannot_fall_through_to_fixed_stop_runtime(tmp_path):
+def test_trailing_type_uses_exact_runtime_trail_not_fixed_stop(tmp_path):
     runtime, execution, adapter, order = setup(tmp_path)
     adapter._rules[A.instrument_id] = adapter._rules[A.instrument_id].model_copy(
         update={"order_types": ("market", "trailing_stop")}
     )
     order = order.model_copy(update={"order_type": "trailing_stop", "trail_percent": D(10)})
     result = admit(runtime, execution, adapter, order)
-    assert result["state"] == "rejected" and "trailing" in result["detail"]
-    assert not runtime.calls
-    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    assert result["state"] == "new"
+    assert len(runtime.calls) == 1
+    assert runtime.ticket["order_type"] == "TrailingStop"
+    assert D(runtime.ticket["trailing_amount"]) == D(".1")
+    assert runtime.ticket["trailing_as_percentage"] is True
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
     assert not execution.ledger.fills(order.account_id)
     execution.ledger.close()
 
@@ -572,17 +587,24 @@ def setup_live(tmp_path, *, runtime=None, wire=None):
             "id": "remote-order-1",
             "client_order_id": "actual-native-client",
             "symbol": "A",
-            "qty": "10",
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "gtc",
+            "qty": str(order.quantity),
+            "side": order.side,
+            "type": order.order_type,
+            "time_in_force": order.tif.lower(),
             "extended_hours": False,
             "order_class": "simple",
             "filled_qty": "0",
             "status": "new",
-            "limit_price": None,
-            "stop_price": None,
+            "limit_price": str(order.limit_price) if order.limit_price is not None else None,
+            "stop_price": str(order.stop_price) if order.stop_price is not None else None,
         }
+        if order.order_type == "trailing_stop":
+            wire.order.update(
+                trail_percent=str(order.trail_percent) if order.trail_percent is not None else None,
+                trail_price=str(order.trail_price) if order.trail_price is not None else None,
+                hwm=str(runtime.price),
+                stop_price=runtime.ticket["stop_price"],
+            )
         return copy.deepcopy(runtime.ticket)
 
     runtime.submit = submit

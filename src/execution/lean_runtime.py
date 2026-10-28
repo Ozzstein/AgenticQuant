@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 from threading import RLock
 
-from src.domain.portfolio import PriceMark
+from src.domain.portfolio import PriceMark, exact_decimal_product
 from src.execution.ccxt_transport import decimal
+from src.execution.lean_venue import require_trailing_support
 from src.execution.ledger import LedgerError
 from src.execution.risk_controls import evaluate_order
 
@@ -255,8 +256,7 @@ class LeanAlgorithmPort:
         }
 
     def preflight(self, intent):
-        if intent.order_type not in ("market", "limit", "stop"):
-            raise LedgerError("LEAN trailing order support is not yet implemented")
+        require_trailing_support(self.deployment, intent)
         security = self.algorithm.Securities[self.symbols[intent.instrument.instrument_id]]
         if not security.IsTradable or not security.HasData or self.algorithm.IsWarmingUp:
             raise LedgerError("LEAN security is not currently ready/tradable")
@@ -269,10 +269,15 @@ class LeanAlgorithmPort:
         for price in (intent.limit_price, intent.stop_price):
             if price is not None:
                 self._native_decimal(price)
+        if intent.order_type == "trailing_stop":
+            self._native_decimal(
+                exact_decimal_product(intent.trail_percent, D(".01"))
+                if intent.trail_percent is not None
+                else intent.trail_price
+            )
 
     def submit(self, intent, client_id):
-        if intent.order_type not in ("market", "limit", "stop"):
-            raise LedgerError("LEAN trailing order support is not yet implemented")
+        require_trailing_support(self.deployment, intent)
         properties = self._properties()
         properties.TimeInForce = self._gtc()
         if intent.tif == "DAY":
@@ -290,6 +295,22 @@ class LeanAlgorithmPort:
         elif intent.order_type == "limit":
             ticket = self.algorithm.LimitOrder(
                 symbol, quantity, self._native_decimal(intent.limit_price), client_id, properties
+            )
+        elif intent.order_type == "trailing_stop":
+            percentage = intent.trail_percent is not None
+            amount = (
+                exact_decimal_product(intent.trail_percent, D(".01"))
+                if percentage
+                else intent.trail_price
+            )
+            ticket = self.algorithm.TrailingStopOrder(
+                symbol,
+                quantity,
+                self._native_decimal(amount),
+                percentage,
+                True,
+                client_id,
+                properties,
             )
         else:
             ticket = self.algorithm.StopMarketOrder(
@@ -379,8 +400,16 @@ class LeanAlgorithmPort:
             if str(order.Type) == "Limit"
             else None,
             "stop_price": str(self._number(order.StopPrice))
-            if str(order.Type) == "StopMarket"
+            if str(order.Type) in ("StopMarket", "TrailingStop")
             else None,
+            **(
+                {
+                    "trailing_amount": str(self._number(order.TrailingAmount)),
+                    "trailing_as_percentage": bool(order.TrailingAsPercentage),
+                }
+                if str(order.Type) == "TrailingStop"
+                else {}
+            ),
             "broker_ids": tuple(str(value) for value in order.BrokerId),
             "events": [self.event(event) for event in ticket.OrderEvents],
         }

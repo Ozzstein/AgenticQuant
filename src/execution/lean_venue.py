@@ -12,12 +12,28 @@ from typing import Literal
 from pydantic import model_validator
 
 from src.domain.common import Instrument, NonEmptyString, VersionedContract, _utc
-from src.domain.portfolio import Fill, InventoryFee, PriceMark, exact_decimal_sum
+from src.domain.portfolio import (
+    Fill,
+    InventoryFee,
+    PriceMark,
+    exact_decimal_product,
+    exact_decimal_sum,
+)
 from src.execution.ccxt_transport import canonical, decimal, digest
 from src.execution.dividends import require_remote_income_account
 from src.execution.ledger import LedgerError
 from src.execution.spot_venue import FeeValuation
 from src.execution.venue import SubmissionNotAttempted, VenueBalances, VenueOrderReport, VenueRules
+
+
+def require_trailing_support(deployment, intent):
+    """Only reviewed LEAN brokerage models can execute the canonical trail."""
+    if intent.order_type == "trailing_stop" and (
+        deployment.brokerage not in ("PaperBrokerage", "AlpacaBrokerage")
+        or deployment.brokerage == "AlpacaBrokerage"
+        and (intent.instrument.asset_class == "crypto" or intent.quantity % 1)
+    ):
+        raise LedgerError("reviewed LEAN brokerage/quantity does not support this trailing order")
 
 
 class LeanInstrument(VersionedContract):
@@ -398,8 +414,7 @@ class LeanVenue:
             return binding
         try:
             rules.require_order(intent, now)
-            if intent.order_type not in ("market", "limit", "stop"):
-                raise LedgerError("LEAN trailing order support is not yet implemented")
+            require_trailing_support(self.deployment, intent)
             if intent.fx_rate != 1 or intent.tif not in ("GTC", "DAY"):
                 raise LedgerError("LEAN requires supported exact cash currency/time-in-force")
             if intent.expires_at is not None and intent.tif != "DAY":
@@ -783,14 +798,17 @@ class LeanVenue:
 
     @staticmethod
     def _validate_ticket_intent(intent, payload):
-        if intent.order_type not in ("market", "limit", "stop"):
-            raise LedgerError("LEAN trailing order support is not yet implemented")
         signed = intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
         if (
             payload["instrument_id"] != intent.instrument.instrument_id
             or decimal(payload["quantity"]) != signed
             or payload["order_type"]
-            != {"market": "Market", "limit": "Limit", "stop": "StopMarket"}[intent.order_type]
+            != {
+                "market": "Market",
+                "limit": "Limit",
+                "stop": "StopMarket",
+                "trailing_stop": "TrailingStop",
+            }[intent.order_type]
         ):
             raise LedgerError("LEAN ticket differs from exact canonical intent")
         if (
@@ -800,6 +818,25 @@ class LeanVenue:
             and decimal(payload["stop_price"]) != intent.stop_price
         ):
             raise LedgerError("LEAN ticket price differs")
+        if intent.order_type == "trailing_stop":
+            percentage = intent.trail_percent is not None
+            expected = (
+                exact_decimal_product(intent.trail_percent, D(".01"))
+                if percentage
+                else intent.trail_price
+            )
+            if (
+                payload.get("trailing_as_percentage") is not percentage
+                or decimal(payload.get("trailing_amount")) != expected
+                or decimal(payload.get("stop_price")) <= 0
+                or payload.get("limit_price") is not None
+            ):
+                raise LedgerError("LEAN trailing ticket amount/basis/observation differs")
+        elif (
+            payload.get("trailing_amount") is not None
+            or payload.get("trailing_as_percentage") is not None
+        ):
+            raise LedgerError("LEAN fixed order unexpectedly contains trailing terms")
 
     def _original_native_binding(self, intent, client, as_of):
         retained = self._latest("native-report", _utc(as_of), client, required=False)
