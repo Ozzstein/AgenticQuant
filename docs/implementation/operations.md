@@ -404,3 +404,32 @@ registered-experiment integration then passed 96 tests in 181.37s, including
 actual fits, paired regimes, callback ledgers and changed-cost accounts. The
 transport/source/refresh integration after the HTTP cap separately passed
 159 tests in 43.01s. Actual local authorities and synthetic transport only.
+
+### Full archived audit, 2026-10-28
+
+The next full suite ran against an immutable `git archive` of
+`a0ec996acd360d7caad2edd0be56b35e53fa1332` at
+`/tmp/quantagentlab-root-audit-a0ec996-pc3v4196`, using the locked main Python
+environment and `PYTHONPATH` pointing only to that archive:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+  /home/ozzstein/AgenticQuant/.venv/bin/python -m pytest tests -q \
+  --disable-socket --allow-unix-socket \
+  --junitxml=/tmp/quantagentlab-root-a0ec996-full.xml
+```
+
+Result: 2,103 tests, **2,081 passed, 3 failed, 18 setup errors, 1 skipped**, two
+warnings, 1,107.76s. Full log `/tmp/quantagentlab-root-a0ec996-full.log` and JUnit
+above retain exact results. All failures/errors are the enabled positive fresh
+H/application acceptance cases requiring explicit sufficient income authority.
+The operator has selected no source; that gate remains closed. The prior fourteen
+retired-interface failures are resolved in this whole-suite run.
+
+The archive excluded the separately installed RD-Agent environment, so
+`test_native_rd_adapter.py::test_real_pinned_templates_render_explicit_us_scenario`
+skipped there. Running that exact test in the main checkout with its installed
+pinned environment passed in 2.03s. No archive result was relabeled; no Docker or
+provider execution is implied. Before the full audit, canonical trailing-stop
+integration passed 248 stop/venue/remote/LEAN/ledger/sleeve/income/artifact tests in
+33.57s. This is still not a source-complete or deployed release.

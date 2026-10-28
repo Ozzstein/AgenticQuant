@@ -1,6 +1,6 @@
 # Full-system implementation evidence register
 
-Authority: [complete build plan](FULL_SYSTEM_BUILD_PLAN.md). Updated 2026-10-27.
+Authority: [complete build plan](FULL_SYSTEM_BUILD_PLAN.md). Updated 2026-10-28.
 
 `offline_verified` means the stated deterministic/local boundary was exercised; it
 is not authenticated, statistical, prospective or deployment acceptance. `partial`
@@ -42,7 +42,7 @@ enabled. This register supersedes the bootstrap table.
 | J7 auxiliary macro | pending | Conditional only; HMM authoritative | Demonstrated incremental value |
 | F1 five optimizers | offline_verified | Actual LW covariance, deterministic HRP, BL views, feasible constrained fallback and exact target conversion | Real histories and all venue fee/lot interactions |
 | F2 durable execution | offline_verified | Exclusive owner, pre-I/O claim, partial/ambiguous receipt recovery, opening capacity identity | Authenticated lifecycle and unsupported historical reconciliation |
-| F3 Alpaca | external_unverified | Typed bounded REST/activity adapter, actual FILL/FEE parsing and account/order reconciliation; synthetic HTTP tests | Actual paper account, bracket/trailing and full lifecycle |
+| F3 Alpaca | external_unverified | Typed bounded REST/activity adapter, actual FILL/FEE parsing, exact trailing fields and account/order reconciliation; shared durable observed-open stop election | Actual paper account, bracket/contingent and full lifecycle |
 | F4 crypto venues | partial | Typed Binance/Kraken spot adapters, native gross settlement, actual inventory-fee ledger/sleeves, bounded CCXT signing and native predicates; frozen source factory/refresh composition; 119 root source/refresh checks passed | Advanced orders and authenticated/testnet acceptance |
 | F5 LEAN | partial | Actual algorithm/port drains canonical exclusive outbox, native fills override estimates; per-intent frozen Binance sources; original native ticket/execution recovery across runtime restart | Advanced orders/expiry and actual LEAN/.NET/Docker acceptance |
 | F6 income ledger | offline_verified | Sourced terms/receivables, original sleeve owners, actual posted/local-paper distributions, taxes and publication fences | Sufficient source authority; mergers/spinoffs/due-bills/foreign conventions blocked |
@@ -53,8 +53,8 @@ enabled. This register supersedes the bootstrap table.
 | G5 native RD | partial | Pinned supervisor/overlay, bounded gateway/watchdog, frozen data/documents and authenticated lineage; immutable create/bind/start/recovery authority and CLI, 139 focused root tests | Actual Docker/all seven workflows, source-specific document scope and candidate import |
 | H1 operating cycle | partial | Shared six-strategy models/HMM/desk/optimizer/ledger, actual mixed-calendar recovery verified before income guard | Fresh positive acceptance now blocked by insufficient income source; retained tests fail visibly |
 | H2 scheduler/entry points | partial | Same application services, frozen jobs, independent operating/research workers, durable recovery | Rolling unattended refresh/build and full intraday production operation |
-| H3 dashboard/alerts | partial | Read-only actual stores/ledger/usage; durable SMTP/Telegram outbox and uncertainty tests | Authenticated delivery, resource monitoring, backup/restore and deployment |
-| I1 full integration | partial | Full pinned audit and exact subsequent root/lane tests linked below; 14 retired-interface failures migrated | Subsequent full audit and positive source/cycle requirements |
+| H3 dashboard/alerts | partial | Verified read-only registry snapshots, historical/current eligibility distinction, narrow native recovery state; actual ledger/usage; durable notification outbox | Authenticated delivery, resource monitoring, backup/restore and deployment |
+| I1 full integration | partial | Latest full pinned audit: 2,081 passed, 3 failed, 18 setup errors, 1 skipped; prior 14 retired-interface failures resolved | Positive source/cycle requirements and subsequent checkpoint integration |
 | I2 external release | external_unverified | Explicit unavailable/blocked states | Clean host/Docker, provider/venue/native runs and labeled agent calibration |
 | I3 prospective release | pending | Thresholds retained in full plan | Three-month paper/required run count, quant-only/veto/full-agent comparison and release decision |
 
@@ -82,3 +82,13 @@ portfolio/advice tests passed in 36.93s after G sleeve integration; 87 refresh a
 credential tests passed in 10.83s; 159 transport/source/refresh tests passed in
 43.01s after the streamed HTTP cap. These overlapping checks are not a full-suite
 green claim. See the linked implementation notes for exact pins and commands.
+
+Latest complete audit: immutable archive `a0ec996acd360d7caad2edd0be56b35e53fa1332`,
+2,103 tests in 1,107.76s: **2,081 passed, 3 failed, 18 setup errors, 1 skipped**.
+Every failure/error is the retained fresh positive income-policy/source dependency;
+none was skipped or replaced with a fabricated positive authority. The one skip
+was the separately installed RD-Agent environment, absent from `git archive`.
+That exact pinned-template test subsequently passed in the main checkout in
+2.03s using the installed isolated environment; this is template rendering, not
+Docker/native job acceptance. Stop/remote/ledger/artifact integration separately
+passed 248 tests in 33.57s. Original full-audit counts remain unchanged.
