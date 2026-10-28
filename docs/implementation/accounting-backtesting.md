@@ -832,3 +832,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" AIQUANT_OUTPUT_DIR=/tmp/quantagent-a
 ```
 
 Changed-file Ruff/diff pass. This is an additive reader identity checkpoint for root's current registry locator, with no new application locator schema, WF bridge, external action or settlement enablement.
+
+## Integrated claim and operating compatibility evidence
+
+Root reports `cbed77b` integrated as `89fb5eb`, with **111 tests passed in 10.46s**, zero skips, covering actual canonical claim/source/audit/venue/opening/source-alias fixture paths. Its review found no new issue in the durable start/claimed receipts or closed rejection paths.
+
+H subsequently tested its unchanged `640e2ef` operating gates against the exact integrated root `e3d5ed9`, including accounting `cbed77b` and `87b9165`: **23 tests passed in 8.97s**. These comprise all 14 current-compliance operating cases and nine actual source midnight/expiry/passive-action cases. H reports actual paper acceptance, retained expired native proof, cancellation, expired-prepared cleanup and a fresh audit between dispatches passing unchanged; typed alerts retain the new account/binding hashes. H's evidence commit is `ec7e49d`. These are reported cross-lane integration results, not additional executions in this accounting worktree.
+
+The accounting branch remains the source of `PortfolioLedger.execution_compliance(account_id)`, the two immutable identity fields, canonical admission/final-claim checks and the separate required validation gate. Root owns current registry locator/ancestor verification. Successful integration of these phase-one gates does not enable factual economic settlement: no private expiry-fill exception, settlement route or contingent-group schema is present. Phase two still requires its separate source/report/sleeve closure and crash-atomicity review. Authenticated provider/LEAN acceptance and sufficient positive income authority remain unverified.
