@@ -27,6 +27,25 @@ def native_time(value):
     return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=native_integer(value))
 
 
+def trailing_delta(intent):
+    """Binance supports integer basis points, not a moving quote-offset conversion."""
+    if intent.order_type != "trailing_stop" or intent.trail_percent is None:
+        raise LedgerError("native Binance trailing stop requires a percentage trail")
+    delta = exact_decimal_product(intent.trail_percent, D(100))
+    if delta <= 0 or delta != delta.to_integral_value():
+        raise LedgerError("native Binance trailing percentage must be exact integer basis points")
+    return int(delta)
+
+
+def order_type(intent):
+    return {
+        "market": "MARKET",
+        "limit": "LIMIT",
+        "stop": "STOP_LOSS",
+        "trailing_stop": "STOP_LOSS",
+    }[intent.order_type]
+
+
 class BinanceVenue(CCXTSpotVenue):
     venue = "binance"
 
@@ -193,12 +212,10 @@ class BinanceVenue(CCXTSpotVenue):
         return source.price
 
     def _check_order(self, intent, as_of):
-        if intent.order_type not in ("market", "limit", "stop"):
-            raise LedgerError("native Binance trailing order support is not yet implemented")
         market = self._market(intent.instrument)
         capture, _ = self._capture(as_of)
         symbol = self._symbol(capture, intent.instrument.instrument_id)
-        native_type = {"market": "MARKET", "limit": "LIMIT", "stop": "STOP_LOSS"}[intent.order_type]
+        native_type = order_type(intent)
         if (
             native_type not in symbol["orderTypes"]
             or intent.tif == "DAY"
@@ -222,11 +239,21 @@ class BinanceVenue(CCXTSpotVenue):
             *filters["exchangeFilters"],
             *filters["assetFilters"],
         ]
+        trailing = intent.order_type == "trailing_stop"
+        if trailing:
+            delta = trailing_delta(intent)
+            if symbol.get("allowTrailingStop") is not True or not any(
+                entry.get("filterType") == "TRAILING_DELTA" for entry in all_filters
+            ):
+                raise LedgerError("native Binance trailing eligibility/range evidence missing")
         for native in all_filters:
             kind = native.get("filterType")
             price = intent.limit_price if intent.order_type == "limit" else intent.stop_price
             if kind in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                if kind == "MARKET_LOT_SIZE" and intent.order_type != "market":
+                if kind == "MARKET_LOT_SIZE" and intent.order_type not in (
+                    "market",
+                    "trailing_stop",
+                ):
                     continue
                 minimum, maximum, step = map(
                     decimal, (native["minQty"], native["maxQty"], native["stepSize"])
@@ -298,7 +325,7 @@ class BinanceVenue(CCXTSpotVenue):
                     if kind.startswith("EXCHANGE_") or row["symbol"] == market.symbol
                 ]
                 if "ALGO" in kind:
-                    if intent.order_type != "stop":
+                    if intent.order_type not in ("stop", "trailing_stop"):
                         continue
                     scoped = [
                         row
@@ -336,17 +363,23 @@ class BinanceVenue(CCXTSpotVenue):
                     raise LedgerError("native MAX_ASSET scope differs from actual market")
                 if amount > decimal(native["limit"]):
                     raise LedgerError("native Binance maximum asset quantity violated")
+            elif kind == "TRAILING_DELTA":
+                if trailing:
+                    direction = "Above" if intent.side == "buy" else "Below"
+                    minimum = native_integer(native["minTrailing" + direction + "Delta"])
+                    maximum = native_integer(native["maxTrailing" + direction + "Delta"])
+                    if not minimum <= delta <= maximum:
+                        raise LedgerError("native Binance trailing delta range violated")
             elif kind in (
                 "ICEBERG_PARTS",
                 "MAX_NUM_ICEBERG_ORDERS",
                 "EXCHANGE_MAX_NUM_ICEBERG_ORDERS",
-                "TRAILING_DELTA",
                 "MAX_NUM_ORDER_AMENDS",
                 "MAX_NUM_ORDER_LISTS",
                 "EXCHANGE_MAX_NUM_ORDER_LISTS",
             ):
                 # This endpoint emits plain individual orders with no iceberg,
-                # trailing delta, amendment or order-list fields.
+                # amendment or order-list fields.
                 continue
             else:
                 raise LedgerError("unrecognized native Binance filter: " + str(kind))
@@ -357,7 +390,7 @@ class BinanceVenue(CCXTSpotVenue):
         params = {
             "symbol": self._market(intent.instrument).symbol,
             "side": intent.side.upper(),
-            "type": {"market": "MARKET", "limit": "LIMIT", "stop": "STOP_LOSS"}[intent.order_type],
+            "type": order_type(intent),
             "quantity": str(intent.quantity),
             "newClientOrderId": client_order_id,
             "newOrderRespType": "RESULT",
@@ -366,6 +399,8 @@ class BinanceVenue(CCXTSpotVenue):
             params.update(price=str(intent.limit_price), timeInForce=intent.tif)
         if intent.order_type == "stop":
             params["stopPrice"] = str(intent.stop_price)
+        elif intent.order_type == "trailing_stop":
+            params["trailingDelta"] = trailing_delta(intent)
         order, observed, reference = self._request(
             "order", method="POST", params=params, submitting=True
         )
@@ -426,8 +461,7 @@ class BinanceVenue(CCXTSpotVenue):
             order.get("symbol") != market.symbol
             or order.get("clientOrderId") != client_order_id
             or order.get("side") != intent.side.upper()
-            or order.get("type")
-            != {"market": "MARKET", "limit": "LIMIT", "stop": "STOP_LOSS"}[intent.order_type]
+            or order.get("type") != order_type(intent)
             or decimal(order["origQty"]) != intent.quantity
             or order.get("orderListId", -1) != -1
         ):
@@ -438,6 +472,13 @@ class BinanceVenue(CCXTSpotVenue):
             or (intent.order_type == "stop" and decimal(order["stopPrice"]) != intent.stop_price)
         ):
             raise LedgerError("native Binance order price/time-in-force differs")
+        if intent.order_type == "trailing_stop":
+            if native_integer(order.get("trailingDelta")) != trailing_delta(intent):
+                raise LedgerError("native Binance trailing delta differs from original intent")
+            if decimal(order.get("stopPrice", "0")) < 0:
+                raise LedgerError("native Binance trailing stop observation is negative")
+        elif order.get("trailingDelta") is not None:
+            raise LedgerError("native Binance order unexpectedly has trailing terms")
         cumulative = decimal(order["executedQty"])
         fills, seen = [], set()
         if cumulative:

@@ -7,6 +7,7 @@ authorization; tests inject offline HTTP transport and never contact a venue.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING
 from decimal import Decimal as D
@@ -36,6 +37,32 @@ def result(value):
     ):
         raise LedgerError("complete successful native Kraken response required")
     return value["result"]
+
+
+def order_type(intent):
+    return {
+        "market": "market",
+        "limit": "limit",
+        "stop": "stop-loss",
+        "trailing_stop": "trailing-stop",
+    }[intent.order_type]
+
+
+def trailing_price(intent):
+    value = intent.trail_percent if intent.trail_percent is not None else intent.trail_price
+    if intent.order_type != "trailing_stop" or value is None:
+        raise LedgerError("native Kraken trailing order requires exact immutable trail terms")
+    return "+" + format(value, "f") + ("%" if intent.trail_percent is not None else "")
+
+
+def require_trailing_price(intent, value):
+    # A number alone cannot distinguish a quote offset from a percent trail.
+    if not isinstance(value, str) or re.fullmatch(r"\+[0-9]+(?:\.[0-9]+)?%?", value) is None:
+        raise LedgerError("native Kraken trailing price requires its explicit relative basis")
+    percentage = value.endswith("%")
+    expected = intent.trail_percent if percentage else intent.trail_price
+    if expected is None or decimal(value[1:-1] if percentage else value[1:]) != expected:
+        raise LedgerError("native Kraken trailing price differs from immutable intent")
 
 
 class KrakenVenue(CCXTSpotVenue):
@@ -257,8 +284,6 @@ class KrakenVenue(CCXTSpotVenue):
         return self._rules[instrument.instrument_id]
 
     def _check_order(self, intent, as_of):
-        if intent.order_type not in ("market", "limit", "stop"):
-            raise LedgerError("native Kraken trailing order support is not yet implemented")
         capture, _ = self._capture(as_of)
         pair = self._pair(capture, intent.instrument.instrument_id)
         if pair["status"] != "online" and not (
@@ -276,11 +301,13 @@ class KrakenVenue(CCXTSpotVenue):
         price = intent.limit_price if intent.order_type == "limit" else intent.stop_price
         if price is not None and price % decimal(pair["tick_size"]):
             raise LedgerError("native Kraken tick size violated")
+        if intent.trail_price is not None and intent.trail_price % decimal(pair["tick_size"]):
+            raise LedgerError("native Kraken trailing offset tick size violated")
         if intent.tif == "DAY" or intent.expires_at is not None:
             raise LedgerError(
                 "Kraken native GTD expiry requires an explicit supported temporal mapping"
             )
-        if intent.order_type == "stop" and intent.tif != "GTC":
+        if intent.order_type in ("stop", "trailing_stop") and intent.tif != "GTC":
             raise LedgerError("conditional Kraken order requires GTC")
         if intent.order_type != "limit":
             market = self.markets[intent.instrument.instrument_id]
@@ -300,15 +327,15 @@ class KrakenVenue(CCXTSpotVenue):
         params = {
             "pair": self._market(intent.instrument).native_id,
             "type": intent.side,
-            "ordertype": {"market": "market", "limit": "limit", "stop": "stop-loss"}[
-                intent.order_type
-            ],
+            "ordertype": order_type(intent),
             "volume": str(intent.quantity),
             "cl_ord_id": client_order_id,
             "oflags": "fciq",
             "timeinforce": intent.tif,
         }
-        if intent.order_type != "market":
+        if intent.order_type == "trailing_stop":
+            params.update(price=trailing_price(intent), trigger="last")
+        elif intent.order_type != "market":
             params["price"] = str(
                 intent.limit_price if intent.order_type == "limit" else intent.stop_price
             )
@@ -408,8 +435,7 @@ class KrakenVenue(CCXTSpotVenue):
             order.get("cl_ord_id") != client_id
             or description.get("pair") not in (market.native_id, market.symbol)
             or description.get("type") != intent.side
-            or description.get("ordertype")
-            != {"market": "market", "limit": "limit", "stop": "stop-loss"}[intent.order_type]
+            or description.get("ordertype") != order_type(intent)
             or description.get("leverage") != "none"
             or description.get("close") not in (None, "")
             or decimal(order["vol"]) != intent.quantity
@@ -418,7 +444,18 @@ class KrakenVenue(CCXTSpotVenue):
             raise LedgerError("native Kraken order differs from exact spot intent")
         if set(filter(None, order.get("oflags", "").split(","))) - {"fciq", "fcib"}:
             raise LedgerError("unexpected native Kraken order flags")
-        if intent.order_type != "market" and decimal(description["price"]) != (
+        if intent.order_type == "trailing_stop":
+            require_trailing_price(intent, description.get("price"))
+            if order.get("trigger") != "last":
+                raise LedgerError(
+                    "native Kraken trailing trigger requires the original last-price basis"
+                )
+            for key in ("stopprice", "limitprice"):
+                if key in order and decimal(order[key]) < 0:
+                    raise LedgerError("native Kraken trailing observation is negative")
+            if description.get("price2") is not None and decimal(description["price2"]):
+                raise LedgerError("native Kraken market trailing order cannot have a limit price")
+        elif intent.order_type != "market" and decimal(description["price"]) != (
             intent.limit_price if intent.order_type == "limit" else intent.stop_price
         ):
             raise LedgerError("native Kraken order price differs")
@@ -453,8 +490,8 @@ class KrakenVenue(CCXTSpotVenue):
                     or decimal(trade["margin"])
                     or trade["ordertype"]
                     not in (
-                        ("market", "stop-loss")
-                        if intent.order_type == "stop"
+                        ("market", description["ordertype"])
+                        if intent.order_type in ("stop", "trailing_stop")
                         else (description["ordertype"],)
                     )
                 ):

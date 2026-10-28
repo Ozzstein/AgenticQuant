@@ -62,6 +62,7 @@ class Wire:
             },
         ]
         self.asset_filters = []
+        self.allow_trailing = False
 
     async def transport(self, request):
         response = self.handle(request)
@@ -123,6 +124,7 @@ class Wire:
                             "quoteAsset": "USDT",
                             "status": "TRADING",
                             "isSpotTradingAllowed": True,
+                            "allowTrailingStop": self.allow_trailing,
                             "orderTypes": ["MARKET", "LIMIT", "STOP_LOSS"],
                             "filters": self.filters,
                         }
@@ -156,6 +158,11 @@ class Wire:
                 "type": parameters["type"],
                 "side": parameters["side"],
                 "stopPrice": parameters.get("stopPrice", "0"),
+                **(
+                    {"trailingDelta": int(parameters["trailingDelta"]), "trailingTime": -1}
+                    if "trailingDelta" in parameters
+                    else {}
+                ),
             }
             if self.lost_ack:
                 raise httpx.ReadTimeout("fixture acceptance with lost reply", request=request)
@@ -278,7 +285,7 @@ def admit(wire, execution, adapter, order):
     return execution.dispatch(order.intent_id, as_of=wire.now)
 
 
-def test_unimplemented_trailing_type_rejects_before_native_post_and_releases_cash(tmp_path):
+def test_unproved_trailing_eligibility_rejects_before_native_post_and_releases_cash(tmp_path):
     wire, execution, adapter, order = setup(tmp_path)
     adapter._rules[BTC.instrument_id] = adapter._rules[BTC.instrument_id].model_copy(
         update={"order_types": ("market", "trailing_stop")}
@@ -289,6 +296,161 @@ def test_unimplemented_trailing_type_rejects_before_native_post_and_releases_cas
     assert not any(method == "POST" for method, *_ in wire.calls)
     assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
     assert not execution.ledger.fills(order.account_id)
+    execution.ledger.close()
+
+
+def trailing_setup(path, wire=None, **terms):
+    wire = wire or Wire()
+    wire.allow_trailing = True
+    if not any(f["filterType"] == "TRAILING_DELTA" for f in wire.filters):
+        wire.filters.append(
+            {
+                "filterType": "TRAILING_DELTA",
+                "minTrailingAboveDelta": 100,
+                "maxTrailingAboveDelta": 2000,
+                "minTrailingBelowDelta": 200,
+                "maxTrailingBelowDelta": 3000,
+            }
+        )
+    wire, execution, adapter, order = setup(path, wire)
+    adapter._rules[BTC.instrument_id] = adapter._rules[BTC.instrument_id].model_copy(
+        update={"order_types": ("market", "trailing_stop")}
+    )
+    return (
+        wire,
+        execution,
+        adapter,
+        order.model_copy(update={"order_type": "trailing_stop", "trail_percent": D(10), **terms}),
+    )
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_native_trailing_basis_points_actual_fees_partial_and_restart(tmp_path, side):
+    wire, execution, adapter, trailing = trailing_setup(tmp_path)
+    if side == "sell":
+        entry = trailing.model_copy(
+            update={"intent_id": "entry", "order_type": "market", "trail_percent": None}
+        )
+        assert admit(wire, execution, adapter, entry)["state"] == "new"
+        wire.add(1, "10", "100", "0", "USDT")
+        wire.now = T + timedelta(seconds=3)
+        assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "filled"
+        execution.ledger.mark(
+            entry.account_id, [PriceMark(instrument=BTC, price=100, as_of=wire.now)]
+        )
+        trailing = trailing.model_copy(
+            update={
+                "side": "sell",
+                "decision_at": wire.now,
+                "eligible_at": wire.now + timedelta(seconds=1),
+            }
+        )
+    adapter.capture()
+    execution.prepare(trailing, {BTC.instrument_id: metadata(wire.now, BTC)}, as_of=wire.now)
+    wire.now = trailing.eligible_at
+    assert execution.dispatch(trailing.intent_id, as_of=wire.now)["state"] == "new"
+    original_id = execution.state(trailing.intent_id)["client_id"]
+    sent = [params for method, path, params in wire.calls if method == "POST" and path == "order"][
+        -1
+    ]
+    assert sent["type"] == "STOP_LOSS" and sent["trailingDelta"] == "1000"
+    assert "stopPrice" not in sent and "price" not in sent
+    first_at = int((wire.now - T).total_seconds()) + 1
+    wire.order["trailingTime"] = milliseconds(wire.now)
+    wire.add(2, "4", "90" if side == "buy" else "85", ".4", "USDT", seconds=first_at)
+    wire.now += timedelta(seconds=2)
+    assert execution.reconcile_all(as_of=wire.now)[-1]["state"] == "partial"
+    assert execution.ledger.order(trailing.account_id, trailing.intent_id)["filled"] == 4
+    execution.ledger.close()
+    wire, execution, adapter, _ = trailing_setup(tmp_path, wire)
+    wire.add(3, "6", "70" if side == "buy" else "95", ".6", "USDT", seconds=first_at + 2)
+    wire.now += timedelta(seconds=2)
+    assert execution.reconcile_all(as_of=wire.now)[-1]["state"] == "filled"
+    execution.reconcile_all(as_of=wire.now)
+    adapter.capture()
+    assert execution.reconcile_balances(as_of=wire.now)["reconciled"]
+    assert execution.state(trailing.intent_id)["client_id"] == original_id
+    fills = [
+        f for f in execution.ledger.fills(trailing.account_id) if f.intent_id == trailing.intent_id
+    ]
+    assert [f.quantity for f in fills] == [4, 6] and sum((f.fee for f in fills), D(0)) == 1
+    assert execution.ledger.reconcile(trailing.account_id)["cash"] == (
+        "99219.0" if side == "buy" else "99909.0"
+    )
+    assert sum(method == "POST" for method, *_ in wire.calls) == (1 if side == "buy" else 2)
+    execution.ledger.close()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "fractional-bip",
+        "quote-offset",
+        "range",
+        "missing-range",
+        "algo-count",
+        "market-lot",
+        "notional",
+    ],
+)
+def test_native_trailing_preflight_applies_exact_amount_and_all_filters(tmp_path, failure):
+    wire, execution, adapter, order = trailing_setup(tmp_path)
+    if failure == "fractional-bip":
+        order = order.model_copy(update={"trail_percent": D("1.001")})
+    elif failure == "quote-offset":
+        order = order.model_copy(update={"trail_percent": None, "trail_price": D(2)})
+    elif failure == "range":
+        order = order.model_copy(update={"trail_percent": D(".5")})
+    elif failure == "missing-range":
+        wire.filters = [f for f in wire.filters if f["filterType"] != "TRAILING_DELTA"]
+    elif failure == "algo-count":
+        wire.filters.append({"filterType": "MAX_NUM_ALGO_ORDERS", "maxNumAlgoOrders": 0})
+    elif failure == "market-lot":
+        next(f for f in wire.filters if f["filterType"] == "MARKET_LOT_SIZE")["maxQty"] = "5"
+    else:
+        next(f for f in wire.filters if f["filterType"] == "MIN_NOTIONAL")["minNotional"] = "2000"
+    result = admit(wire, execution, adapter, order)
+    assert result["state"] == "rejected"
+    assert not any(method == "POST" for method, *_ in wire.calls)
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    execution.ledger.close()
+
+
+def test_native_trailing_delta_receipt_loss_changed_terms_and_partial_cancel(tmp_path):
+    wire, execution, adapter, order = trailing_setup(tmp_path)
+    wire.lost_ack = True
+    assert admit(wire, execution, adapter, order)["state"] == "ambiguous"
+    wire.order["trailingDelta"] = 900
+    with pytest.raises(LedgerError, match="trailing delta"):
+        adapter.lookup(order, execution.state(order.intent_id)["client_id"], None, wire.now)
+    assert not execution.ledger.fills(order.account_id)
+    wire.order["trailingDelta"] = 1000
+    wire.now += timedelta(seconds=1)
+    assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "new"
+    wire.add(1, "4", "90", ".4", "USDT")
+    wire.now += timedelta(seconds=1)
+    assert execution.cancel(order.intent_id, as_of=wire.now)["state"] == "cancelled"
+    assert execution.ledger.quantity(order.account_id, BTC.instrument_id) == 4
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    assert execution.ledger.reconcile(order.account_id)["reconciled"]
+    assert sum(method == "POST" for method, *_ in wire.calls) == 1
+    execution.ledger.close()
+
+
+def test_native_trailing_above_below_ranges_are_selected_by_actual_side(tmp_path):
+    wire, execution, adapter, order = trailing_setup(tmp_path, trail_percent=D("4.5"))
+    native = next(f for f in wire.filters if f["filterType"] == "TRAILING_DELTA")
+    native.update(
+        minTrailingAboveDelta=100,
+        maxTrailingAboveDelta=500,
+        minTrailingBelowDelta=600,
+        maxTrailingBelowDelta=900,
+    )
+    adapter.capture()
+    adapter._check_order(order, wire.now)
+    with pytest.raises(LedgerError, match="trailing delta range"):
+        adapter._check_order(order.model_copy(update={"side": "sell"}), wire.now)
+    assert not any(method == "POST" for method, *_ in wire.calls)
     execution.ledger.close()
 
 

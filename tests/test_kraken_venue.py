@@ -1,6 +1,8 @@
 """Offline native Kraken protocol fixtures; no authenticated trading acceptance."""
 
 import base64
+import hashlib
+import hmac
 import json
 from datetime import timedelta
 from decimal import Decimal as D
@@ -66,12 +68,26 @@ class Wire:
     async def transport(self, request):
         assert request.url.host == "api.kraken.com"
         path = request.url.path.rsplit("/", 1)[1]
-        params = {
-            key: value[0]
-            for key, value in parse_qs(
-                request.content.decode() if request.method == "POST" else request.url.query.decode()
-            ).items()
-        }
+        params = (
+            json.loads(request.content)
+            if request.headers.get("content-type") == "application/json"
+            else {
+                key: value[0]
+                for key, value in parse_qs(
+                    request.content.decode()
+                    if request.method == "POST"
+                    else request.url.query.decode()
+                ).items()
+            }
+        )
+        if request.method == "POST":
+            encoded = hashlib.sha256(str(params["nonce"]).encode() + request.content).digest()
+            expected = base64.b64encode(
+                hmac.new(
+                    b"fixture-secret", request.url.path.encode() + encoded, hashlib.sha512
+                ).digest()
+            ).decode()
+            assert request.headers["API-Sign"] == expected
         self.calls.append((path, params))
         response = self.handle(path, params, request)
         # Native timestamps and balances are genuine JSON numbers here. The
@@ -161,6 +177,11 @@ class Wire:
                 "price": "0",
                 "oflags": "fciq",
                 "trades": [],
+                **(
+                    {"trigger": params["trigger"], "stopprice": "0", "limitprice": "0"}
+                    if params["ordertype"] == "trailing-stop"
+                    else {}
+                ),
             }
             if self.timeout:
                 raise httpx.ReadTimeout(
@@ -305,17 +326,115 @@ def admit(wire, engine, adapter, order):
     return engine.dispatch(order.intent_id, as_of=wire.now)
 
 
-def test_unimplemented_trailing_type_rejects_before_add_order_and_releases_cash(tmp_path):
+def test_native_trailing_offset_tick_rejects_before_add_order_and_releases_cash(tmp_path):
     wire, execution, adapter, order = setup(tmp_path)
     adapter._rules[BTC.instrument_id] = adapter._rules[BTC.instrument_id].model_copy(
         update={"order_types": ("market", "trailing_stop")}
     )
-    order = order.model_copy(update={"order_type": "trailing_stop", "trail_percent": D(10)})
+    order = order.model_copy(update={"order_type": "trailing_stop", "trail_price": D(".05")})
+    wire.pair["tick_size"] = ".1"
     result = admit(wire, execution, adapter, order)
     assert result["state"] == "rejected" and "trailing" in result["detail"]
-    assert not any("AddOrder" in path for _, path, *_ in wire.calls)
+    assert not any("AddOrder" in path for path, *_ in wire.calls)
     assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
     assert not execution.ledger.fills(order.account_id)
+    execution.ledger.close()
+
+
+def trailing_setup(path, wire=None, *, percent=True):
+    wire, execution, adapter, order = setup(path, wire)
+    adapter._rules[BTC.instrument_id] = adapter._rules[BTC.instrument_id].model_copy(
+        update={"order_types": ("market", "trailing_stop")}
+    )
+    return (
+        wire,
+        execution,
+        adapter,
+        order.model_copy(
+            update={
+                "order_type": "trailing_stop",
+                "trail_percent": D("1.25") if percent else None,
+                "trail_price": None if percent else D("2.50"),
+            }
+        ),
+    )
+
+
+@pytest.mark.parametrize("percent", [True, False])
+def test_native_trailing_relative_basis_actual_ledger_fee_partial_and_restart(tmp_path, percent):
+    wire, execution, adapter, order = trailing_setup(tmp_path, percent=percent)
+    assert admit(wire, execution, adapter, order)["state"] == "new"
+    sent = next(params for path, params in wire.calls if path == "AddOrder")
+    assert sent["ordertype"] == "trailing-stop" and sent["trigger"] == "last"
+    assert sent["price"] == ("+1.25%" if percent else "+2.50")
+    assert "price2" not in sent and "close[ordertype]" not in sent
+    wire.add("T-TRAIL-1", "4", "90", ".4")
+    wire.trades["T-TRAIL-1"]["ordertype"] = "market"
+    wire.now = T + timedelta(seconds=3)
+    wire.empty_ledgers = True
+    with pytest.raises(LedgerError, match="ledger coverage incomplete"):
+        adapter.lookup(order, execution.state(order.intent_id)["client_id"], "O-FIXTURE", wire.now)
+    assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "ambiguous"
+    assert not execution.ledger.fills(order.account_id)
+    wire.empty_ledgers = False
+    assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "partial"
+    original = execution.state(order.intent_id)["client_id"]
+    execution.ledger.close()
+    wire, execution, adapter, same = trailing_setup(tmp_path, wire, percent=percent)
+    assert same == order
+    wire.add("T-TRAIL-2", "6", "70", ".6", seconds="4.125")
+    wire.trades["T-TRAIL-2"]["ordertype"] = "market"
+    wire.now = T + timedelta(seconds=5)
+    assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "filled"
+    execution.reconcile_all(as_of=wire.now)
+    adapter.capture()
+    assert execution.reconcile_balances(as_of=wire.now)["reconciled"]
+    assert execution.state(order.intent_id)["client_id"] == original
+    assert [f.price for f in execution.ledger.fills(order.account_id)] == [90, 70]
+    assert D(execution.ledger.reconcile(order.account_id)["cash"]) == D(99219)
+    assert sum(path == "AddOrder" for path, _ in wire.calls) == 1
+    execution.ledger.close()
+
+
+@pytest.mark.parametrize("changed", ["amount", "basis", "sign", "missing", "trigger", "limit"])
+def test_native_trailing_changed_or_ambiguous_terms_do_not_book_or_resubmit(tmp_path, changed):
+    wire, execution, adapter, order = trailing_setup(tmp_path)
+    wire.timeout = True
+    assert admit(wire, execution, adapter, order)["state"] == "ambiguous"
+    if changed in ("amount", "basis", "sign", "missing"):
+        wire.order["descr"]["price"] = {
+            "amount": "+2%",
+            "basis": "+1.25",
+            "sign": "-1.25%",
+            "missing": "1.25",
+        }[changed]
+    elif changed == "trigger":
+        wire.order["trigger"] = "index"
+    else:
+        wire.order["descr"]["price2"] = "100"
+    with pytest.raises(LedgerError, match="trailing"):
+        adapter.lookup(order, execution.state(order.intent_id)["client_id"], None, wire.now)
+    assert execution.dispatch(order.intent_id, as_of=wire.now)["state"] == "ambiguous"
+    assert not execution.ledger.fills(order.account_id)
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 1000
+    assert sum(path == "AddOrder" for path, _ in wire.calls) == 1
+    execution.ledger.close()
+
+
+def test_native_trailing_lost_ack_recovery_then_partial_cancel(tmp_path):
+    wire, execution, adapter, order = trailing_setup(tmp_path)
+    wire.timeout = True
+    assert admit(wire, execution, adapter, order)["state"] == "ambiguous"
+    execution.ledger.close()
+    wire, execution, adapter, _ = trailing_setup(tmp_path, wire)
+    wire.now = T + timedelta(seconds=3)
+    assert execution.reconcile_all(as_of=wire.now)[0]["state"] == "new"
+    wire.add("T-ACTUAL", "4", "90", ".4")
+    assert execution.cancel(order.intent_id, as_of=wire.now)["state"] == "cancelled"
+    assert execution.ledger.quantity(order.account_id, BTC.instrument_id) == 4
+    assert execution.ledger.order(order.account_id, order.intent_id)["reserved"] == 0
+    assert execution.ledger.reconcile(order.account_id)["reconciled"]
+    assert sum(path == "AddOrder" for path, _ in wire.calls) == 1
     execution.ledger.close()
 
 

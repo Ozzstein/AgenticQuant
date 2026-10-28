@@ -201,7 +201,7 @@ class VenueRules(VersionedContract):
                 raise LedgerError("venue tick increment or price range violated")
         if intent.trail_price is not None and intent.trail_price % self.price_tick:
             raise LedgerError("venue trailing offset tick increment violated")
-        market = intent.order_type == "market"
+        market = intent.order_type in ("market", "trailing_stop")
         if market and (
             (self.market_quantity_step is not None and intent.quantity % self.market_quantity_step)
             or (
