@@ -433,3 +433,17 @@ pinned environment passed in 2.03s. No archive result was relabeled; no Docker o
 provider execution is implied. Before the full audit, canonical trailing-stop
 integration passed 248 stop/venue/remote/LEAN/ledger/sleeve/income/artifact tests in
 33.57s. This is still not a source-complete or deployed release.
+
+### Qlib daily-grid integration
+
+Data checkpoint `86fb043` integrated as root `3a501c6`. Root command
+`python -m pytest tests/test_qlib_daily_contract.py tests/test_local_quant_flow.py
+tests/test_native_discovery_exposure.py -q --disable-socket --allow-unix-socket`
+passed all 50 tests in 13.78s, including actual Qlib Alpha158/Ridge. Intraday or
+duplicate rows cannot overwrite a daily instrument/session, and unresolved
+internal sessions cannot silently become NaN samples. Full XNYS boundaries and
+strict source clocks are checked before writing. No membership outside supplied
+endpoints is inferred. Existing valid layout/schema remains unchanged; malformed
+published source grids fail without rewriting their files. Native admission
+continues its separate full snapshot-to-binary reconstruction. File hashes alone
+are not presented as that numerical proof.
