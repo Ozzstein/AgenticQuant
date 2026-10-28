@@ -743,3 +743,16 @@ advice verification, but registry current-authority binding is still design work
 Historical completed receipts remain immutable; cancellation, capture and factual
 inspection remain possible. No settlement enablement or release acceptance is
 claimed by this checkpoint.
+
+The decision-budget repair does not close the separate generative-call budget.
+A subsequent owned audit reproduced valid token counters being discarded by
+`AgentCallBudget.finish` when a model identity or the other counter is missing;
+the gateway also checks model identity before accounting. Another run on the
+same admission day can therefore call again despite the known token lower bound.
+The bounded repair is assigned to the existing budget/receipt/gateway authority:
+retain valid counters and unknown pricing separately, enforce original-day/run
+fences, preserve legacy receipts, and expose a verified read-only summary. Root
+generative monitoring and native completion will be integrated against that
+contract; current nonnull-counter/charged-cost aggregation is not sufficient for
+wrong-model pricing. No generative budget closure or actual spend claim is made
+until that checkpoint and its consumer tests pass.
