@@ -10,6 +10,7 @@ import asyncio
 import json
 import multiprocessing
 import os
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal
@@ -77,6 +78,16 @@ class FetchTask(VersionedContract):
             from src.operations.operating_fetch import OPERATIONS
             if self.operation not in OPERATIONS or (set(arguments)|{r.argument for r in self.source_arguments})-set(OPERATIONS[self.operation]):
                 raise ValueError('operating operation/arguments are not permitted')
+            if self.operation=='kraken_fx_reference' and (
+                self.instrument is None or self.source_arguments
+                or self.instrument.asset_class!='crypto'
+                or self.instrument.symbol!='USDT/USD'
+                or self.instrument.quote_currency!='USD'
+                or self.instrument.venue!='kraken'
+                or not isinstance(arguments.get('market_id'),str)
+                or re.fullmatch(r'[A-Z0-9]+',arguments['market_id']) is None
+            ):
+                raise ValueError('Kraken FX needs exact USDT/USD identity and explicit native market ID')
             if self.operation=='binance_notional_reference' and (
                 self.instrument is None or self.source_arguments
                 or arguments.get('network','mainnet') not in ('mainnet','testnet')

@@ -495,3 +495,46 @@ two derivative fixture failures used an invalid zero-width seed window; correcte
 to a real positive interval, with no runtime gate relaxation. Log:
 `/tmp/quantagentlab-root-rolling-integration.log`. This closes rolling fetch-plan
 materialization, not full source-complete unattended build/retrain/operation.
+
+### Expiry, prompt authority and native indicative FX
+
+`d65e637` integrated as `489c9fe`: 267 root expiry/native/LEAN/reference/ledger/
+sleeve/replay/validation tests passed in 40.49s. `expire_orders` returns current
+outbox states, not a list of successful cancellations. Only an undispatched
+prepared intent can expire locally; actual global receipts are reconciled before
+native cancellation, with uncertain/incomplete reservations retained. Eligibility
+is `[eligible_at, expires_at)`. Post-deadline real fills remain evidence requiring
+explicit reconciliation, never retimed into compliant fills.
+
+`7639ba6` integrated as `e2d5dd2`: 262 root prompt-projection, desk, history,
+memory, experiment, policy and registered historical-advice/sleeve/cost tests
+passed in 90.62s. Shadow citation semantics no longer reach model-visible debate
+extras. Eligible semantic entries retain exact observation/request/source-span/
+model/question/policy/publication identities and are reverified at prompt time.
+Legacy unisolated prompts remain audit records, not newly certified memory.
+Delivered-document coverage is the next separate owned checkpoint.
+
+FX `56a61d0` integrated as `4f1745b`. Root closed refresh adds only
+`provider='operating', operation='kraken_fx_reference'`, exact crypto
+`USDT/USD` instrument with quote `USD` and venue `kraken`, and explicit native
+`market_id`. There is no default market ID, source lookup, user endpoint, asset
+version, trade count or caller price. Actual fixed-origin AssetPairs/Assets/Trades
+requests share existing refresh request/deadline caps. The result archives all
+three raw authorities and one derived FX record with original observed time and
+measured availability. `FetchSourceRef(argument='fx_evidence_id', task_id=...,
+kind='fx', selection='one')` pins the exact earlier task's source. The original
+cutoff cannot use a later capture. Source and consumer verification use the same
+native parser, at the actual valuation/open cutoff and its explicit age bound.
+
+Root source/consumer/factory/refresh integration passed 116 cases; initial new
+dispatch tests had one test-only exception mismatch (direct fetch raises the
+documented ProviderError, while the child-worker wrapper uses OperationError).
+After correcting that expectation, all 13 closed-dispatch tests passed in 0.44s,
+including actual source normalization and certification, exact dependency/restart,
+wrong identity/arguments and shared request exhaustion with no derived FX proof.
+Logs: `/tmp/quantagentlab-root-fx-integration.log` and
+`/tmp/quantagentlab-root-fx-dispatch.log`. HTTP responses are synthetic; no vendor
+calls or market-availability claim. The 300-second operating ceiling never
+relaxes the 30-second fee bound. Current-FX revaluation of historical quote
+turnover keeps its existing explicit convention; neither historical daily USD
+conversion nor executable FX/multicurrency settlement is established.

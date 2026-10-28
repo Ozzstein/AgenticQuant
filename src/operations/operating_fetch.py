@@ -113,6 +113,7 @@ OPERATIONS = {
         "provider_account_id",
     ),
     "kraken_bars": ("market_id", "start", "end"),
+    "kraken_fx_reference": ("market_id",),
     "kraken_reference": ("market_id", "bar_ids", "fx_evidence_id"),
     "kraken_trades": ("market_id", "start", "end", "calendar_id", "max_pages", "fx_evidence_id"),
     "kraken_calendar": ("start", "end", "reference_id"),
