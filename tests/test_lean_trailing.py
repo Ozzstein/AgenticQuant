@@ -127,6 +127,11 @@ def test_actual_port_overload_and_native_ticket_fields(side, field, value, expec
         TrailingAmount=D(expected),
         TrailingAsPercentage=percentage,
         BrokerId=["native-id"],
+        TimeInForce=NS(
+            GetType=lambda: NS(
+                FullName="QuantConnect.Orders.TimeInForces.GoodTilCanceledTimeInForce"
+            )
+        ),
     )
     native_ticket = NS(
         OrderId=51,

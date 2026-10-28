@@ -42,8 +42,8 @@ class LeanAlgorithmPort:
             from QuantConnect.Configuration import Config
             from QuantConnect.Orders import OrderProperties
             from QuantConnect.Orders.TimeInForces import (
+                DayTimeInForce,
                 GoodTilCanceledTimeInForce,
-                GoodTilDateTimeInForce,
             )
             from System import DateTime, Decimal
             from System.Globalization import CultureInfo
@@ -65,10 +65,10 @@ class LeanAlgorithmPort:
             DateTime,
             CultureInfo.InvariantCulture,
         )
-        self._properties, self._gtc, self._gtd = (
+        self._properties, self._gtc, self._day = (
             OrderProperties,
             GoodTilCanceledTimeInForce,
-            GoodTilDateTimeInForce,
+            DayTimeInForce,
         )
         self._extensions = Extensions
         self.runtime_id = str(uuid.uuid4())
@@ -255,8 +255,49 @@ class LeanAlgorithmPort:
             "open_orders": opened,
         }
 
+    def _day_expiry(self, key, submitted_utc):
+        """Match actual DayTimeInForce using the subscribed security calendar."""
+        security = self.algorithm.Securities[self.symbols[key]]
+        hours = security.Exchange.Hours
+        local = self._extensions.ConvertFromUtc(submitted_utc, hours.TimeZone)
+        if str(security.Symbol.SecurityType) == "Crypto":
+            # LEAN's crypto DAY implementation is a calendar-day boundary.
+            # Only its documented UTC calendar is supported here.
+            if str(hours.TimeZone.Id) != "UTC":
+                raise LedgerError("LEAN crypto DAY requires the actual UTC calendar")
+            close = local.Date.AddDays(1)
+        elif str(security.Symbol.SecurityType) == "Equity":
+            close = hours.GetLastDailyMarketClose(local, False)
+        else:
+            raise LedgerError("LEAN DAY security calendar is unsupported")
+        return utc_datetime(self._extensions.ConvertToUtc(close, hours.TimeZone))
+
+    def _order_properties(self, intent):
+        properties = self._properties()
+        if intent.tif == "GTC" and intent.expires_at is None:
+            properties.TimeInForce = self._gtc()
+        elif intent.tif == "DAY":
+            if self.deployment.brokerage not in ("PaperBrokerage", "AlpacaBrokerage") or (
+                self.deployment.brokerage == "AlpacaBrokerage"
+                and intent.instrument.asset_class == "crypto"
+            ):
+                raise LedgerError("reviewed LEAN brokerage does not support this DAY order")
+            now = self.now()
+            submitted = self._datetime.Parse(now.isoformat(), self._culture).ToUniversalTime()
+            if (
+                intent.expires_at is None
+                or now >= intent.expires_at
+                or self._day_expiry(intent.instrument.instrument_id, submitted) != intent.expires_at
+            ):
+                raise LedgerError("LEAN DAY expiry differs from the actual security calendar")
+            properties.TimeInForce = self._day()
+        else:
+            raise LedgerError("LEAN exact time-in-force/expiry mapping is unsupported")
+        return properties
+
     def preflight(self, intent):
         require_trailing_support(self.deployment, intent)
+        self._order_properties(intent)
         security = self.algorithm.Securities[self.symbols[intent.instrument.instrument_id]]
         if not security.IsTradable or not security.HasData or self.algorithm.IsWarmingUp:
             raise LedgerError("LEAN security is not currently ready/tradable")
@@ -278,14 +319,7 @@ class LeanAlgorithmPort:
 
     def submit(self, intent, client_id):
         require_trailing_support(self.deployment, intent)
-        properties = self._properties()
-        properties.TimeInForce = self._gtc()
-        if intent.tif == "DAY":
-            at = intent.expires_at
-            # Actual admitted calendar boundary, not LEAN's guessed local day.
-            properties.TimeInForce = self._gtd(
-                self._datetime.Parse(at.isoformat(), self._culture).ToUniversalTime()
-            )
+        properties = self._order_properties(intent)
         quantity = self._native_decimal(
             intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
         )
@@ -386,6 +420,23 @@ class LeanAlgorithmPort:
         order = self.algorithm.Transactions.GetOrderById(int(ticket.OrderId))
         if order is None:
             raise LedgerError("LEAN ticket has no actual order yet")
+        if (
+            getattr(order, "Contingency", None) is not None
+            or getattr(order, "GroupOrderManager", None) is not None
+        ):
+            raise LedgerError("LEAN contingent/combo ticket requires explicit group ownership")
+        kind = str(order.TimeInForce.GetType().FullName)
+        if kind == "QuantConnect.Orders.TimeInForces.DayTimeInForce":
+            expiry = {
+                "time_in_force": "DAY",
+                "expires_at": self._day_expiry(
+                    self._instrument(order.Symbol), order.Time
+                ).isoformat(),
+            }
+        elif kind == "QuantConnect.Orders.TimeInForces.GoodTilCanceledTimeInForce":
+            expiry = {}  # Preserve existing ordinary ticket receipt shape.
+        else:
+            raise LedgerError("actual LEAN ticket has unsupported time-in-force")
         return {
             "runtime_id": self.runtime_id,
             "observed_at": self.now().isoformat(),
@@ -396,6 +447,7 @@ class LeanAlgorithmPort:
             "filled_quantity": str(self._number(ticket.QuantityFilled)),
             "status": str(ticket.Status),
             "order_type": str(order.Type),
+            **expiry,
             "limit_price": str(self._number(order.LimitPrice))
             if str(order.Type) == "Limit"
             else None,

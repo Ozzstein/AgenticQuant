@@ -121,6 +121,8 @@ class RuntimeFixture:
                 trailing_as_percentage=percentage,
                 stop_price=str(self.price + sign * offset),
             )
+        if order.tif == "DAY":
+            self.ticket.update(time_in_force="DAY", expires_at=order.expires_at.isoformat())
         if self.lose_ack:
             raise RuntimeError("fixture runtime accepted, acknowledgement lost")
         return copy.deepcopy(self.ticket)

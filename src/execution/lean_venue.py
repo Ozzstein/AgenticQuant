@@ -800,6 +800,15 @@ class LeanVenue:
 
     @staticmethod
     def _validate_ticket_intent(intent, payload):
+        if intent.tif == "DAY":
+            if (
+                payload.get("time_in_force") != "DAY"
+                or not payload.get("expires_at")
+                or _utc(datetime.fromisoformat(payload["expires_at"])) != intent.expires_at
+            ):
+                raise LedgerError("LEAN ticket DAY expiry differs from admitted calendar")
+        elif payload.get("time_in_force") is not None or payload.get("expires_at") is not None:
+            raise LedgerError("LEAN GTC ticket unexpectedly has an expiry")
         signed = intent.quantity if intent.side == "buy" else intent.quantity.copy_negate()
         if (
             payload["instrument_id"] != intent.instrument.instrument_id
