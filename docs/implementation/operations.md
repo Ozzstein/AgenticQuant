@@ -127,6 +127,45 @@ use synthetic wire fixtures; no vendor calls or authenticated acceptance occurre
 Current acquisition checklist and candidate disposition:
 [income source acceptance](income-source-acceptance.md).
 
+### IBKR credential readiness (1Password CLI)
+
+The operator selected the non-MCP Service Account route. Reference-only
+`config/ibkr-flex.op.env` maps the exact supplied `Agents` vault items:
+`IBKR Flex Queries/Query ID` and `IBKR Flex Web Service/Flex token`.
+No actual field or Service Account value is stored in the repository.
+
+From an operator-controlled interactive WSL terminal:
+
+```bash
+cd /home/ozzstein/AgenticQuant
+.venv/bin/python scripts/check_ibkr_flex_credentials.py
+```
+
+Enter the **1Password Service Account token**, not the IBKR token, at the hidden
+prompt. The checker refuses a noninteractive/echo-fallback prompt, uses `op run`
+to resolve only the two references, and strips the Service Account credential
+before the child checks a numeric Query ID and nonempty resolved Flex token.
+Captured CLI output/errors are never relayed. It does not save the supplied
+Service Account credential. It makes no IBKR request and cannot certify token
+validity, account identity, report scope or income completeness.
+
+The local user installation is 1Password CLI 2.41.1 at
+`/home/ozzstein/.local/bin/op`; no PATH change or administrator installation was
+needed. Original `op.sig` verified using an isolated GPG keyring against the
+official key fingerprint `3FEF9748469ADBE15DA7CA80AC2D62742012EA22` before
+installation. Binary SHA256:
+`301bd09f60ca5696a25bd2739ee6d86e924d51268041bb511d503c7f4e60b07b`.
+Sources: [CLI verification](https://www.1password.dev/cli/verify),
+[runtime secret injection](https://www.1password.dev/cli/secrets-environment-variables).
+No authenticated 1Password or IBKR request has yet occurred. The reported IBKR
+expiry is 2026-12-25; actual IBKR acceptance remains a separate test.
+Verification: 10 offline credential-boundary tests passed in 0.13s with sockets
+disabled, including suppressed failure/timeout output, exact references,
+unresolved-field rejection, Service Account isolation and no echo fallback.
+Ruff and diff checks passed. These tests use synthetic values only.
+
+### Native income captures
+
 Operating refresh permits two additional closed GET operations:
 `alpaca_cash_dividend_sources` and `alpaca_account_dividend_sources`. Both require
 an explicit instrument and `started_at`/`ended_at`; the account operation also
