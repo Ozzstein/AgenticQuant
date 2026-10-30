@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import socket
+import ssl
 import stat
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -23,6 +27,49 @@ PENDING = {"1004", "1005", "1006", "1007", "1008", "1009", "1019", "1021"}
 
 class FlexCaptureError(ValueError):
     """Only code-owned, public status labels may leave this module."""
+
+
+def transport_reason(exc):
+    """Classify exception types/codes, never authenticated URLs or messages."""
+    cause, seen = exc, set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            return "transport_tls_certificate_verification_failed"
+        if isinstance(cause, socket.gaierror):
+            return "transport_dns_resolution_failed"
+        if (
+            isinstance(cause, ConnectionResetError)
+            or getattr(cause, "errno", None) == errno.ECONNRESET
+        ):
+            return "transport_connection_reset"
+        cause = cause.__cause__ or cause.__context__
+    for kind, label in (
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.ProxyError, "proxy_error"),
+        (httpx.ConnectError, "connect_error"),
+        (httpx.RemoteProtocolError, "remote_protocol_error"),
+    ):
+        if isinstance(exc, kind):
+            return "transport_" + label
+    return "transport_failed_no_retry"
+
+
+def network_check(client):
+    """Fixed public probes with no query parameters, tokens or report requests."""
+    result = {}
+    for label, url in (
+        ("CONTROL_HTTPS", "https://www.1password.dev/"),
+        ("IBKR_WEBSITE", "https://www.interactivebrokers.com/"),
+        ("IBKR_FLEX_HOST", "https://ndcdyn.interactivebrokers.com/"),
+    ):
+        try:
+            with client.stream("GET", url, timeout=8) as response:
+                result[label] = "HTTP_" + str(response.status_code)
+        except httpx.HTTPError as exc:
+            result[label] = transport_reason(exc)
+    return result
 
 
 def private_directory(base: Path) -> Path:
@@ -91,9 +138,9 @@ def fetch_report(client, token, query_id, directory, *, sleep=time.sleep, monoto
                         raise FlexCaptureError("response_bytes_exceeded")
                     raw.extend(chunk)
                 status = response.status_code
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             # Exceptions contain authenticated request URLs. Never relay them.
-            raise FlexCaptureError("transport_failed_no_retry") from None
+            raise FlexCaptureError(transport_reason(exc)) from None
         raw = bytes(raw)
         if token.encode() in raw:
             raise FlexCaptureError("credential_echo_refused")
@@ -161,6 +208,11 @@ def main():
     # Authenticated Flex URLs have the token in their query. Suppress HTTP logs.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).disabled = True
+    if sys.argv[1:] == ["--network-check"]:
+        with httpx.Client(trust_env=False, follow_redirects=False) as client:
+            for label, value in network_check(client).items():
+                print(label + ": " + value)
+        return 0
     try:
         if "OP_SERVICE_ACCOUNT_TOKEN" in os.environ:
             raise FlexCaptureError("service_account_not_isolated")

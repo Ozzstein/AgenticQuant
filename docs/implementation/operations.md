@@ -227,6 +227,30 @@ Verification: 29 offline credential/capture tests passed in 0.29s with sockets
 disabled, including pending/error/overflow/unsafe XML/private permissions and
 closed parent-output checks; Ruff and diff checks passed.
 
+The operator's first authenticated fetch reported a transport failure, not an
+IBKR HTTP/XML rejection. Token-free diagnosis reproduced DNS success, successful
+HTTPS to `www.1password.dev`, and TCP/TLS-path connection resets for the official
+Flex host and IBKR website. Native Windows `curl.exe` invoked from WSL also
+reported a reset to the public Flex host before HTTP (status 000). No root-held
+credential was used in these probes. This does not establish which network,
+endpoint-security, proxy or remote filtering component caused the reset; browser
+comparison remains necessary. TLS verification was never disabled and alternate
+hosts are not used to transmit credentials.
+
+Transport errors now expose only type/code-derived fixed labels (DNS, reset,
+certificate verification, connect/read timeout, proxy and protocol). The optional
+token-free diagnostic is:
+
+```bash
+.venv/bin/python scripts/fetch_ibkr_flex_report.py --network-check
+```
+
+It probes only three fixed public roots, closes responses without printing their
+contents, and has no query/token/report-generation parameters. The combined
+credential/capture/diagnostic suite passed 33 offline tests in 0.74s with sockets
+disabled; Ruff and diff checks passed. Successful real IBKR download is still
+unverified; do not regenerate keys based only on a pre-HTTP transport failure.
+
 ### Native income captures
 
 Operating refresh permits two additional closed GET operations:

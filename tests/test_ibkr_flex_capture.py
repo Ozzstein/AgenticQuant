@@ -1,6 +1,8 @@
 """Real HTTPX boundary over synthetic XML; no credentials or external calls."""
 
 import json
+import socket
+import ssl
 import stat
 
 import httpx
@@ -11,8 +13,10 @@ from scripts.fetch_ibkr_flex_report import (
     ORIGIN,
     FlexCaptureError,
     fetch_report,
+    network_check,
     parse_xml,
     private_directory,
+    transport_reason,
 )
 
 TOKEN = "synthetic-private-flex-token"
@@ -121,3 +125,40 @@ def test_private_output_refuses_symlinks_and_shared_permissions(tmp_path):
     link.symlink_to(public)
     with pytest.raises(FlexCaptureError, match="invalid"):
         private_directory(link)
+
+
+@pytest.mark.parametrize(
+    "cause,label",
+    [
+        (ConnectionResetError(104, "PRIVATE-TOKEN"), "connection_reset"),
+        (ssl.SSLCertVerificationError(1, "PRIVATE-TOKEN"), "tls_certificate_verification_failed"),
+        (socket.gaierror(-2, "PRIVATE-TOKEN"), "dns_resolution_failed"),
+    ],
+)
+def test_transport_diagnostics_never_echo_exception_message(cause, label):
+    exc = httpx.ConnectError("https://broker.invalid/?t=PRIVATE-TOKEN")
+    exc.__cause__ = cause
+    assert transport_reason(exc) == "transport_" + label
+
+
+def test_public_network_probe_uses_no_credentials_or_report_routes(monkeypatch):
+    monkeypatch.setenv("IBKR_FLEX_TOKEN", "PRIVATE-TOKEN")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.path == "/" and not request.url.query
+        assert "authorization" not in request.headers
+        assert b"PRIVATE-TOKEN" not in request.content
+        if request.url.host == "www.1password.dev":
+            return httpx.Response(200)
+        raise httpx.ConnectError("PRIVATE-TOKEN") from ConnectionResetError(104, "PRIVATE-TOKEN")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = network_check(client)
+    assert len(requests) == 3
+    assert result == {
+        "CONTROL_HTTPS": "HTTP_200",
+        "IBKR_WEBSITE": "transport_connection_reset",
+        "IBKR_FLEX_HOST": "transport_connection_reset",
+    }
