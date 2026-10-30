@@ -111,7 +111,77 @@ def _error(root):
     return None
 
 
-def fetch_report(client, token, query_id, directory, *, sleep=time.sleep, monotonic=time.monotonic):
+def latest_generation(base: Path, query_id: str):
+    """Read the latest original acknowledgement, without exposing its reference."""
+    try:
+        for path in (base, *base.parents):
+            if path.is_symlink():
+                raise ValueError
+        info = base.stat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError
+        candidates = sorted(
+            path
+            for path in base.iterdir()
+            if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}", path.name)
+            and (path / "01-SendRequest.xml").exists()
+        )
+        if not candidates:
+            raise ValueError
+        source = candidates[-1]
+        if (source / "capture.json").exists():
+            raise FlexCaptureError("resume_latest_already_downloaded")
+        paths = [source, source / "01-SendRequest.xml", source / "01-SendRequest.xml.receipt.json"]
+        for path in paths:
+            info = path.lstat()
+            if (
+                path.is_symlink()
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o077
+                or (path != source and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))
+                or (path != source and info.st_size > MAX_BYTES)
+            ):
+                raise ValueError
+        raw = paths[1].read_bytes()
+        receipt = json.loads(paths[2].read_bytes())
+        if (
+            receipt["operation"] != "SendRequest"
+            or receipt["http_status"] != 200
+            or receipt["raw_file"] != paths[1].name
+            or receipt["request_version"] != "3"
+            or receipt["raw_sha256"] != hashlib.sha256(raw).hexdigest()
+            or receipt["query_id_sha256"] != hashlib.sha256(query_id.encode()).hexdigest()
+        ):
+            raise ValueError
+        root = parse_xml(raw)
+        reference = root.findtext("ReferenceCode", "")
+        if (
+            root.tag != "FlexStatementResponse"
+            or root.findtext("Status") != "Success"
+            or _error(root)
+            or not re.fullmatch(r"[0-9]+", reference)
+        ):
+            raise ValueError
+        return reference, {
+            "directory": str(source),
+            "acknowledgement_sha256": receipt["raw_sha256"],
+        }
+    except FlexCaptureError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError):
+        raise FlexCaptureError("resume_source_unavailable_or_invalid") from None
+
+
+def fetch_report(
+    client,
+    token,
+    query_id,
+    directory,
+    *,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+    resume_generation=None,
+):
     """One generation request, at most eight same-reference retrieval attempts."""
     if not re.fullmatch(r"[0-9]+", query_id) or not token.strip() or token.startswith("op://"):
         raise FlexCaptureError("credentials_invalid")
@@ -164,17 +234,21 @@ def fetch_report(client, token, query_id, directory, *, sleep=time.sleep, monoto
             raise FlexCaptureError("http_status_" + str(status))
         return parse_xml(raw), name
 
-    root, _ = request("SendRequest", query_id)
-    code = _error(root)
-    if code:
-        raise FlexCaptureError("ibkr_error_" + code)
-    reference = root.findtext("ReferenceCode", "")
-    if (
-        root.tag != "FlexStatementResponse"
-        or root.findtext("Status") != "Success"
-        or not re.fullmatch(r"[0-9]+", reference)
-    ):
-        raise FlexCaptureError("generation_response_invalid")
+    if resume_generation is not None:
+        reference, source = latest_generation(resume_generation, query_id)
+        write_private(directory / "resume.json", json.dumps(source, sort_keys=True).encode())
+    else:
+        root, _ = request("SendRequest", query_id)
+        code = _error(root)
+        if code:
+            raise FlexCaptureError("ibkr_error_" + code)
+        reference = root.findtext("ReferenceCode", "")
+        if (
+            root.tag != "FlexStatementResponse"
+            or root.findtext("Status") != "Success"
+            or not re.fullmatch(r"[0-9]+", reference)
+        ):
+            raise FlexCaptureError("generation_response_invalid")
     # Use the documented fixed endpoint, never a server-supplied redirect/URL.
     for _ in range(8):
         if monotonic() + 7 >= deadline:
@@ -213,6 +287,9 @@ def main():
             for label, value in network_check(client).items():
                 print(label + ": " + value)
         return 0
+    if sys.argv[1:] not in ([], ["--resume-latest"]):
+        print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
+        return 1
     try:
         if "OP_SERVICE_ACCOUNT_TOKEN" in os.environ:
             raise FlexCaptureError("service_account_not_isolated")
@@ -227,6 +304,7 @@ def main():
                 os.environ.get("IBKR_FLEX_TOKEN", ""),
                 os.environ.get("IBKR_FLEX_QUERY_ID", ""),
                 directory,
+                resume_generation=directory.parent if sys.argv[1:] == ["--resume-latest"] else None,
             )
     except FlexCaptureError as exc:
         print(json.dumps({"status": "failed", "reason": str(exc)}))

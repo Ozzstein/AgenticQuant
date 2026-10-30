@@ -109,7 +109,7 @@ def _diagnose(executable, environment, runner):
     )
 
 
-def _fetch(executable, environment, runner):
+def _fetch(executable, environment, runner, *, resume_latest=False):
     result = _invoke(
         runner,
         [
@@ -123,6 +123,7 @@ def _fetch(executable, environment, runner):
             "OP_SERVICE_ACCOUNT_TOKEN",
             sys.executable,
             str(ROOT / "scripts/fetch_ibkr_flex_report.py"),
+            *(["--resume-latest"] if resume_latest else []),
         ],
         environment,
         timeout=180,
@@ -158,6 +159,8 @@ def _fetch(executable, environment, runner):
                 "report_not_ready_bounded_polling_stopped",
                 "service_account_not_isolated",
                 "capture_unavailable",
+                "resume_latest_already_downloaded",
+                "resume_source_unavailable_or_invalid",
             }
             import re
 
@@ -190,7 +193,7 @@ def _fetch(executable, environment, runner):
 
 
 def check_credentials(
-    service_token: str, *, op_path=None, runner=subprocess.run, fetch=False
+    service_token: str, *, op_path=None, runner=subprocess.run, fetch=False, resume_latest=False
 ) -> int:
     """Use exact configured references; never relay CLI stdout/stderr to the user."""
     executable = op_path or shutil.which("op") or str(Path.home() / ".local/bin/op")
@@ -243,8 +246,8 @@ def check_credentials(
             )
             _diagnose(executable, environment, runner)
             return 1
-        if fetch:
-            return _fetch(executable, environment, runner)
+        if fetch or resume_latest:
+            return _fetch(executable, environment, runner, resume_latest=resume_latest)
     finally:
         environment.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     print("IBKR Flex token and numeric Query ID loaded successfully; values withheld.")
@@ -258,6 +261,11 @@ def main() -> int:
         "--fetch",
         action="store_true",
         help="Download the configured XML report into a private capture folder.",
+    )
+    parser.add_argument(
+        "--resume-latest",
+        action="store_true",
+        help="Retrieve the latest retained generation reference without generating a new report.",
     )
     args = parser.parse_args()
     if not sys.stdin.isatty():
@@ -273,7 +281,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nCredential check cancelled.", file=sys.stderr)
         return 130
-    return check_credentials(credential, fetch=args.fetch)
+    return check_credentials(credential, fetch=args.fetch, resume_latest=args.resume_latest)
 
 
 if __name__ == "__main__":

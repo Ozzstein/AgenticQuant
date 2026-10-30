@@ -1055,3 +1055,31 @@ locator/ancestor gate changes, which remain separately under implementation.
 Data's source-pinned CatBoost comparator feasibility note `192920a` integrated
 as `9b8df4e` is documentation only. No comparator/parser, model-byte rewriting,
 consumer widening or exact-evaluator relaxation has been implemented.
+
+### IBKR pending report continuation — 2026-10-30
+
+Operator reported all three credential-free network checks HTTP 200 on a phone
+hotspot, followed by `report_not_ready_bounded_polling_stopped` on the private
+fetch. This means the worker retained a successful generation acknowledgement
+and exhausted eight same-reference retrieval checks; no report was admitted.
+
+The launcher now supports `--resume-latest`. It retrieves the most recent
+retained original generation reference for the configured query, without another
+SendRequest. The worker verifies the original private acknowledgement and receipt
+(hash, query identity, successful status, endpoint operation and version), rejects
+symlink/shared/hardlinked source files, and writes new GET receipts plus a
+source acknowledgement hash/path in a separate private capture directory. Original
+capture bytes remain unchanged. Missing/invalid source or an originally completed
+capture fails before network access. A repeated continuation still uses the same
+original generation, bounded by the existing deadline/eight polls, not a new
+report generation. Original references and credentials never enter argv/stdout.
+
+Command in the operator's terminal, while the working connection remains active:
+`.venv/bin/python scripts/check_ibkr_flex_credentials.py --resume-latest`.
+No actual credentials or original report contents were read during implementation.
+Validation: 42 tests passed in 0.57s, sockets disabled, across
+`tests/test_ibkr_flex_capture.py` and `tests/test_ibkr_flex_credentials.py`;
+Ruff check/format and diff check passed. Covers pending-to-resumed download,
+GET-only original reference, unchanged original files, invalid query/raw/permissions/
+symlink/completed source refusal, and launcher isolation/status filtering.
+Downloaded XML still requires independent income/payment/coverage assessment.

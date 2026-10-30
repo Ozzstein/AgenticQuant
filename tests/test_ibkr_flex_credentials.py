@@ -120,9 +120,10 @@ def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
         assert field + ": " + expected in output.err
 
 
+@pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("outcome", ["downloaded", "rejected", "unsafe"])
 def test_fetch_launcher_only_exposes_closed_status_and_private_path(
-    tmp_path, monkeypatch, capsys, outcome
+    tmp_path, monkeypatch, capsys, outcome, resume
 ):
     executable = tmp_path / "op"
     executable.touch()
@@ -140,6 +141,7 @@ def test_fetch_launcher_only_exposes_closed_status_and_private_path(
         if len(calls) == 1:
             return subprocess.CompletedProcess(command, 0, b"", b"")
         assert kwargs["timeout"] == 180
+        assert ("--resume-latest" in command) is resume
         if outcome == "downloaded":
             value = {
                 "status": "downloaded",
@@ -158,7 +160,11 @@ def test_fetch_launcher_only_exposes_closed_status_and_private_path(
         )
 
     code = check_credentials(
-        "synthetic-service-secret", op_path=str(executable), runner=run, fetch=True
+        "synthetic-service-secret",
+        op_path=str(executable),
+        runner=run,
+        fetch=True,
+        resume_latest=resume,
     )
     assert code == (0 if outcome == "downloaded" else 1)
     output = capsys.readouterr()

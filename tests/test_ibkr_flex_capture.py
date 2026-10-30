@@ -88,6 +88,66 @@ def test_pending_is_bounded_and_preserves_all_same_reference_receipts(tmp_path):
     assert not (directory / "capture.json").exists()
 
 
+def test_resume_reuses_original_reference_without_generation_or_overwrite(tmp_path):
+    directory, client, requests, delays = capture(tmp_path, [ACK, *([error("1019")] * 8)])
+    with client, pytest.raises(FlexCaptureError, match="bounded_polling_stopped"):
+        fetch_report(client, TOKEN, "12345", directory, sleep=delays.append)
+    original = {path.name: path.read_bytes() for path in directory.iterdir()}
+    resumed = private_directory(directory.parent)
+    requests.clear()
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.path.endswith("/GetStatement")
+        assert request.url.params["q"] == "98765"
+        return httpx.Response(200, content=REPORT)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = fetch_report(
+            client,
+            TOKEN,
+            "12345",
+            resumed,
+            sleep=lambda _: None,
+            resume_generation=directory.parent,
+        )
+    assert len(requests) == 1 and result["statements"] == 1
+    assert json.loads((resumed / "resume.json").read_text())["directory"] == str(directory)
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == original
+
+
+@pytest.mark.parametrize("change", ["query", "raw", "permissions", "symlink", "complete"])
+def test_resume_invalid_source_never_contacts_provider(tmp_path, change):
+    directory, client, _, delays = capture(tmp_path, [ACK, *([error("1019")] * 8)])
+    with client, pytest.raises(FlexCaptureError):
+        fetch_report(client, TOKEN, "12345", directory, sleep=delays.append)
+    ack = directory / "01-SendRequest.xml"
+    query = "67890" if change == "query" else "12345"
+    if change == "raw":
+        ack.write_bytes(ACK + b" ")
+    elif change == "permissions":
+        ack.chmod(0o644)
+    elif change == "symlink":
+        target = directory / "original.xml"
+        ack.rename(target)
+        ack.symlink_to(target)
+    elif change == "complete":
+        (directory / "capture.json").write_text("{}")
+    resumed = private_directory(directory.parent)
+    calls = []
+    with httpx.Client(transport=httpx.MockTransport(lambda r: calls.append(r))) as client:
+        with pytest.raises(FlexCaptureError):
+            fetch_report(
+                client,
+                TOKEN,
+                query,
+                resumed,
+                sleep=lambda _: None,
+                resume_generation=directory.parent,
+            )
+    assert calls == []
+
+
 def test_overflow_never_archives_truncated_success(tmp_path):
     directory, client, requests, delays = capture(tmp_path, [ACK, b"x" * (MAX_BYTES + 1)])
     with client, pytest.raises(FlexCaptureError, match="response_bytes_exceeded"):
