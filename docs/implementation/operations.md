@@ -251,6 +251,16 @@ credential/capture/diagnostic suite passed 33 offline tests in 0.74s with socket
 disabled; Ruff and diff checks passed. Successful real IBKR download is still
 unverified; do not regenerate keys based only on a pre-HTTP transport failure.
 
+The operator then reported an XML `FlexStatementResponse` from the token-free
+browser test, with invalid-request text as expected without `t`/`q`. That proves
+browser reachability only. Windows proxy inspection found no configured manual
+proxy/PAC. System and public DNS returned different public CDN addresses; a
+token-free curl request through a public-DNS address succeeded once with verified
+TLS but failed on repeat. This is insufficient to attribute the fault to DNS or
+ship an alternate route. Experimental DNS/curl routing code was removed; no
+system DNS, TLS verification, credential or endpoint changes were retained.
+Browser-specific networking/security differences remain under investigation.
+
 ### Native income captures
 
 Operating refresh permits two additional closed GET operations:
