@@ -24,12 +24,13 @@ def test_cli_boundary_hides_diagnostics_and_drops_service_token(
         assert "synthetic-service-secret" not in command
         assert kwargs["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == "synthetic-service-secret"
         assert not {"OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "IBKR_FLEX_TOKEN"} & kwargs["env"].keys()
-        assert command[command.index("--") + 1 :][:3] == [
-            "/usr/bin/env",
-            "-u",
-            "OP_SERVICE_ACCOUNT_TOKEN",
-        ]
-        assert kwargs["capture_output"] and kwargs["timeout"] == 90
+        if command[1] == "run":
+            assert command[command.index("--") + 1 :][:3] == [
+                "/usr/bin/env",
+                "-u",
+                "OP_SERVICE_ACCOUNT_TOKEN",
+            ]
+        assert kwargs["capture_output"] and kwargs["timeout"] == 30
         if failure == "timeout":
             raise subprocess.TimeoutExpired(command, 90, output="leaked-provider-secret")
         return subprocess.CompletedProcess(
@@ -84,3 +85,34 @@ def test_hidden_prompt_cannot_fall_back_to_echo(monkeypatch, capsys):
     monkeypatch.setattr(getpass, "getpass", unavailable)
     assert checker.main() == 1
     assert "cancelled" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failed_field", ["IBKR_FLEX_QUERY_ID", "IBKR_FLEX_TOKEN", None])
+def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
+    tmp_path, capsys, monkeypatch, failed_field
+):
+    executable = tmp_path / "op"
+    executable.touch()
+    monkeypatch.setenv("OTHER_SECRET", "op://unrelated/private/value")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert "OTHER_SECRET" not in kwargs["env"]
+        if "--env-file" in command:
+            code = 1
+        elif command[1:3] == ["user", "get"]:
+            code = 0
+        else:
+            code = 2 if command[-1] == failed_field else 0
+            assert kwargs["env"][command[-1]].startswith("op://Agents/")
+        return subprocess.CompletedProcess(command, code, b"PRIVATE-VALUE", b"PRIVATE-VALUE")
+
+    assert check_credentials("synthetic-service-secret", op_path=str(executable), runner=run) == 1
+    output = capsys.readouterr()
+    assert "PRIVATE-VALUE" not in output.out + output.err
+    assert "1PASSWORD_AUTHENTICATION_OK" in output.err
+    assert len(calls) == 4
+    for field in ("IBKR_FLEX_QUERY_ID", "IBKR_FLEX_TOKEN"):
+        expected = "READ_OR_VALIDATION_FAILED" if field == failed_field else "LOADED_AND_VALID"
+        assert field + ": " + expected in output.err

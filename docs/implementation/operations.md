@@ -164,6 +164,19 @@ disabled, including suppressed failure/timeout output, exact references,
 unresolved-field rejection, Service Account isolation and no echo fallback.
 Ruff and diff checks passed. These tests use synthetic values only.
 
+The operator subsequently reported the original generic credential check failed;
+this does not establish successful 1Password or IBKR authentication. The revised
+checker performs bounded diagnostics on failure: authenticated-user lookup and
+one isolated lookup per configured field. It emits fixed authentication/field
+status labels, never account details, raw CLI output or secret values. Each CLI
+call has a 30-second timeout (at most four calls); unrelated inherited secret
+references are excluded. Independently successful fields plus a failed combined
+check are reported as a configuration issue. Provider CLI exit code 2 cannot be
+assumed to mean field validation alone, so its label includes read failure too.
+Only `read_items` vault permission is required; no write permission is requested.
+The revised credential suite passed 13 offline tests in 0.14s; Ruff/diff checks
+passed. No real credential was supplied to root or used by these tests.
+
 ### Native income captures
 
 Operating refresh permits two additional closed GET operations:
