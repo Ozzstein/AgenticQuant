@@ -1,8 +1,10 @@
-"""Check 1Password injection without printing credentials or contacting IBKR."""
+"""Check private 1Password injection; optionally download an IBKR Flex report."""
 
 from __future__ import annotations
 
+import argparse
 import getpass
+import json
 import os
 import shutil
 import subprocess
@@ -38,9 +40,9 @@ sys.exit(0 if valid else 2)
 """
 
 
-def _invoke(runner, command, environment):
+def _invoke(runner, command, environment, *, timeout=30):
     try:
-        return runner(command, env=environment, capture_output=True, timeout=30, check=False)
+        return runner(command, env=environment, capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -107,7 +109,81 @@ def _diagnose(executable, environment, runner):
     )
 
 
-def check_credentials(service_token: str, *, op_path=None, runner=subprocess.run) -> int:
+def _fetch(executable, environment, runner):
+    result = _invoke(
+        runner,
+        [
+            executable,
+            "run",
+            "--env-file",
+            str(REFERENCES),
+            "--",
+            "/usr/bin/env",
+            "-u",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            sys.executable,
+            str(ROOT / "scripts/fetch_ibkr_flex_report.py"),
+        ],
+        environment,
+        timeout=180,
+    )
+    try:
+        if result is None:
+            raise ValueError
+        report = json.loads(result.stdout)
+        if report.get("status") == "failed" and result.returncode:
+            reason = report.get("reason", "")
+            allowed = {
+                "private_directory_invalid",
+                "private_directory_permissions",
+                "unsupported_xml",
+                "invalid_xml_report",
+                "invalid_provider_error",
+                "credentials_invalid",
+                "deadline_exceeded",
+                "response_bytes_exceeded",
+                "transport_failed_no_retry",
+                "credential_echo_refused",
+                "generation_response_invalid",
+                "xml_activity_report_required",
+                "statement_scope_missing",
+                "report_not_ready_bounded_polling_stopped",
+                "service_account_not_isolated",
+                "capture_unavailable",
+            }
+            import re
+
+            if reason not in allowed and not re.fullmatch(
+                r"(?:ibkr_error_[0-9]{4}|http_status_[0-9]{3})", reason
+            ):
+                raise ValueError
+            print("IBKR retrieval stopped: " + reason, file=sys.stderr)
+            return 1
+        if result.returncode or report.get("status") != "downloaded":
+            raise ValueError
+        location = Path(report["directory"])
+        base = Path.home() / ".local/share/quantagentlab/ibkr-flex"
+        if (
+            not location.is_absolute()
+            or not location.is_relative_to(base)
+            or ".." in location.parts
+        ):
+            raise ValueError
+        if type(report["statements"]) is not int or report["statements"] < 1:
+            raise ValueError
+        print("IBKR XML report downloaded. Private capture folder:")
+        print(location)
+        print("Statements:", report["statements"])
+        print("Income completeness and payment linkage have not yet been verified.")
+        return 0
+    except (ValueError, KeyError, TypeError):
+        print("Report worker unavailable; diagnostic content withheld.", file=sys.stderr)
+        return 1
+
+
+def check_credentials(
+    service_token: str, *, op_path=None, runner=subprocess.run, fetch=False
+) -> int:
     """Use exact configured references; never relay CLI stdout/stderr to the user."""
     executable = op_path or shutil.which("op") or str(Path.home() / ".local/bin/op")
     if not service_token.strip() or not Path(executable).is_file():
@@ -159,6 +235,8 @@ def check_credentials(service_token: str, *, op_path=None, runner=subprocess.run
             )
             _diagnose(executable, environment, runner)
             return 1
+        if fetch:
+            return _fetch(executable, environment, runner)
     finally:
         environment.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     print("IBKR Flex token and numeric Query ID loaded successfully; values withheld.")
@@ -167,6 +245,13 @@ def check_credentials(service_token: str, *, op_path=None, runner=subprocess.run
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Download the configured XML report into a private capture folder.",
+    )
+    args = parser.parse_args()
     if not sys.stdin.isatty():
         print("Run this command in your own interactive terminal.", file=sys.stderr)
         return 1
@@ -180,7 +265,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nCredential check cancelled.", file=sys.stderr)
         return 130
-    return check_credentials(credential)
+    return check_credentials(credential, fetch=args.fetch)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """No real secrets, 1Password requests or IBKR calls in these boundary tests."""
 
 import getpass
+import json
 import subprocess
 import sys
 import warnings
@@ -77,6 +78,7 @@ def test_hidden_prompt_cannot_fall_back_to_echo(monkeypatch, capsys):
     from scripts import check_ibkr_flex_credentials as checker
 
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys, "argv", ["check_ibkr_flex_credentials.py"])
 
     def unavailable(_):
         warnings.warn("cannot disable echo", getpass.GetPassWarning)
@@ -116,3 +118,50 @@ def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
     for field in ("IBKR_FLEX_QUERY_ID", "IBKR_FLEX_TOKEN"):
         expected = "READ_OR_VALIDATION_FAILED" if field == failed_field else "LOADED_AND_VALID"
         assert field + ": " + expected in output.err
+
+
+@pytest.mark.parametrize("outcome", ["downloaded", "rejected", "unsafe"])
+def test_fetch_launcher_only_exposes_closed_status_and_private_path(
+    tmp_path, monkeypatch, capsys, outcome
+):
+    executable = tmp_path / "op"
+    executable.touch()
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert "synthetic-service-secret" not in command
+        assert command[command.index("--") + 1 :][:3] == [
+            "/usr/bin/env",
+            "-u",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+        ]
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        assert kwargs["timeout"] == 180
+        if outcome == "downloaded":
+            value = {
+                "status": "downloaded",
+                "directory": str(tmp_path / ".local/share/quantagentlab/ibkr-flex/capture"),
+                "statements": 1,
+            }
+            code = 0
+        else:
+            value = {
+                "status": "failed",
+                "reason": "ibkr_error_1012" if outcome == "rejected" else "PRIVATE-SECRET",
+            }
+            code = 1
+        return subprocess.CompletedProcess(
+            command, code, json.dumps(value).encode(), b"PRIVATE-SECRET"
+        )
+
+    code = check_credentials(
+        "synthetic-service-secret", op_path=str(executable), runner=run, fetch=True
+    )
+    assert code == (0 if outcome == "downloaded" else 1)
+    output = capsys.readouterr()
+    assert "PRIVATE-SECRET" not in output.out + output.err
+    if outcome == "rejected":
+        assert "ibkr_error_1012" in output.err

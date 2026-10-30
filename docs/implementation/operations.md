@@ -184,6 +184,49 @@ lookups; subsequent copied secret references established the name/identifier
 differences above. Both combined and isolated checks now use those exact paths.
 Successful real field loading and IBKR retrieval remain unverified until rerun.
 
+The operator subsequently reported both fields loaded successfully. This
+establishes local credential readiness only, not IBKR authentication or scope.
+The explicit next diagnostic command is:
+
+```bash
+.venv/bin/python scripts/check_ibkr_flex_credentials.py --fetch
+```
+
+This uses the same hidden Service Account prompt and isolates that credential
+from the report worker. Only the worker receives the resolved IBKR token and
+Query ID. Its output is validated against closed status labels and a private
+output-directory prefix before presentation; raw provider errors are suppressed.
+It invokes only the documented HTTPS GET `SendRequest` and `GetStatement`
+endpoints at `ndcdyn.interactivebrokers.com`. It never follows a server-supplied
+URL or HTTP redirect and has no order/trading route. Generation is requested once;
+transport/auth/rate-limit failures are not retried. Only documented same-report
+readiness errors permit polling (seven-second waits, eight attempts, at most nine
+requests, 120-second worker deadline, 15-second request timeout, 8 MiB decoded
+body cap per response). Other processes using the same IBKR token share its rate
+limit; a provider rate-limit response stops this worker.
+
+Original complete responses and hash/clock receipts are written before XML
+interpretation into a fresh folder under
+`~/.local/share/quantagentlab/ibkr-flex/`, outside the repo. Folders are private
+(0700), files are exclusive-create 0600, and symlink/shared-directory inputs are
+refused. XML DTD/entity declarations, NUL and unsupported encodings fail closed.
+Overflow does not archive a truncated response. A final `capture.json` exists
+only for a nonempty XML activity-report envelope; it explicitly records
+`income_admission='not_verified'`. Date/account scope, event/component linkage,
+source completeness and original query configuration still require independent
+inspection. These files are diagnostic original captures, not registered positive
+income proof or canonical successful `ActionCoverage`.
+
+Sources: IBKR [generation](https://www.interactivebrokers.com/docs/web-api/api-reference/send-request),
+[retrieval](https://www.interactivebrokers.com/docs/web-api/api-reference/get-statement),
+and [error codes](https://www.interactivebrokers.com/docs/web-api/flex-web-service/error-codes).
+Offline tests exercise actual HTTPX transport boundaries over synthetic responses;
+no root-held credential, authenticated IBKR request, or actual report acceptance
+is claimed before the operator runs this command.
+Verification: 29 offline credential/capture tests passed in 0.29s with sockets
+disabled, including pending/error/overflow/unsafe XML/private permissions and
+closed parent-output checks; Ruff and diff checks passed.
+
 ### Native income captures
 
 Operating refresh permits two additional closed GET operations:
