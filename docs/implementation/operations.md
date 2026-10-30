@@ -131,7 +131,10 @@ Current acquisition checklist and candidate disposition:
 
 The operator selected the non-MCP Service Account route. Reference-only
 `config/ibkr-flex.op.env` maps the exact supplied `Agents` vault items:
-`IBKR Flex Queries/Query ID` and `IBKR Flex Web Service/Flex token`.
+`IBKR Felx Queries/credential` and `IBKR Flex Web Service /credential`.
+These are the actual Copy Secret Reference paths supplied by the operator:
+`Felx` and the space immediately before `/credential` in the second path are
+intentional exact item-name characters. Display labels are not field identifiers.
 No actual field or Service Account value is stored in the repository.
 
 From an operator-controlled interactive WSL terminal:
@@ -176,6 +179,10 @@ assumed to mean field validation alone, so its label includes read failure too.
 Only `read_items` vault permission is required; no write permission is requested.
 The revised credential suite passed 13 offline tests in 0.14s; Ruff/diff checks
 passed. No real credential was supplied to root or used by these tests.
+The operator reported successful Service Account authentication but failed field
+lookups; subsequent copied secret references established the name/identifier
+differences above. Both combined and isolated checks now use those exact paths.
+Successful real field loading and IBKR retrieval remain unverified until rerun.
 
 ### Native income captures
 

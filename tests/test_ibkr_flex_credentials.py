@@ -68,8 +68,8 @@ def test_child_requires_resolved_fields_without_account_token(query, token, serv
 def test_reference_file_contains_only_exact_user_supplied_pointers():
     rows = [row for row in REFERENCES.read_text().splitlines() if row and not row.startswith("#")]
     assert rows == [
-        'IBKR_FLEX_QUERY_ID="op://Agents/IBKR Flex Queries/Query ID"',
-        'IBKR_FLEX_TOKEN="op://Agents/IBKR Flex Web Service/Flex token"',
+        'IBKR_FLEX_QUERY_ID="op://Agents/IBKR Felx Queries/credential"',
+        'IBKR_FLEX_TOKEN="op://Agents/IBKR Flex Web Service /credential"',
     ]
 
 

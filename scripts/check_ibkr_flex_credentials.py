@@ -61,8 +61,8 @@ def _diagnose(executable, environment, runner):
         return
     print("1PASSWORD_AUTHENTICATION_OK", file=sys.stderr)
     fields = (
-        ("IBKR_FLEX_QUERY_ID", "op://Agents/IBKR Flex Queries/Query ID"),
-        ("IBKR_FLEX_TOKEN", "op://Agents/IBKR Flex Web Service/Flex token"),
+        ("IBKR_FLEX_QUERY_ID", "op://Agents/IBKR Felx Queries/credential"),
+        ("IBKR_FLEX_TOKEN", "op://Agents/IBKR Flex Web Service /credential"),
     )
     all_valid = True
     for name, reference in fields:
