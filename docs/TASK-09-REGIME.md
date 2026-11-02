@@ -66,7 +66,7 @@ New mode: `evolve-regime`. The R&D loop proposes, implements, and evaluates chan
 
 **What RD-Agent can change:**
 
-- **Input signals** — add new signals (put/call ratio, copper/gold ratio, crypto total market cap, high-yield spread) or remove signals that don't improve downstream Sharpe
+- **Input signals** — add new signals (e.g. put/call ratio, copper/gold ratio, crypto total market cap, high-yield spread) or remove signals that don't improve downstream Sharpe
 - **Number of states** — try 3, 4, 5, 6 states and evaluate which count produces the best pipeline performance
 - **Preprocessing** — different normalization windows (126 vs 252 days), different transformations (raw vs rate-of-change vs z-score vs percentile rank), different lookback periods for momentum signals
 - **Model variant** — try replacing Gaussian HMM with other HMM emission types (GMM-HMM for multimodal distributions) or entirely different approaches (random forest classifier, LSTM) if they produce better downstream results
