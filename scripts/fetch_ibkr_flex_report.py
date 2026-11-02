@@ -141,8 +141,8 @@ def latest_generation(base: Path, query_id: str):
                         or receipt.get("raw_file") != "01-SendRequest.xml"
                         or receipt.get("request_version") != "3"
                         or receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest()
-                        or receipt.get("query_id_sha256")
-                        != hashlib.sha256(query_id.encode()).hexdigest()
+                        or not isinstance(receipt.get("query_id_sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", receipt["query_id_sha256"])
                     ):
                         raise ValueError
                     started = _instant(receipt.get("started_at"))
@@ -166,6 +166,7 @@ def latest_generation(base: Path, query_id: str):
                             reference,
                             receipt["raw_sha256"],
                             "capture.json" in names,
+                            receipt["query_id_sha256"],
                         )
                     )
         if not candidates:
@@ -176,7 +177,11 @@ def latest_generation(base: Path, query_id: str):
         for older, newer in zip(candidates, candidates[1:]):
             if older[0] == newer[0] or older[1] >= newer[0]:
                 raise ValueError
-        _, _, name, reference, digest, completed = candidates[-1]
+        _, _, name, reference, digest, completed, selected_query_hash = candidates[-1]
+        # Retain valid history for previous query settings, but never fall back
+        # to an older matching query when the globally newest one differs.
+        if selected_query_hash != hashlib.sha256(query_id.encode()).hexdigest():
+            raise ValueError
         if completed:
             raise FlexCaptureError("resume_latest_already_downloaded")
         return reference, {

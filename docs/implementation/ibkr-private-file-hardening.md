@@ -36,7 +36,7 @@ helper rather than an unrelated editable installation.
 
 Resume scans the opened base descriptor and reads each original SendRequest ACK
 and receipt through an opened private generation directory. It verifies raw hash,
-query binding, operation/version/status, successful ACK and reference, duplicate-
+query-hash syntax, operation/version/status, successful ACK and reference, duplicate-
 free JSON, and aware started/available clocks. Only original SendRequest receipts
 participate; empty and resume-only generations do not become new generations.
 Selection derives solely from receipt intervals, never UUID, directory timestamp,
@@ -45,6 +45,17 @@ fail closed with the existing `resume_source_unavailable_or_invalid` label.
 The latest completed original still refuses resume rather than choosing an older
 pending request. Corrupt retained candidates fail closed rather than being skipped.
 There is no hidden recapture or SendRequest on resume.
+
+Coordinator post-fix review of integrated `447876d` found one compatibility
+regression: a valid earlier query's retained ACK was incorrectly required to
+match the current QueryID. The narrow follow-up validates all original candidates,
+including query-hash syntax and complete receipt intervals, then compares the
+globally latest candidate's query hash with the selected query. Valid older-query
+history is retained; a newer other-query request cannot cause fallback to an older
+matching request. Corrupt history and ambiguous/completed-latest refusal remain.
+Eleven tests in `tests/test_ibkr_resume_query_history.py` retain the independent
+reviewer's desired-behavior probes and malformed-digest cases. The reproduced
+regression was a denial of legitimate resume, not an authority bypass.
 
 ## Validation and limits
 
@@ -69,3 +80,13 @@ evidence, not authenticated broker time. Full-suite positive-income failures are
 outside this bounded work; source authentication, positive income admission and
 completed release remain blocked. No broker calls, secrets, real reports,
 provisioning, push, merge or PR are involved.
+
+Coordinator combined validation after the query-history correction: 186 tests
+passed in 14.73s with sockets disabled across resume-query history, private files,
+canonical CLI, capture, intake, credentials, operating income proof, action
+coverage and actual local Qlib flow. Root Ruff check and formatting checks pass
+for changed Python files (one format-only canonical CLI line was corrected).
+The actual existing private paper capture also passed canonical CLI inspection
+under the new descriptor helper; every capture file hash remained unchanged.
+No new broker request or economic mutation was performed. Independent final
+review is required before publishing this integrated checkpoint.

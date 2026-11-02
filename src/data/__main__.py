@@ -218,7 +218,9 @@ def inspect_ibkr_flex(args) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store", help="owned SQLite evidence database path (required except for inspection)")
+    parser.add_argument(
+        "--store", help="owned SQLite evidence database path (required except for inspection)"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("inspect-ibkr-flex", help="read-only local Flex capture inspection")
     p.add_argument("--capture", type=Path, required=True, help="explicit private capture directory")
