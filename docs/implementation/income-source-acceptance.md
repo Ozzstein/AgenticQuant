@@ -102,3 +102,27 @@ and operating verifier paths, retain unsupported cases as explicit gaps, and run
 the existing canonical economics/coverage/operating tests. Do not add a parallel
 income ledger, accept an invented vendor protocol or relax the current gate to
 make acceptance fixtures pass. No runtime behavior changed in this review.
+
+## IBKR paper acquisition milestone — 2026-11-02
+
+- [x] Operator retrieved one paper-account Flex XML statement through the
+  private 1Password-backed API launcher, with separate paper token/query items.
+- [x] Local inspection verified every saved raw-response SHA-256 against its
+  receipt and private file modes; one generation and one retrieval completed.
+- [x] Inspected section/field structure without publishing account identifiers,
+  balances, amounts, transaction descriptions, credentials or raw report bytes.
+- [ ] Obtain the live-account report after initial funding/report availability,
+  plus exact query configuration and documented delivery scope.
+- [ ] Obtain actual income examples and independently prove required identities,
+  deductions, revisions, clocks and coverage before positive parser admission.
+
+The paper report contains CashReport, StmtFunds, Trades, CorporateActions,
+CashTransactions, ChangeInDividendAccruals, OpenDividendAccruals and SecuritiesInfo
+sections. No OpenPositions section is present. Corporate-action and both dividend
+accrual sections have no rows; cash rows contain no dividend-classified entry or
+nonempty action ID. Thus actual payment/action association and gross/net/deduction
+semantics cannot be tested from this sample. Empty sections do not certify a
+complete event window. Paper acquisition is working; the live/source sufficiency
+blocker remains open. Original XML/receipts stay outside the repository; no
+positive source parser, income policy, execution gate or completion criterion was
+relaxed. This documentation-only update required no runtime change.
