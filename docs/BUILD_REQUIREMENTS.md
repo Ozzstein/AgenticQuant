@@ -1,6 +1,6 @@
 # Full-system implementation evidence register
 
-Authority: [complete build plan](FULL_SYSTEM_BUILD_PLAN.md). Updated 2026-10-28.
+Authority: [complete build plan](FULL_SYSTEM_BUILD_PLAN.md). Updated 2026-11-02.
 
 `offline_verified` means the stated deterministic/local boundary was exercised; it
 is not authenticated, statistical, prospective or deployment acceptance. `partial`
@@ -22,7 +22,7 @@ enabled. This register supersedes the bootstrap table.
 | B4 vendor/MCP data | partial | FMP/FRED/ALFRED/Yahoo/Finnhub/SEC/CoinGecko/Alpaca parsing and provenance | Credentialed schemas/entitlements, transcripts and document coverage |
 | B5 actual prints/ADV | offline_verified | Raw print IDs/ns, aliases, exact native references and VWAP turnover; certified indicative USDT/USD with fixed three-source proof and closed refresh | Authenticated feeds, historical FX and remaining native constraints; indicative FX is not cash conversion |
 | B6 source preparation | offline_verified | `data/operating_plan.py`; completed task receipts, dated seven-series macro inputs, immutable training prefix and contextual whitelist | Approved actual source recipes/historical breadth and rolling unattended preparation |
-| B7 income authority | partial | Native Alpaca raw capture/parser plus `operations/income.py`; unsupported positive/complete claims rejected | **No sufficient positive income/complete-stream parser admitted**; crypto scope also missing |
+| B7 income authority | partial | Native Alpaca gap parser plus `operations/income.py`; IBKR paper Flex retrieval, read-only intake/canonical inspection and reviewed descriptor-safe local capture/resume; unsupported positive/complete claims rejected | **No sufficient positive income/complete-stream parser admitted**; crypto scope also missing |
 | C1 evaluator roles | offline_verified | Actual US Qlib research and authoritative chronological ledger replay; explicit bundle CLI | Native RD/Qlib container and actual historical inputs |
 | C2 factors/models | partial | Bounded AST engine, four families/train-only transforms; temporal IC selection; closed canonical ensemble parent, child/selection artifacts and two-file proof; 236 root artifact/model/Qlib/WF tests | Reviewed native volatility comparison, dual-file consumer provenance and explicit strategy/operating ensemble admission; actual entitled histories |
 | C3 replay/accounting | offline_verified | Shared Decimal ledger, actual events/fills/targets/callback snapshots, costs and sleeves; durable/artifact suites | Broader actual actions/FX/delistings and venue parity |
