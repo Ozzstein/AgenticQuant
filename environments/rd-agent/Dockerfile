@@ -5,7 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git libgomp1 ca
 WORKDIR /opt/native
 COPY environments/rd-agent/pyproject.toml environments/rd-agent/uv.lock ./
 RUN uv sync --locked --no-dev
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
 COPY src /opt/quantagent/src
+COPY environments/rd-agent/offline_smoke.py /opt/quantagent/offline_smoke.py
 ENV PATH="/opt/native/.venv/bin:$PATH" PYTHONPATH="/opt/quantagent" PYTHONDONTWRITEBYTECODE=1 QUANTAGENT_NATIVE_SANDBOX=1
 RUN useradd --uid 10001 --create-home native
 USER 10001:10001
