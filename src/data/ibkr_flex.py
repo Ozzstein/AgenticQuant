@@ -492,3 +492,238 @@ def read_flex_capture(directory: str | Path, *, as_of: datetime) -> CapturedFlex
         query_hash,
         hashlib.sha256(binding).hexdigest(),
     )
+
+
+@dataclass(frozen=True)
+class FlexQueryScopeReview:
+    """Immutable local review; declarations are never provider attestations."""
+
+    capture: CapturedFlexReport = field(repr=False)
+    declaration_bytes: bytes = field(repr=False)
+    declaration_hash: str
+    configuration_hash: str
+    binding_hash: str
+    declared_at: datetime
+    configuration_recorded_at: datetime
+    requested_sections: tuple[str, ...]
+    account_selection_matches: bool | None
+    period_matches: bool
+
+    def safe_summary(self) -> dict:
+        """Return code-owned labels/counts/hashes/clocks, never declaration text."""
+        observed = self.capture.report.safe_summary()
+        sections = {}
+        requested = _json(self.declaration_bytes)["requested_sections"]
+        for name, section in observed["sections"].items():
+            sections[name] = {
+                **section,
+                "requested": name in self.requested_sections,
+                "declared_field_count": (
+                    len(requested[name]) if requested.get(name) is not None else None
+                ),
+                "statements_with_empty_section": sum(
+                    not s.rows
+                    for st in self.capture.report.statements
+                    for s in st.sections
+                    if s.name == name
+                ),
+                "statements_missing_section": len(self.capture.report.statements)
+                - section["statements_with_section"],
+            }
+        return {
+            **self.capture.safe_summary(),
+            "schema_version": "ibkr-flex-query-scope-review-1",
+            "scope_authority": "operator_declared_not_provider_certified",
+            "configuration_binding": "local_exact_bytes_only",
+            "historical_configuration_effectiveness": "not_verified",
+            "declaration_hash": self.declaration_hash,
+            "configuration_hash": self.configuration_hash,
+            "report_hash": self.capture.report.raw_hash,
+            "capture_binding_hash": self.capture.source_binding_hash,
+            "review_binding_hash": self.binding_hash,
+            "declared_at": self.declared_at.isoformat(),
+            "configuration_recorded_at": self.configuration_recorded_at.isoformat(),
+            "account_selection_matches": self.account_selection_matches,
+            "period_matches": self.period_matches,
+            "sections": sections,
+        }
+
+
+def _scope_keys(value: object, keys: set[str]) -> dict:
+    if not isinstance(value, dict) or set(value) != keys:
+        _fail("scope_structure_invalid")
+    return value
+
+
+def _scope_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 256
+        and not any(ord(char) < 32 for char in value)
+    )
+
+
+def _scope_selection(value: object) -> tuple[str, tuple[str, ...]]:
+    selection = _scope_keys(value, {"mode", "values"})
+    mode, values = selection["mode"], selection["values"]
+    if (
+        mode not in ("all", "selected", "none", "unknown")
+        or not isinstance(values, list)
+        or len(values) > 256
+        or not all(_scope_text(item) for item in values)
+        or len(set(values)) != len(values)
+        or (mode != "selected" and values)
+        or (mode == "selected" and not values)
+    ):
+        _fail("scope_selection_invalid")
+    return mode, tuple(values)
+
+
+def read_flex_query_scope_review(
+    directory: str | Path,
+    *,
+    configuration_path: str | Path,
+    declaration_path: str | Path,
+    expected_declaration_hash: str,
+    as_of: datetime,
+) -> FlexQueryScopeReview:
+    """Bind a private operator declaration/snapshot to an original capture.
+
+    Args:
+        directory: Original capture directory accepted by read_flex_capture.
+        configuration_path: Opaque saved snapshot bytes; no native export assumed.
+        declaration_path: Private JSON in the closed local declaration schema.
+        expected_declaration_hash: Separately retained SHA-256 pin of exact JSON bytes.
+        as_of: Aware cutoff for original capture and declaration clocks.
+
+    Returns:
+        Frozen diagnostic review, with all income authority gaps retained.
+
+    Raises:
+        FlexIntakeError: On unsafe files, malformed declarations, hash or clock mismatch.
+    """
+    capture = read_flex_capture(directory, as_of=as_of)
+    raw = _private_read(Path(declaration_path), 64 * 1024)
+    declaration_hash = hashlib.sha256(raw).hexdigest()
+    if declaration_hash != expected_declaration_hash:
+        _fail("scope_declaration_hash_mismatch")
+    declaration = _scope_keys(
+        _json(raw),
+        {
+            "schema_version",
+            "scope_authority",
+            "configuration_sha256",
+            "report_sha256",
+            "capture_binding_sha256",
+            "query_id_sha256",
+            "declared_at",
+            "configuration_recorded_at",
+            "query_version",
+            "requested_sections",
+            "scope",
+        },
+    )
+    if (
+        declaration["schema_version"] != "ibkr-flex-operator-scope-1"
+        or declaration["scope_authority"] != "operator_declared_not_provider_certified"
+        or (
+            declaration["query_version"] is not None
+            and not _scope_text(declaration["query_version"])
+        )
+    ):
+        _fail("scope_declaration_invalid")
+    configuration = _private_read(Path(configuration_path))
+    if not configuration:
+        _fail("scope_configuration_empty")
+    configuration_hash = hashlib.sha256(configuration).hexdigest()
+    for key, expected in (
+        ("configuration_sha256", configuration_hash),
+        ("report_sha256", capture.report.raw_hash),
+        ("capture_binding_sha256", capture.source_binding_hash),
+        ("query_id_sha256", capture.query_id_hash),
+    ):
+        if declaration[key] != expected:
+            _fail("scope_binding_mismatch")
+    declared = _instant(declaration["declared_at"])
+    recorded = _instant(declaration["configuration_recorded_at"])
+    if not recorded <= declared <= as_of:
+        _fail("scope_clock_mismatch")
+    requested = declaration["requested_sections"]
+    if not isinstance(requested, dict) or not requested or not set(requested) <= set(SECTIONS):
+        _fail("scope_sections_invalid")
+    for fields in requested.values():
+        # None explicitly means field selection was not recorded; [] is not 'all fields'.
+        if fields is not None and (
+            not isinstance(fields, list)
+            or not 1 <= len(fields) <= 256
+            or not all(_scope_text(item) for item in fields)
+            or len(set(fields)) != len(fields)
+        ):
+            _fail("scope_fields_invalid")
+    scope = _scope_keys(
+        declaration["scope"],
+        {
+            "accounts",
+            "models",
+            "asset_classes",
+            "currencies",
+            "security_ids",
+            "period",
+            "timezone",
+            "date_format",
+            "time_format",
+            "detail_level",
+            "currency_mode",
+            "output_format",
+        },
+    )
+    selections = {
+        name: _scope_selection(scope[name])
+        for name in ("accounts", "models", "asset_classes", "currencies", "security_ids")
+    }
+    period = _scope_keys(scope["period"], {"from_date", "to_date"})
+    start, end = _day(period["from_date"]), _day(period["to_date"])
+    if start > end:
+        _fail("scope_period_invalid")
+    if (
+        any(
+            scope[key] is not None and not _scope_text(scope[key])
+            for key in ("timezone", "date_format", "time_format")
+        )
+        or scope["detail_level"] not in ("detail", "summary", "both", "unknown")
+        or scope["currency_mode"] not in ("base", "native", "both", "unknown")
+        or scope["output_format"] != "XML"
+    ):
+        _fail("scope_settings_invalid")
+    mode, accounts = selections["accounts"]
+    account_match = (
+        set(accounts) == {st.account_id for st in capture.report.statements}
+        if mode == "selected"
+        else None
+    )
+    period_match = all(
+        (st.started_on, st.ended_on) == (start, end) for st in capture.report.statements
+    )
+    binding = json.dumps(
+        {
+            "policy": "ibkr-flex-query-scope-review-1",
+            "declaration_hash": declaration_hash,
+            "configuration_hash": configuration_hash,
+            "capture_binding_hash": capture.source_binding_hash,
+            "report_hash": capture.report.raw_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return FlexQueryScopeReview(
+        capture,
+        raw,
+        declaration_hash,
+        configuration_hash,
+        hashlib.sha256(binding).hexdigest(),
+        declared,
+        recorded,
+        tuple(sorted(requested)),
+        account_match,
+        period_match,
+    )
