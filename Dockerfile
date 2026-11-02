@@ -25,7 +25,6 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --chown=appuser:appuser src/ src/
 COPY --chown=appuser:appuser scripts/ scripts/
 COPY --chown=appuser:appuser config/ config/
-COPY --chown=appuser:appuser lean/ lean/
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH="/app/.venv/bin:$PATH"
 USER appuser
 EXPOSE 8501
