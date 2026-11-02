@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import stat
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from src.data.private_files import PrivateFileError, read_private
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_NODES = 100_000
@@ -295,30 +295,9 @@ def parse_flex_report(raw: bytes, *, expected_account_id: str | None = None) -> 
 
 def _private_read(path: Path, limit: int = MAX_BYTES) -> bytes:
     try:
-        if (
-            not path.is_absolute()
-            or ".." in path.parts
-            or any(p.is_symlink() for p in (path, *path.parents))
-        ):
-            _fail("private_source_invalid")
-        parent = path.parent.stat()
-        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
-            _fail("private_source_permissions")
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) & 0o077
-                or info.st_size > limit
-            ):
-                _fail("private_source_invalid")
-            raw = stream.read(limit + 1)
-        if len(raw) > limit:
-            _fail("private_source_invalid")
-        return raw
+        return read_private(path, limit)
+    except PrivateFileError as exc:
+        _fail(str(exc))
     except OSError:
         _fail("private_source_unavailable")
 
