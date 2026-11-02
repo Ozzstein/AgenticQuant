@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCES = ROOT / "config" / "ibkr-flex.op.env"
+PAPER_REFERENCES = ROOT / "config" / "ibkr-flex-paper.op.env"
 
 # Only this subprocess receives the resolved IBKR fields. Drop the Service
 # Account credential before starting Python, rather than exposing it to the check.
@@ -47,7 +48,7 @@ def _invoke(runner, command, environment, *, timeout=30):
         return None
 
 
-def _diagnose(executable, environment, runner):
+def _diagnose(executable, environment, runner, *, paper=False):
     """Emit fixed labels only; never interpolate provider output or field values."""
     auth = _invoke(runner, [executable, "user", "get", "--me", "--format=json"], environment)
     if auth is None:
@@ -63,8 +64,18 @@ def _diagnose(executable, environment, runner):
         return
     print("1PASSWORD_AUTHENTICATION_OK", file=sys.stderr)
     fields = (
-        ("IBKR_FLEX_QUERY_ID", "op://Agents/IBKR Felx Queries/credential"),
-        ("IBKR_FLEX_TOKEN", "op://Agents/IBKR Flex Web Service /credential"),
+        (
+            "IBKR_FLEX_QUERY_ID",
+            "op://Agents/IBKR Felx Queries Paper Account/credential"
+            if paper
+            else "op://Agents/IBKR Felx Queries/credential",
+        ),
+        (
+            "IBKR_FLEX_TOKEN",
+            "op://Agents/IBKR Flex Web Service  Paper Account/credential"
+            if paper
+            else "op://Agents/IBKR Flex Web Service /credential",
+        ),
     )
     all_valid = True
     for name, reference in fields:
@@ -109,14 +120,14 @@ def _diagnose(executable, environment, runner):
     )
 
 
-def _fetch(executable, environment, runner, *, resume_latest=False):
+def _fetch(executable, environment, runner, *, resume_latest=False, paper=False):
     result = _invoke(
         runner,
         [
             executable,
             "run",
             "--env-file",
-            str(REFERENCES),
+            str(PAPER_REFERENCES if paper else REFERENCES),
             "--",
             "/usr/bin/env",
             "-u",
@@ -124,6 +135,7 @@ def _fetch(executable, environment, runner, *, resume_latest=False):
             sys.executable,
             str(ROOT / "scripts/fetch_ibkr_flex_report.py"),
             *(["--resume-latest"] if resume_latest else []),
+            *(["--paper"] if paper else []),
         ],
         environment,
         timeout=180,
@@ -193,7 +205,13 @@ def _fetch(executable, environment, runner, *, resume_latest=False):
 
 
 def check_credentials(
-    service_token: str, *, op_path=None, runner=subprocess.run, fetch=False, resume_latest=False
+    service_token: str,
+    *,
+    op_path=None,
+    runner=subprocess.run,
+    fetch=False,
+    resume_latest=False,
+    paper=False,
 ) -> int:
     """Use exact configured references; never relay CLI stdout/stderr to the user."""
     executable = op_path or shutil.which("op") or str(Path.home() / ".local/bin/op")
@@ -225,7 +243,7 @@ def check_credentials(
                 executable,
                 "run",
                 "--env-file",
-                str(REFERENCES),
+                str(PAPER_REFERENCES if paper else REFERENCES),
                 "--",
                 "/usr/bin/env",
                 "-u",
@@ -244,10 +262,10 @@ def check_credentials(
                 "Credential check failed; running bounded diagnostics. No IBKR request made.",
                 file=sys.stderr,
             )
-            _diagnose(executable, environment, runner)
+            _diagnose(executable, environment, runner, paper=paper)
             return 1
         if fetch or resume_latest:
-            return _fetch(executable, environment, runner, resume_latest=resume_latest)
+            return _fetch(executable, environment, runner, resume_latest=resume_latest, paper=paper)
     finally:
         environment.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     print("IBKR Flex token and numeric Query ID loaded successfully; values withheld.")
@@ -267,6 +285,11 @@ def main() -> int:
         action="store_true",
         help="Retrieve the latest retained generation reference without generating a new report.",
     )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help="Use the paper token profile and its separate private capture directory.",
+    )
     args = parser.parse_args()
     if not sys.stdin.isatty():
         print("Run this command in your own interactive terminal.", file=sys.stderr)
@@ -281,7 +304,12 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nCredential check cancelled.", file=sys.stderr)
         return 130
-    return check_credentials(credential, fetch=args.fetch, resume_latest=args.resume_latest)
+    return check_credentials(
+        credential,
+        fetch=args.fetch,
+        resume_latest=args.resume_latest,
+        paper=args.paper,
+    )
 
 
 if __name__ == "__main__":

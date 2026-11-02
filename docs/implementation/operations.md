@@ -1083,3 +1083,23 @@ Ruff check/format and diff check passed. Covers pending-to-resumed download,
 GET-only original reference, unchanged original files, invalid query/raw/permissions/
 symlink/completed source refusal, and launcher isolation/status filtering.
 Downloaded XML still requires independent income/payment/coverage assessment.
+
+### Separate IBKR paper credential profile — 2026-11-02
+
+Operator supplied distinct paper token and query secret references. New
+`config/ibkr-flex-paper.op.env` retains both exact pointers (including two spaces
+in the token item name). `--paper` selects this closed profile for readiness,
+field diagnostics, and fetch. Default live reference file is unchanged. Only
+references are committed, never resolved values. A separate paper capture root
+`~/.local/share/quantagentlab/ibkr-flex/paper/` prevents paper continuation from
+selecting earlier live-generation references. Existing private permissions,
+fixed official origin, hidden prompt, service-token isolation and polling bounds
+remain in force. CLI: `.venv/bin/python scripts/check_ibkr_flex_credentials.py
+--paper --fetch`; pending continuation uses `--paper --resume-latest`.
+
+Validation: 53 tests passed in 0.56s with sockets disabled across both Flex test
+files; Ruff check/format and diff check passed. Tests cover both profile launch
+paths and diagnostics, exact references/spacing, original live profile retained,
+and actual HTTPX fixture capture under the paper-only root. No authenticated
+request was made by the agent and paper XML cannot establish live dividend or
+custodial deduction authority.

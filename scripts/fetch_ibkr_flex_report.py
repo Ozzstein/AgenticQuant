@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import errno
 import hashlib
 import json
@@ -287,13 +288,15 @@ def main():
             for label, value in network_check(client).items():
                 print(label + ": " + value)
         return 0
-    if sys.argv[1:] not in ([], ["--resume-latest"]):
-        print(json.dumps({"status": "failed", "reason": "invalid_arguments"}))
-        return 1
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--resume-latest", action="store_true")
+    parser.add_argument("--paper", action="store_true")
+    args = parser.parse_args()
     try:
         if "OP_SERVICE_ACCOUNT_TOKEN" in os.environ:
             raise FlexCaptureError("service_account_not_isolated")
-        directory = private_directory(Path.home() / ".local/share/quantagentlab/ibkr-flex")
+        base = Path.home() / ".local/share/quantagentlab/ibkr-flex"
+        directory = private_directory(base / "paper" if args.paper else base)
         with httpx.Client(
             trust_env=False,
             follow_redirects=False,
@@ -304,7 +307,7 @@ def main():
                 os.environ.get("IBKR_FLEX_TOKEN", ""),
                 os.environ.get("IBKR_FLEX_QUERY_ID", ""),
                 directory,
-                resume_generation=directory.parent if sys.argv[1:] == ["--resume-latest"] else None,
+                resume_generation=directory.parent if args.resume_latest else None,
             )
     except FlexCaptureError as exc:
         print(json.dumps({"status": "failed", "reason": str(exc)}))

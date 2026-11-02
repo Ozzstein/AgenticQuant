@@ -148,6 +148,42 @@ def test_resume_invalid_source_never_contacts_provider(tmp_path, change):
     assert calls == []
 
 
+def test_paper_worker_uses_separate_capture_and_resume_namespace(tmp_path, monkeypatch, capsys):
+    import scripts.fetch_ibkr_flex_report as worker
+
+    monkeypatch.setattr(worker.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(worker.sys, "argv", ["fetch_ibkr_flex_report.py", "--paper"])
+    monkeypatch.setenv("IBKR_FLEX_TOKEN", TOKEN)
+    monkeypatch.setenv("IBKR_FLEX_QUERY_ID", "12345")
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    actual_client = httpx.Client
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            200, content=ACK if request.url.path.endswith("SendRequest") else REPORT
+        )
+
+    monkeypatch.setattr(
+        worker.httpx,
+        "Client",
+        lambda **kwargs: actual_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    actual_fetch = worker.fetch_report
+    monkeypatch.setattr(
+        worker, "fetch_report", lambda *a, **kw: actual_fetch(*a, sleep=lambda _: None, **kw)
+    )
+    assert worker.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert (
+        worker.Path(result["directory"]).parent
+        == tmp_path / ".local/share/quantagentlab/ibkr-flex/paper"
+    )
+    assert len(calls) == 2
+    assert TOKEN not in json.dumps(result)
+
+
 def test_overflow_never_archives_truncated_success(tmp_path):
     directory, client, requests, delays = capture(tmp_path, [ACK, b"x" * (MAX_BYTES + 1)])
     with client, pytest.raises(FlexCaptureError, match="response_bytes_exceeded"):

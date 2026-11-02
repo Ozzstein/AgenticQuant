@@ -8,7 +8,12 @@ import warnings
 
 import pytest
 
-from scripts.check_ibkr_flex_credentials import CHECK_CODE, REFERENCES, check_credentials
+from scripts.check_ibkr_flex_credentials import (
+    CHECK_CODE,
+    PAPER_REFERENCES,
+    REFERENCES,
+    check_credentials,
+)
 
 
 @pytest.mark.parametrize("failure", [False, True, "timeout"])
@@ -89,9 +94,10 @@ def test_hidden_prompt_cannot_fall_back_to_echo(monkeypatch, capsys):
     assert "cancelled" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("paper", [False, True])
 @pytest.mark.parametrize("failed_field", ["IBKR_FLEX_QUERY_ID", "IBKR_FLEX_TOKEN", None])
 def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
-    tmp_path, capsys, monkeypatch, failed_field
+    tmp_path, capsys, monkeypatch, failed_field, paper
 ):
     executable = tmp_path / "op"
     executable.touch()
@@ -108,9 +114,21 @@ def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
         else:
             code = 2 if command[-1] == failed_field else 0
             assert kwargs["env"][command[-1]].startswith("op://Agents/")
+            if command[-1] == "IBKR_FLEX_TOKEN":
+                expected = (
+                    "op://Agents/IBKR Flex Web Service  Paper Account/credential"
+                    if paper
+                    else "op://Agents/IBKR Flex Web Service /credential"
+                )
+                assert kwargs["env"][command[-1]] == expected
         return subprocess.CompletedProcess(command, code, b"PRIVATE-VALUE", b"PRIVATE-VALUE")
 
-    assert check_credentials("synthetic-service-secret", op_path=str(executable), runner=run) == 1
+    assert (
+        check_credentials(
+            "synthetic-service-secret", op_path=str(executable), runner=run, paper=paper
+        )
+        == 1
+    )
     output = capsys.readouterr()
     assert "PRIVATE-VALUE" not in output.out + output.err
     assert "1PASSWORD_AUTHENTICATION_OK" in output.err
@@ -120,10 +138,11 @@ def test_diagnostics_identify_individual_fields_without_echoing_provider_data(
         assert field + ": " + expected in output.err
 
 
+@pytest.mark.parametrize("paper", [False, True])
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("outcome", ["downloaded", "rejected", "unsafe"])
 def test_fetch_launcher_only_exposes_closed_status_and_private_path(
-    tmp_path, monkeypatch, capsys, outcome, resume
+    tmp_path, monkeypatch, capsys, outcome, resume, paper
 ):
     executable = tmp_path / "op"
     executable.touch()
@@ -132,6 +151,9 @@ def test_fetch_launcher_only_exposes_closed_status_and_private_path(
 
     def run(command, **kwargs):
         calls.append(command)
+        assert command[command.index("--env-file") + 1] == str(
+            PAPER_REFERENCES if paper else REFERENCES
+        )
         assert "synthetic-service-secret" not in command
         assert command[command.index("--") + 1 :][:3] == [
             "/usr/bin/env",
@@ -142,6 +164,7 @@ def test_fetch_launcher_only_exposes_closed_status_and_private_path(
             return subprocess.CompletedProcess(command, 0, b"", b"")
         assert kwargs["timeout"] == 180
         assert ("--resume-latest" in command) is resume
+        assert ("--paper" in command) is paper
         if outcome == "downloaded":
             value = {
                 "status": "downloaded",
@@ -165,9 +188,24 @@ def test_fetch_launcher_only_exposes_closed_status_and_private_path(
         runner=run,
         fetch=True,
         resume_latest=resume,
+        paper=paper,
     )
     assert code == (0 if outcome == "downloaded" else 1)
     output = capsys.readouterr()
     assert "PRIVATE-SECRET" not in output.out + output.err
     if outcome == "rejected":
         assert "ibkr_error_1012" in output.err
+
+
+def test_paper_profile_preserves_exact_reference_and_original_profile():
+    assert (
+        'IBKR_FLEX_TOKEN="op://Agents/IBKR Flex Web Service  Paper Account/credential"'
+        in PAPER_REFERENCES.read_text()
+    )
+    assert (
+        'IBKR_FLEX_TOKEN="op://Agents/IBKR Flex Web Service /credential"' in REFERENCES.read_text()
+    )
+    assert (
+        'IBKR_FLEX_QUERY_ID="op://Agents/IBKR Felx Queries Paper Account/credential"'
+        in PAPER_REFERENCES.read_text()
+    )
