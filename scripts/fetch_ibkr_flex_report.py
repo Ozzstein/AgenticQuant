@@ -11,7 +11,6 @@ import os
 import re
 import socket
 import ssl
-import stat
 import sys
 import time
 import uuid
@@ -20,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+
+# The launcher executes this file directly, with a sanitized environment.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.data import private_files  # noqa: E402
+from src.data.ibkr_flex import FlexIntakeError, _instant, _json  # noqa: E402
 
 ORIGIN = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/"
 MAX_BYTES = 8 * 1024 * 1024
@@ -74,23 +78,25 @@ def network_check(client):
 
 
 def private_directory(base: Path) -> Path:
-    if not base.is_absolute() or any(p.is_symlink() for p in (base, *base.parents)):
-        raise FlexCaptureError("private_directory_invalid")
-    base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = base.stat()
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-        raise FlexCaptureError("private_directory_permissions")
-    root = base / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex)
-    root.mkdir(mode=0o700)
-    return root
+    try:
+        with private_files.private_directory(base, create=True) as parent:
+            name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex
+            os.mkdir(name, 0o700, dir_fd=parent)
+            with private_files.private_child(parent, name):
+                pass
+        return base / name
+    except private_files.PrivateFileError as exc:
+        code = "permissions" if str(exc) == "private_source_permissions" else "invalid"
+        raise FlexCaptureError("private_directory_" + code) from None
+    except OSError:
+        raise FlexCaptureError("private_directory_invalid") from None
 
 
 def write_private(path: Path, data: bytes):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as output:
-        output.write(data)
-        output.flush()
-        os.fsync(output.fileno())
+    try:
+        private_files.write_private(path, data)
+    except (OSError, private_files.PrivateFileError):
+        raise FlexCaptureError("capture_unavailable") from None
 
 
 def parse_xml(raw: bytes):
@@ -115,61 +121,71 @@ def _error(root):
 def latest_generation(base: Path, query_id: str):
     """Read the latest original acknowledgement, without exposing its reference."""
     try:
-        for path in (base, *base.parents):
-            if path.is_symlink():
-                raise ValueError
-        info = base.stat()
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValueError
-        candidates = sorted(
-            path
-            for path in base.iterdir()
-            if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}", path.name)
-            and (path / "01-SendRequest.xml").exists()
-        )
+        candidates = []
+        with private_files.private_directory(base) as parent:
+            for name in os.listdir(parent):
+                if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}", name):
+                    continue
+                with private_files.private_child(parent, name) as source:
+                    # Resume-only directories have no original SendRequest.
+                    names = os.listdir(source)
+                    if "01-SendRequest.xml" not in names:
+                        continue
+                    raw = private_files.read_at(source, "01-SendRequest.xml", MAX_BYTES)
+                    receipt = _json(
+                        private_files.read_at(source, "01-SendRequest.xml.receipt.json", 64 * 1024)
+                    )
+                    if (
+                        receipt.get("operation") != "SendRequest"
+                        or receipt.get("http_status") != 200
+                        or receipt.get("raw_file") != "01-SendRequest.xml"
+                        or receipt.get("request_version") != "3"
+                        or receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest()
+                        or receipt.get("query_id_sha256")
+                        != hashlib.sha256(query_id.encode()).hexdigest()
+                    ):
+                        raise ValueError
+                    started = _instant(receipt.get("started_at"))
+                    available = _instant(receipt.get("available_at"))
+                    if started > available:
+                        raise ValueError
+                    root = parse_xml(raw)
+                    reference = root.findtext("ReferenceCode", "")
+                    if (
+                        root.tag != "FlexStatementResponse"
+                        or root.findtext("Status") != "Success"
+                        or _error(root)
+                        or not re.fullmatch(r"[0-9]+", reference)
+                    ):
+                        raise ValueError
+                    candidates.append(
+                        (
+                            started,
+                            available,
+                            name,
+                            reference,
+                            receipt["raw_sha256"],
+                            "capture.json" in names,
+                        )
+                    )
         if not candidates:
             raise ValueError
-        source = candidates[-1]
-        if (source / "capture.json").exists():
-            raise FlexCaptureError("resume_latest_already_downloaded")
-        paths = [source, source / "01-SendRequest.xml", source / "01-SendRequest.xml.receipt.json"]
-        for path in paths:
-            info = path.lstat()
-            if (
-                path.is_symlink()
-                or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) & 0o077
-                or (path != source and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))
-                or (path != source and info.st_size > MAX_BYTES)
-            ):
+        candidates.sort(key=lambda candidate: candidate[0])
+        # Require non-overlapping, strictly ordered original request intervals.
+        # UUIDs, directory timestamps and mtimes carry no acquisition ordering.
+        for older, newer in zip(candidates, candidates[1:]):
+            if older[0] == newer[0] or older[1] >= newer[0]:
                 raise ValueError
-        raw = paths[1].read_bytes()
-        receipt = json.loads(paths[2].read_bytes())
-        if (
-            receipt["operation"] != "SendRequest"
-            or receipt["http_status"] != 200
-            or receipt["raw_file"] != paths[1].name
-            or receipt["request_version"] != "3"
-            or receipt["raw_sha256"] != hashlib.sha256(raw).hexdigest()
-            or receipt["query_id_sha256"] != hashlib.sha256(query_id.encode()).hexdigest()
-        ):
-            raise ValueError
-        root = parse_xml(raw)
-        reference = root.findtext("ReferenceCode", "")
-        if (
-            root.tag != "FlexStatementResponse"
-            or root.findtext("Status") != "Success"
-            or _error(root)
-            or not re.fullmatch(r"[0-9]+", reference)
-        ):
-            raise ValueError
+        _, _, name, reference, digest, completed = candidates[-1]
+        if completed:
+            raise FlexCaptureError("resume_latest_already_downloaded")
         return reference, {
-            "directory": str(source),
-            "acknowledgement_sha256": receipt["raw_sha256"],
+            "directory": str(base / name),
+            "acknowledgement_sha256": digest,
         }
     except FlexCaptureError:
         raise
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, FlexIntakeError):
         raise FlexCaptureError("resume_source_unavailable_or_invalid") from None
 
 
