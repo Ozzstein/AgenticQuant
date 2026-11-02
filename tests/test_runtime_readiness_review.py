@@ -58,7 +58,6 @@ def test_invalid_python_versions(python):
     }
 
 
-@pytest.mark.xfail(strict=True, raises=RecursionError, reason='R1: deeply nested JSON escapes metadata parser')
 def test_nested_metadata_is_rejected():
     payload = '[' * 2000 + '0' + ']' * 2000
     assert len(payload) < readiness.MAX_OUTPUT

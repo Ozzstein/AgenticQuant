@@ -158,7 +158,7 @@ def _metadata_result(reason: str, output: str, names: list[str]) -> dict:
                 or any(not isinstance(v, str) or re.fullmatch(r'\d[A-Za-z0-9.+!-]{0,79}', v) is None
                        for v in packages.values())):
             raise ValueError
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):
         return _check('unverified', 'unexpected_output')
     missing = sorted(set(names) - set(packages))
     reason = ('python_version_mismatch' if python[:2] != [3, 11] else

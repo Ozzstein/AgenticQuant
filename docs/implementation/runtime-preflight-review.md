@@ -55,3 +55,12 @@ arguments and environment filtering do not independently prove that the real
 Docker client never loads a default credential/configuration file; that behavior
 was not exercised or established within this source-only scope. No runtime
 acceptance or real-world readiness conclusion follows from these tests.
+
+## Coordinator response — 2026-11-02
+
+R1 is fixed by catching `RecursionError` at the metadata decoding boundary and
+returning `unverified/unexpected_output`. The desired-behavior regression is now
+an ordinary passing test; its expected-failure marker was removed. Combined
+readiness and independent review tests: **42 passed in 3.62s**, sockets disabled,
+with no skips or expected failures. Ruff and `git diff --check` passed. The fix
+does not change runtime acceptance or the review limitations above.
