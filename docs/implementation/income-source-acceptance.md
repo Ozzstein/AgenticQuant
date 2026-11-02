@@ -1,7 +1,7 @@
 # Blocker 1: income source acceptance
 
-Status: **open — source/access dependency**, reviewed 2026-10-28.
-This is an acquisition and verification plan, not a registered positive parser.
+Status: **open — source sufficiency dependency**, reviewed 2026-11-02.
+Read-only IBKR capture intake exists; no positive income parser is registered.
 The existing canonical ledger and operating income gate remain authoritative.
 
 ## Completion criteria
@@ -92,8 +92,9 @@ operator claim that no events occurred cannot establish complete protocol scope.
 
 ## Decision and next step
 
-No positive source is selected or acquired. The next external dependency is the
-original evidence package and provider delivery specification; no new account,
+No positive income source has been certified. Original paper-account IBKR bytes
+have been acquired as described below. The next external dependency is the
+query configuration and sufficient provider delivery specification; no new account,
 subscription or credential request is implied. Public documentation review can
 shortlist components but cannot substitute for those bytes or access rights.
 
@@ -126,3 +127,80 @@ complete event window. Paper acquisition is working; the live/source sufficiency
 blocker remains open. Original XML/receipts stay outside the repository; no
 positive source parser, income policy, execution gate or completion criterion was
 relaxed. This documentation-only update required no runtime change.
+
+## Bounded IBKR intake implementation — 2026-11-02
+
+- [x] `src.data.ibkr_flex.parse_flex_report(raw, expected_account_id=None)` reads
+  original bounded UTF-8 Flex XML into immutable private observations.
+- [x] `read_flex_capture(directory, as_of=...)` independently checks local
+  acknowledgement/poll/final-report receipts, raw hashes, query identity and
+  acquisition chronology, including an original acknowledgement on resumed GETs.
+- [x] Decimal strings remain exact; absent fields, blank fields and explicit zero
+  remain distinct. Original row strings, IDs, native dates/times and source leaf
+  paths are retained; no inferred UTC posting/entitlement clock is created.
+- [x] Accrual Po/Re, open accruals, cash and Statement of Funds observations remain
+  distinct; no amount/date/description join, gross-minus-net tax inference,
+  deduplication, cash creation or canonical entitlement/payment is performed.
+- [x] Native SUMMARY rows are retained as `summary_not_posting`, including the
+  actual sample's dash account summary. They do not count as separate payments.
+- [x] Safe CLI summary exposes fixed section names, counts and gaps without account
+  identifiers, descriptions, amounts, provider IDs or native report dates.
+- [ ] Register a positive operating source only after the remaining source scope,
+  convention, linked deductions, lifecycle and cutoff obligations are supported.
+
+The reader is diagnostic intake, not `verify_income_provenance` admission. Its
+`capture_consistency=verified` means local bytes/receipts agree, not that IBKR
+cryptographically authenticated them or that the selected account is live.
+`source_authentication=not_independently_verified`, `income_admission=blocked` and
+zero canonical income records are explicit even for populated synthetic examples.
+No new EvidenceStore/ledger authority or source-success flag was introduced.
+The original query configuration is not included in the Flex report. Missing
+values on native summary/opening-balance lines do not prove a query misconfiguration.
+All original records are retained rather than matched or discarded.
+
+Field meanings were checked against the official [cash transaction reference](https://www.ibkrguides.com/reportingreference/reportguide/cash%20transactionsfq.htm),
+[change in accruals](https://www.ibkrguides.com/reportingreference/reportguide/change%20in%20dividend%20accrualsfq.htm),
+[open accruals](https://www.ibkrguides.com/reportingreference/reportguide/open%20dividend%20accrualsfq.htm)
+and [Statement of Funds](https://www.ibkrguides.com/reportingreference/reportguide/statement%20of%20fundsfq.htm).
+In particular, reversal code Re is not unique evidence of payout. Literal cash
+row labels are observation categories only; unreviewed row types/sections remain
+unsupported and never establish economics or complete coverage.
+
+Validation: 104 tests passed in 1.27s, sockets disabled, across the three IBKR test
+files, `test_operations_income_proof.py` and `test_action_coverage_accounts.py`.
+41 new intake cases exercise real HTTPX fixture capture -> receipt reader,
+original-reference continuation, sub-float Decimal precision, summary exclusion,
+absent/blank/zero, reversals, corrections and currencies, source corruption,
+path aliases/hardlinks, unsafe XML, account scope, future acquisition and redaction.
+Test XML is labelled synthetic protocol evidence, not actual payment acceptance.
+Ruff check/format and diff check passed. Actual private paper capture was also
+read through the implementation; all original capture file hashes stayed unchanged.
+No broker request or ledger write was made by this intake implementation.
+
+Private local inspection command (no credentials required):
+
+```bash
+.venv/bin/python -m scripts.inspect_ibkr_flex_report --capture /ABSOLUTE/PRIVATE/CAPTURE_FOLDER
+```
+
+Next query-configuration review, using the existing saved query rather than
+buying assets or generating income:
+
+1. Confirm exact account, reporting period, currency/detail settings and that no
+   security, transaction-type or dividend filters unintentionally narrow scope.
+2. In Cash Transactions retain account/currency/amount/type/date-time, instrument
+   identity and native transaction/action identifiers where IBKR exposes them.
+3. In both dividend-accrual sections retain account, currency, conid/security ID,
+   ex/pay dates, quantity, gross rate/amount, net amount, tax, fee and code. Change
+   in accruals additionally needs its change/report dates where available.
+4. Retain Statement of Funds IDs, activity codes, dates and cash balance fields;
+   include Corporate Actions, Securities Info and Open Positions for subsequent
+   identity/holdings review. Their presence is not itself coverage certification.
+5. Keep the original configuration privately with its actual acquisition time.
+   An operator confirmation helps review but cannot substitute for a documented
+   provider guarantee about completeness, late amendments or tax applicability.
+
+Development can proceed with documentation and labelled tests. A newly opened
+account need not have historical dividends; no purchase, deposit or subscription
+is required by this implementation. Actual income examples remain a later
+acceptance requirement, separate from the now-working paper acquisition/intake.
