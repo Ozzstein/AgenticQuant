@@ -1,4 +1,4 @@
-"""Data/quant entry points usable before canonical CLI integration.
+"""Data/quant commands and read-only capture inspection, also used by aiquant data.
 
 All inputs are supplied artifacts; there are no runtime sample-data generators.
 """
@@ -11,16 +11,21 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.data.evidence.store import EvidenceStore
-from src.domain.common import EvidenceRecord, Instrument, RunContext
-from src.domain.market import FeatureSpec, MarketSnapshot
-
 
 def read_json(path):
     return json.loads(Path(path).read_text())
 
 
 def execute(args) -> dict:
+    # Inspection must never import evidence machinery or open a store, even when
+    # a caller supplies the legacy global --store option.
+    if args.command == "inspect-ibkr-flex":
+        return inspect_ibkr_flex(args)
+
+    from src.data.evidence.store import EvidenceStore
+    from src.domain.common import EvidenceRecord, Instrument, RunContext
+    from src.domain.market import FeatureSpec, MarketSnapshot
+
     store = EvidenceStore(args.store)
     if args.command == "import-archive":
         manifest_path = Path(args.manifest).resolve()
@@ -188,10 +193,36 @@ def execute(args) -> dict:
     raise ValueError("unknown command")
 
 
+def inspect_ibkr_flex(args) -> dict:
+    """Expose only the existing reader's safe summary and code-owned failures."""
+    from src.data.ibkr_flex import FlexIntakeError, read_flex_capture
+
+    try:
+        as_of = (
+            datetime.fromisoformat(args.as_of)
+            if args.as_of is not None
+            else datetime.now(timezone.utc)
+        )
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError
+    except ValueError:
+        return {"status": "unavailable", "reason": "aware_cutoff_required"}
+    try:
+        return read_flex_capture(args.capture, as_of=as_of).safe_summary()
+    except FlexIntakeError as exc:
+        # FlexIntakeError contains code-owned labels only, per the reader contract.
+        return {"status": "unavailable", "reason": str(exc)}
+    except Exception:
+        return {"status": "unavailable", "reason": "capture_inspection_failed"}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store", required=True, help="owned SQLite evidence database path")
+    parser.add_argument("--store", help="owned SQLite evidence database path (required except for inspection)")
     commands = parser.add_subparsers(dest="command", required=True)
+    p = commands.add_parser("inspect-ibkr-flex", help="read-only local Flex capture inspection")
+    p.add_argument("--capture", type=Path, required=True, help="explicit private capture directory")
+    p.add_argument("--as-of", help="aware ISO 8601 acquisition cutoff; defaults to invocation time")
     p = commands.add_parser("import-archive")
     p.add_argument("--manifest", required=True)
     p = commands.add_parser("query")
@@ -235,6 +266,12 @@ def main(argv=None) -> int:
     p.add_argument("--year", required=True, type=int)
     p.add_argument("--quarter", required=True, type=int, choices=[1, 2, 3, 4])
     args = parser.parse_args(argv)
+    if args.command == "inspect-ibkr-flex":
+        result = execute(args)
+        print(json.dumps(result, sort_keys=True, indent=2, allow_nan=False))
+        return 1 if result.get("status") == "unavailable" else 0
+    if args.store is None:
+        parser.error("the following arguments are required: --store")
     try:
         print(json.dumps(execute(args), indent=2, allow_nan=False))
     except Exception as exc:
