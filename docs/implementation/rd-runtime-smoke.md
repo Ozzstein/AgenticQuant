@@ -1,5 +1,20 @@
 # RD runtime offline packaging smoke
 
+## Coordinator integration — 2026-11-03
+
+Integrated the smoke assets with the IBKR query-scope diagnostic and runtime
+readiness checks. The first combined run exposed process-global umask leakage
+from the smoke runner's failure path (223 passed, one IBKR permissions fixture
+failed because its intended public directory was created privately). `main`
+now restores the original umask in `finally`; the unavailable-Docker regression
+also verifies that restoration. The subsequent combined run passed **224 tests
+in 17.42s**, with sockets disabled; Ruff and diff checks passed.
+
+The coordinator independently retried the fixed local Docker socket on this
+date and received the Docker Desktop WSL forwarding error: `The command 'docker'
+could not be found in this WSL 2 distro.` No new container execution is claimed.
+The successful prior project-image smoke remains separate historical evidence.
+
 This path checks the existing pinned upstream installation, imports, CLI help,
 and reviewed US template rendering. It does not run native research, a provider
 health check, data generation, backtesting, LEAN, or admission. No native

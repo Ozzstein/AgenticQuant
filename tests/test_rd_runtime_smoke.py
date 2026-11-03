@@ -1,6 +1,7 @@
 """Offline smoke boundaries without Docker, provider access, or installed RD packages."""
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -82,8 +83,14 @@ def test_unavailable_docker_stops_before_archive_or_build(tmp_path, monkeypatch)
         return dict(exit_code=1, timed_out=False)
 
     monkeypatch.setattr(runner, 'bounded', unavailable)
-    with pytest.raises(RuntimeError, match='local Docker unavailable'):
-        runner.main()
+    previous_umask = os.umask(0o022)
+    try:
+        with pytest.raises(RuntimeError, match='local Docker unavailable'):
+            runner.main()
+        retained_umask = os.umask(0o022)
+        assert retained_umask == 0o022
+    finally:
+        os.umask(previous_umask)
     assert len(commands) == 1
     assert commands[0][1:3] == ['--host', 'unix:///var/run/docker.sock']
     assert commands[0][-3:] == ['info', '--format', '{{.ServerVersion}}']

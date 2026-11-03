@@ -53,7 +53,15 @@ def container_command(image: str, probe: list[str]) -> list[str]:
 
 def main() -> None:
     """Build only the committed allowlist; leave logs and the unique local image for review."""
-    os.umask(0o077)
+    previous_umask = os.umask(0o077)
+    try:
+        _main()
+    finally:
+        os.umask(previous_umask)
+
+
+def _main() -> None:
+    """Run with private file creation permissions scoped by main."""
     evidence = Path(tempfile.mkdtemp(prefix='rd-runtime-smoke-'))
     config = evidence/'docker-config'
     config.mkdir()
