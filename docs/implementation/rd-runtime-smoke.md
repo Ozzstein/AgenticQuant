@@ -77,9 +77,84 @@ an enforced network byte quota.
 
 ## Observed results
 
-Focused offline boundary tests: **6 passed**. Ruff and `git diff --check` passed.
+Focused offline boundary tests: **7 passed**. Ruff and `git diff --check` passed.
 Tests assert own checkout imports, mount-free offline resource limits, archive
 allowlist, subprocess failure/deadline handling, rejection of modified upstream
 templates, and locked unprivileged Docker packaging. No full-suite claim.
 
-Actual build and container results are recorded below after execution.
+Implementation commit: `db6dc8a14f550540a390b1d9837f7afe82c44555`.
+The initial build used that committed source and a dedicated `git archive`
+context in `/tmp/rd-runtime-smoke-x786eq0v`. Observed Docker output showed
+3.28 MB context, successful `uv sync` (57.6 seconds), source/probe COPY steps,
+unprivileged user creation and then `exporting layers`. **No final image ID,
+build exit, or container probe result was observed.** The task was interrupted;
+on resumption on 2026-11-03 that temporary directory no longer existed.
+It cannot serve as retained acceptance evidence. In particular, do not infer
+build completion or successful imports/help from dependency installation.
+
+On resumption `/var/run/docker.sock` was absent. The Docker executable resolved
+to the Docker Desktop WSL forwarding script, which returned exit **1** and:
+
+```text
+The command 'docker' could not be found in this WSL 2 distro.
+```
+
+No host installation or setup change was attempted. No repeat of completed
+setup was requested. The runner now checks the same explicit local Docker
+socket first with a 10-second bounded `info` call and records a blocked result
+before archiving or building when Docker is unavailable. An added offline test
+verifies this boundary and that no build command is issued.
+
+Exact smoke command, run with that preflight fix in the working tree:
+
+```bash
+PYTHONPATH=$PWD /home/ozzstein/AgenticQuant/.venv/bin/python environments/rd-agent/run_smoke.py
+```
+
+Exit **1**; `packaging_smoke: blocked`, `runtime_acceptance: unverified`.
+Docker info exited **1** in **0.17 seconds**, without timeout. Fresh config:
+`/tmp/rd-runtime-smoke-7_lhfmg3/docker-config`. Result and diagnostic log:
+`/tmp/rd-runtime-smoke-7_lhfmg3/result.json` and `docker-info.log`.
+The reported source revision is `db6dc8a14f550540a390b1d9837f7afe82c44555`;
+no image was built from uncommitted files. Diagnostic log SHA-256:
+`663ca6c96d74b96ae6cdccb23c6be8294ad56f20da13a8da31b6551d66968f0b`.
+These are temporary local artifacts, subject to deletion across restarts.
+
+The installed pinned template files remain available. The following separate
+host-side check passed: eight pinned file hashes checked, five actual YAML
+templates rendered/parsed, and generator source compiled without execution.
+It used the required root interpreter and asserted checkout source paths;
+it did not import or run the native package:
+
+```bash
+PYTHONPATH=$PWD /home/ozzstein/AgenticQuant/.venv/bin/python - <<'PYCODE'
+import importlib.util
+import json
+import tempfile
+from pathlib import Path
+import src
+import src.research.native_runtime.overlay as overlay
+assert Path(src.__file__).resolve() == Path.cwd()/'src/__init__.py'
+assert Path(overlay.__file__).resolve() == Path.cwd()/'src/research/native_runtime/overlay.py'
+spec=importlib.util.spec_from_file_location('offline_smoke', 'environments/rd-agent/offline_smoke.py')
+smoke=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(smoke)
+source=Path('/home/ozzstein/AgenticQuant/environments/rd-agent/.venv/lib/python3.11/site-packages/rdagent')
+with tempfile.TemporaryDirectory(prefix='rd-template-check-') as temporary:
+    result=smoke.check_templates(source, Path(temporary)/'rdagent')
+    print(json.dumps(result, indent=2))
+PYCODE
+```
+
+Unchanged isolated lock SHA-256:
+`f0d6469ab96470d95f819e17446d061f673d0bc4b816a92781f77f0914735837`.
+Unchanged isolated pyproject SHA-256:
+`455a06718ae90246a32b75ef4910ae04efcecd0105e2ff94a68b232aa3bb73e9`.
+
+Current status: tested packaging preparation and real pinned-template rendering
+pass. Image completion/import/help smoke remains blocked by the currently
+unavailable local Docker integration and missing prior completion evidence.
+Native RD/LEAN workflow acceptance and income-source completeness remain
+unestablished. Supervisor, gateway, registry, locks and dependency manifests
+were not modified. No research, provider calls, secrets, trading, host installs,
+push, merge, PR, or additional threads/agents were used.

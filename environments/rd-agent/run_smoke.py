@@ -65,6 +65,12 @@ def main() -> None:
     result = dict(source_revision=revision, image_tag=tag, runtime_acceptance='unverified')
     print(f'Evidence: {evidence}', flush=True)
     try:
+        result['docker_probe'] = bounded(
+            docker + ['info', '--format', '{{.ServerVersion}}'],
+            evidence/'docker-info.log', env, 10)
+        if result['docker_probe']['exit_code'] or result['docker_probe']['timed_out']:
+            result['packaging_smoke'] = 'blocked'
+            raise RuntimeError('local Docker unavailable; inspect docker-info.log')
         archive = evidence/'source.tar'
         with archive.open('wb') as output:
             subprocess.run(['git', 'archive', '--format=tar', revision, *ARCHIVE_PATHS],
@@ -109,6 +115,10 @@ def main() -> None:
                 subprocess.run(docker + ['rm', '--force', container], env=env, check=True,
                                stdout=subprocess.DEVNULL, timeout=15)
         result['packaging_smoke'] = 'passed'
+    except Exception as error:
+        result.setdefault('packaging_smoke', 'failed')
+        result['error'] = str(error)
+        raise
     finally:
         (evidence/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(f'Offline packaging smoke passed: {tag}; native workflow remains unverified.')

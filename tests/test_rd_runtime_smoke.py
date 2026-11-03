@@ -64,3 +64,31 @@ def test_dockerfile_reuses_locked_environment():
     assert 'COPY .venv' not in text
     assert 'USER 10001:10001' in text
     assert 'offline_smoke.py' in text
+
+
+def test_unavailable_docker_stops_before_archive_or_build(tmp_path, monkeypatch):
+    runner = load('run_smoke')
+    evidence = tmp_path/'evidence'
+    evidence.mkdir()
+    monkeypatch.setattr(runner.tempfile, 'mkdtemp', lambda **kwargs: str(evidence))
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *args, **kwargs: 'a'*40)
+    commands = []
+
+    def unavailable(command, log, env, seconds):
+        commands.append(command)
+        assert seconds == 10
+        assert set(env) <= {'PATH', 'HOME', 'DOCKER_CONFIG'}
+        assert list((evidence/'docker-config').iterdir()) == []
+        return dict(exit_code=1, timed_out=False)
+
+    monkeypatch.setattr(runner, 'bounded', unavailable)
+    with pytest.raises(RuntimeError, match='local Docker unavailable'):
+        runner.main()
+    assert len(commands) == 1
+    assert commands[0][1:3] == ['--host', 'unix:///var/run/docker.sock']
+    assert commands[0][-3:] == ['info', '--format', '{{.ServerVersion}}']
+    result = json.loads((evidence/'result.json').read_text())
+    assert result['packaging_smoke'] == 'blocked'
+    assert result['runtime_acceptance'] == 'unverified'
+    assert not (evidence/'source.tar').exists()
+    assert 'build' not in result
