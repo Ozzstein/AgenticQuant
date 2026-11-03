@@ -1,5 +1,54 @@
 # RD runtime offline packaging smoke
 
+## Actual offline container result — 2026-11-03
+
+Docker was restored by the operator and verified through the explicit local
+socket: Engine **29.9.2**, Linux. The corrected committed source
+`8d7681984a0cdc6325316964ebe989ec2f9d47a2` built and passed all three actual
+network-disabled probes:
+
+- Build: exit 0, 3.59 seconds using freshly rebuilt dependency layers.
+- Imports/source identity/eight upstream hashes/five templates: exit 0, 8.74 s.
+- Upstream CLI help: exit 0, 23.58 s.
+- Factor command help: exit 0, 23.24 s.
+- All exact owned containers report successful removal; no timeout occurred.
+
+Image: `sha256:8ba105804c336481a78836f8cfde36353559a447bcafef49c455404246a4b4e0`.
+Tag: `quantagentlab-rd:offline-8d7681984a0c-c165f21d2b5c`.
+The run used the committed archive, no host mounts/credentials/ports, network
+none, UID 10001, dropped capabilities and the existing CPU/memory/PID bounds.
+Command: `PYTHONPATH="$PWD" .venv/bin/python environments/rd-agent/run_smoke.py`.
+
+Two preceding failures were retained rather than counted as passes:
+
+1. Source `4adca72`, cached build: RD-Agent dist-info metadata files were zero
+   bytes. The source identity check failed. A no-cache rebuild of the same
+   archive restored readable metadata; why the earlier layer contained empty
+   files was not established. No pin/check was bypassed.
+2. Same source, no-cache build: exit 0 in 193.12 s, but the import probe found
+   copied source directories inaccessible to UID 10001. The archive was
+   extracted with private host permissions and Docker COPY retained those
+   permissions under root ownership. `8d76819` adds `chmod -R a+rX
+   /opt/quantagent` inside the image; host evidence remains private. Existing
+   focused tests, including the packaging requirement, passed **13 in 2.92s**.
+
+Persistent local evidence root:
+`/home/ozzstein/.local/share/quantagentlab/runtime-smoke/` (private directories).
+Subdirectories preserve original archives, build contexts, logs, container
+identity/cleanup receipts and result JSON:
+
+| Run | result.json SHA-256 |
+| --- | --- |
+| rd-runtime-smoke-o0ki6x8t (cached failure) | cf1642d9428278501d88597d4151651dc7b3f939d201c4414ce9ceb5b41c602c |
+| rd-clean-smoke-oqefhike (clean build/import failure) | db9fd15588cb27b589eccd990f1e50142187c6949cdfec9cf3a1df4edb40f96c |
+| rd-runtime-smoke-2jk5q00e (passed) | 3853a4da077ca49c2944f696814b3801b6beeb592904b54b421680a2de8c630c |
+
+This supersedes the earlier unavailable-Docker packaging blocker only. No
+native research job, authenticated gateway/model call, generated candidate,
+LEAN engine or trade was run. Full native workflow and income-source acceptance
+remain unverified. No host installation, dependency/lock changes or cache prune
+was performed.
+
 ## Cleanup review fixes — 2026-11-03
 
 Independent review of `c404b79` reproduced two P2 defects: a TERM-ignoring
