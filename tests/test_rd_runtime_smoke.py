@@ -99,3 +99,77 @@ def test_unavailable_docker_stops_before_archive_or_build(tmp_path, monkeypatch)
     assert result['runtime_acceptance'] == 'unverified'
     assert not (evidence/'source.tar').exists()
     assert 'build' not in result
+
+
+@pytest.mark.parametrize('parent_wait', [False, True])
+def test_descendant_cannot_outlive_leader_or_timeout(tmp_path, parent_wait):
+    import signal
+    import time
+
+    runner = load('run_smoke')
+    ready = tmp_path/'ready'
+    survived = tmp_path/'survived'
+    code = (
+        'import os, signal, time\n'
+        'pid = os.fork()\n'
+        'if pid == 0:\n'
+        '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        f'    open({str(ready)!r}, "w").write(str(os.getpid()))\n'
+        '    time.sleep(1)\n'
+        f'    open({str(survived)!r}, "w").write("survived")\n'
+        '    os._exit(0)\n'
+        f'while not os.path.exists({str(ready)!r}): time.sleep(.005)\n'
+        + ('time.sleep(30)\n' if parent_wait else 'os._exit(0)\n')
+    )
+    try:
+        result = runner.bounded([sys.executable, '-I', '-S', '-c', code],
+                                tmp_path/'child.log', {}, .4 if parent_wait else 3)
+        assert ready.exists()
+        assert result['timed_out'] is parent_wait
+        time.sleep(1.1)
+        assert not survived.exists()
+    finally:
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize('cleanup_failure', [None, 'inspect_timeout', 'wrong_owner', 'rm_failure'])
+def test_lost_create_ack_cleanup_retains_identity(tmp_path, monkeypatch, cleanup_failure):
+    import subprocess
+
+    runner = load('run_smoke')
+    status = {}
+    removals = []
+
+    def check_output(command, **kwargs):
+        if command[1] == 'create':
+            saved = json.loads((tmp_path/'probe-container.json').read_text())
+            assert saved['container_name'] == command[command.index('--name')+1]
+            assert saved['cleanup']['status'] == 'pending'
+            raise subprocess.TimeoutExpired(command, 30)
+        assert command[1] == 'inspect'
+        if cleanup_failure == 'inspect_timeout':
+            raise subprocess.TimeoutExpired(command, 15)
+        return json.dumps([{'Id': 'a'*64, 'Name': '/'+status['container_name'],
+                            'Config': {'Labels': {'org.quantagentlab.smoke-owner':
+                                'different' if cleanup_failure == 'wrong_owner' else status['owner']}}}]).encode()
+
+    def remove(command, **kwargs):
+        removals.append(command)
+        return subprocess.CompletedProcess(command, 1 if cleanup_failure == 'rm_failure' else 0)
+
+    monkeypatch.setattr(runner.subprocess, 'check_output', check_output)
+    monkeypatch.setattr(runner.subprocess, 'run', remove)
+    with pytest.raises(subprocess.TimeoutExpired) as error:
+        runner.run_container(['docker'], 'sha256:fixture', ['--help'], 'probe', tmp_path, {}, status)
+    assert error.value.timeout == 30  # Preserve primary create failure.
+    saved = json.loads((tmp_path/'probe-container.json').read_text())
+    assert saved == status
+    assert status['cleanup']['status'] == ('removed' if cleanup_failure is None else 'unresolved')
+    if cleanup_failure in ('inspect_timeout', 'wrong_owner'):
+        assert not removals
+    else:
+        assert removals == [['docker', 'rm', '--force', 'a'*64]]

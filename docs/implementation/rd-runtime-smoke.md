@@ -1,5 +1,31 @@
 # RD runtime offline packaging smoke
 
+## Cleanup review fixes — 2026-11-03
+
+Independent review of `c404b79` reproduced two P2 defects: a TERM-ignoring
+descendant survived when its group leader exited, and a lost Docker-create
+acknowledgement bypassed container cleanup. The runner now sends SIGKILL to the
+original process group in `finally`, independently of leader exit, before
+hashing its log. This also applies to normal and exceptional leader exits;
+processes that deliberately escape the session remain outside this guarantee.
+
+Each container now has a random name and ownership label recorded in a private
+per-probe JSON file **before** creation. Creation is inside cleanup protection.
+Cleanup inspects that name, requires the exact ownership label, then removes
+the returned original ID. Cleanup outcomes and recovered IDs are retained;
+unavailable inspection, ownership mismatch or failed removal remains explicitly
+unresolved. Cleanup does not replace the primary create/probe exception and
+unresolved cleanup cannot yield a passed smoke result. A daemon unavailable or
+still processing creation can require later operator inspection using the
+retained locator; the runner does not claim guaranteed removal in that case.
+
+Six new synthetic regressions cover leader success/timeout with an ignoring
+descendant, lost create ACK, cleanup inspection timeout, ownership mismatch and
+removal failure. Focused smoke tests: **13 passed in 2.80s**. Combined smoke,
+readiness, independent readiness review, IBKR scope and capture tests:
+**112 passed in 6.78s**, sockets disabled. Ruff and diff checks passed. No real
+Docker, private reports or providers were used for this fix verification.
+
 ## Coordinator integration — 2026-11-03
 
 Integrated the smoke assets with the IBKR query-scope diagnostic and runtime

@@ -19,6 +19,13 @@ ARCHIVE_PATHS = (
 )
 
 
+def _signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def bounded(command: list[str], log: Path, env: dict, seconds: int) -> dict:
     """Run a process group with a wall deadline and retain its exact command and log."""
     started = time.monotonic()
@@ -30,12 +37,17 @@ def bounded(command: list[str], log: Path, env: dict, seconds: int) -> dict:
             code = process.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
+            _signal_group(process.pid, signal.SIGTERM)
             try:
                 code = process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                _signal_group(process.pid, signal.SIGKILL)
                 code = process.wait()
+        finally:
+            # The leader can exit while descendants ignore TERM or hold the log.
+            # Also cover successful leader exits and exceptional waits.
+            _signal_group(process.pid, signal.SIGKILL)
+            process.wait()
     return dict(command=command, exit_code=code, timed_out=timed_out,
                 seconds=round(time.monotonic()-started, 2),
                 log_sha256=hashlib.sha256(log.read_bytes()).hexdigest())
@@ -58,6 +70,56 @@ def main() -> None:
         _main()
     finally:
         os.umask(previous_umask)
+
+
+def run_container(docker: list[str], image: str, probe: list[str], name: str,
+                  evidence: Path, env: dict, status: dict) -> None:
+    """Retain ownership before create, including lost create acknowledgements."""
+    owner = uuid.uuid4().hex
+    container_name = f'qal-rd-smoke-{owner}'
+    label = 'org.quantagentlab.smoke-owner'
+    status.update(container_name=container_name, owner=owner, cleanup={'status': 'pending'})
+    # Durable recovery locator exists before the daemon may create the container.
+    identity_path = evidence/f'{name}-container.json'
+    identity_path.write_text(json.dumps(status, sort_keys=True)+'\n')
+    failed = False
+    try:
+        command = container_command(image, probe)
+        command[1:1] = ['--name', container_name, '--label', f'{label}={owner}']
+        container = subprocess.check_output(docker + command, env=env, text=True,
+                                            timeout=30).strip()
+        status['container_id'] = container
+        status.update(bounded(docker + ['start', '--attach', container],
+                              evidence/f'{name}.log', env, 120))
+        subprocess.run(docker + ['kill', container], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15, check=False)
+        inspection = json.loads(subprocess.check_output(
+            docker + ['inspect', container], env=env, timeout=15))[0]
+        status.update(state=inspection['State'], host_config=inspection['HostConfig'],
+                      mounts=inspection['Mounts'], user=inspection['Config']['User'])
+        if status['timed_out'] or inspection['State']['ExitCode'] or status['exit_code']:
+            raise RuntimeError(f'{name} failed; inspect its log')
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            owned = json.loads(subprocess.check_output(
+                docker + ['inspect', container_name], env=env, timeout=15))[0]
+            if (owned['Name'] != '/'+container_name
+                    or owned['Config'].get('Labels', {}).get(label) != owner):
+                raise ValueError('container ownership mismatch')
+            status['container_id'] = owned['Id']
+            removal = subprocess.run(docker + ['rm', '--force', owned['Id']], env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     timeout=15, check=False)
+            status['cleanup'] = {'status': 'removed' if removal.returncode == 0 else 'unresolved',
+                                 'exit_code': removal.returncode}
+        except Exception as error:
+            status['cleanup'] = {'status': 'unresolved', 'error_type': type(error).__name__}
+        identity_path.write_text(json.dumps(status, sort_keys=True)+'\n')
+        if not failed and status['cleanup']['status'] != 'removed':
+            raise RuntimeError(f'{name} cleanup unresolved; inspect container evidence')
 
 
 def _main() -> None:
@@ -104,24 +166,8 @@ def _main() -> None:
                       factor_help=['-m', 'rdagent.app.cli', 'fin_factor', '--help'])
         result['probes'] = {}
         for name, probe in probes.items():
-            container = subprocess.check_output(docker + container_command(image, probe),
-                                                env=env, text=True, timeout=30).strip()
-            try:
-                status = bounded(docker + ['start', '--attach', container],
-                                 evidence/f'{name}.log', env, 120)
-                subprocess.run(docker + ['kill', container], env=env, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=15, check=False)
-                inspection = json.loads(subprocess.check_output(
-                    docker + ['inspect', container], env=env, timeout=15))[0]
-                status.update(container_id=container, state=inspection['State'],
-                              host_config=inspection['HostConfig'], mounts=inspection['Mounts'],
-                              user=inspection['Config']['User'])
-                result['probes'][name] = status
-                if status['timed_out'] or inspection['State']['ExitCode'] or status['exit_code']:
-                    raise RuntimeError(f'{name} failed; inspect its log')
-            finally:
-                subprocess.run(docker + ['rm', '--force', container], env=env, check=True,
-                               stdout=subprocess.DEVNULL, timeout=15)
+            result['probes'][name] = {}
+            run_container(docker, image, probe, name, evidence, env, result['probes'][name])
         result['packaging_smoke'] = 'passed'
     except Exception as error:
         result.setdefault('packaging_smoke', 'failed')
