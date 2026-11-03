@@ -1,5 +1,9 @@
 # Actual LEAN paper engine, 2026-11-03
 
+> Follow-up: the shutdown failure described below was subsequently resolved in
+> the locally patched pinned image. See [clean-exit verification](lean-shutdown-fix-2026-11-03.md).
+> This report preserves the original failing evidence.
+
 ## Result
 
 **Paper-order execution verified; complete runtime acceptance remains blocked.**

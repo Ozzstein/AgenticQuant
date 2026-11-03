@@ -1,0 +1,11 @@
+--- a/Common/Python/PythonInitializer.cs
++++ b/Common/Python/PythonInitializer.cs
+@@ -82,7 +82,7 @@
+ 
+                 try
+                 {
+-                    var pyLock = Py.GIL();
++                    // Runtime.Shutdown owns the GIL; do not leak an outer GILState.
+                     Log.Trace($"PythonInitializer.Shutdown(): calling engine shutdown...");
+                     PythonEngine.Shutdown();
+                 }

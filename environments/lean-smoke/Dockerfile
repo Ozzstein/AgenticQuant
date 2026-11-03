@@ -1,6 +1,8 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b AS compiler
 WORKDIR /source
 COPY . .
+RUN echo "ca4b5c7374c096309fb8b37f4ae3b29895f00b88b1e56e3db7bb95d489ca896c  Common/Python/PythonInitializer.cs" | sha256sum -c - \
+    && git apply --check qal-shutdown.patch && git apply qal-shutdown.patch
 RUN dotnet build Launcher/QuantConnect.Lean.Launcher.csproj -c Release --nologo -v minimal -p:RunAnalyzers=false -p:EnableNETAnalyzers=false
 FROM quantagentlab:smoke-a233bb5
 USER root

@@ -1,9 +1,9 @@
 # Actual LEAN paper-engine diagnostic
 
 This is a **synthetic offline runtime diagnostic**, not a trading strategy, broker
-connection, or release-acceptance certificate. The current pinned runtime fills
-and reconciles the paper order but exits 139 during Python shutdown. A minimal
-algorithm without project imports reproduces that failure.
+connection, or release-acceptance certificate. The patched pinned runtime fills and reconciles the paper order and exits
+cleanly. The unpatched runtime exited 139 during Python shutdown, also reproduced
+by a minimal algorithm without project imports. See the shutdown follow-up report.
 
 Pinned upstream source: QuantConnect/Lean
 `3b2bf19e597805cc917dd199ed9ee7d10d5ceb84`.
@@ -12,7 +12,10 @@ The Dockerfile is built with that public source checkout as its context. It uses
 our existing `quantagentlab:smoke-a233bb5` image for Python/project dependencies
 and the recorded .NET SDK digest. Preserve the base image ID in run evidence;
 the local tag is not a portable dependency lock. Copy `QalOfflineSmokeDataQueue.cs`
-into the checkout's `Engine/DataFeeds/Queues/` before building. It subclasses the
+into the checkout's `Engine/DataFeeds/Queues/` before building. Also copy
+`patches/shutdown-gil.patch` to `qal-shutdown.patch` at the checkout root. The
+Dockerfile verifies the exact original initializer SHA256 before applying this
+local patch; changed upstream source fails the build rather than silently adapting. It subclasses the
 upstream **test-only** FakeDataQueue at two data points per second per symbol.
 Prices use the upstream wall-clock synthetic generator; this is not a historical
 market-data replay. Keep `.git`, upstream tests and unnecessary market data out
@@ -53,3 +56,7 @@ original 100 ns ticks and rounds forward only at the Python microsecond boundary
 See `docs/implementation/lean-runtime-smoke-2026-11-03.md` for actual results and
 remaining acceptance gaps. No DAY/trailing/restart/native broker acceptance is
 inferred from this one GTC market order.
+
+Shutdown fix and clean-exit evidence: `docs/implementation/lean-shutdown-fix-2026-11-03.md`.
+`shutdown_control.py` provides the no-project/no-order control; substitute it for
+the generated fixture main.py with the same engine configuration.
