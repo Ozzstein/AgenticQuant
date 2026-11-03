@@ -148,3 +148,53 @@ restart to reject without resubmission or altered original ownership/reservation
 No live/native broker recovery, successful original pending-ticket recovery,
 process-kill crash injection, partial-fill restart or production readiness is
 established by this task.
+
+## Coordinator rerun after integrating the limit overload fix
+
+The lifecycle lane independently fixed the actual limit overload and verified
+cancellation twice. After integrating both lanes, the coordinator corrected the
+existing DAY mock signature and obtained 135 passing combined offline/retained-
+evidence cases. Root then performed a **new, separately bounded three-start run**
+with fresh production manifests and the integrated source (no image rebuild):
+
+`~/.local/share/quantagentlab/runtime-smoke/recovery-integrated-20261103-root/`
+
+- Origin: actual market fill, three idempotent completed-order retries, then a
+  genuinely Submitted pending limit ticket. Two original native orders and two
+  immutable ticket bindings exist. Engine exit0/cleanup0.
+- Completed-only fresh engine: three dispatch retries preserve the original one
+  fill, claim and ticket binding; no native order is submitted by the new engine.
+  Engine exit0/cleanup0. **This is not fully healthy recovery:** the operating
+  bridge reports `venue cash/holdings do not reconcile to durable accounting`.
+- Accepted-pending fresh engine: initialization refuses unresolved original
+  history, retaining both original bindings, claims, outbox state, fill, reports
+  and reservation. No new native order is submitted. Engine exit1 is the expected
+  fail-closed refusal; cleanup0. The pending outbox remains `new`, not the earlier
+  ambiguous/no-ticket scenario. No pending-ticket recovery success is claimed.
+
+Six read-only assertions pass against this new evidence directory. The reader
+also preserves support for the historical ambiguous-attempt evidence. The new
+completed-only test explicitly records its observed balance error; passing that
+test is a **negative-path observation**, not an endorsement of the error or a
+production-readiness gate.
+
+Concrete next integration issue: `restore_paper_state` runs in the algorithm's
+Initialize, while the pinned `BrokerageSetupHandler` fetches and applies the
+configured paper cash afterward. The actual completed-retry log sets USD back
+to `100000` after initialization, although the retained canonical ledger has
+already paid for its original fill. BTC quantity1 remains present. Thus this
+unchanged fixed-starting-cash paper configuration overwrites the restored cash
+and the existing reconciliation gate correctly blocks. Resolve the paper
+initialization/seed ordering contract with exact retained-ledger authority,
+then repeat completed-only restart; do not waive the balance check, invent a
+broker conversion, or claim that completed retry idempotency proves readiness.
+
+All three exact containers were removed; no timeout/OOM or provider interaction.
+The new directory retains original manifests, source map, SQLite backups, output,
+inspections and hashes. The earlier three delegated starts and their limitations
+remain recorded above rather than rewritten as successful accepted-ticket tests.
+
+Final combined validation after the evidence-reader extension: **136 passed in
+4.93s**, no skips, sockets disabled/Unix only. Ruff and diff checks passed.
+This count includes negative-path and retained-evidence assertions; it does not
+turn the observed restart balance failure into positive recovery acceptance.

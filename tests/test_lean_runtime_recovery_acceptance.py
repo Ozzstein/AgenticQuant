@@ -62,7 +62,8 @@ def test_completed_retry_has_no_duplicate_submission_or_fill(evidence):
 
 
 def test_pending_restart_retains_exact_original_ownership(evidence):
-    original = read(evidence / "origin", "timeout.json")
+    accepted = (evidence / "origin" / "pending-checkpoint.json").exists()
+    original = read(evidence / "origin", "pending-checkpoint.json" if accepted else "timeout.json")
     rejected = read(evidence / "pending-restart", "initialization-error.json")
     assert (
         rejected["error"]
@@ -70,13 +71,14 @@ def test_pending_restart_retains_exact_original_ownership(evidence):
     )
     restarted = rejected["snapshot"]
     assert restarted["runtime"]["runtime_id"] != original["runtime"]["runtime_id"]
-    assert len(original["native_orders"]) == 1
+    assert len(original["native_orders"]) == (2 if accepted else 1)
     assert restarted["native_orders"] == []
     assert len(original["attempts"]) == 2
     for key in ("bindings", "attempts", "fills", "outbox", "pending"):
         assert restarted[key] == original[key]
     pending = [row for row in original["outbox"] if row["intent"] == "recovery-pending"]
-    assert len(pending) == 1 and pending[0]["state"] == "ambiguous"
+    assert len(pending) == 1 and pending[0]["state"] == ("new" if accepted else "ambiguous")
+    assert len(original["bindings"]) == (2 if accepted else 1)
     assert original["pending"]
     assert not (evidence / "pending-restart" / "initialized.json").exists()
 
@@ -89,3 +91,25 @@ def test_fresh_readonly_ledger_preserves_original_receipts(evidence):
 
     for table in ("lean_ticket_bindings", "venue_outbox", "venue_reports", "fills"):
         assert rows("origin", table) == rows("pending-restart", table)
+
+
+def test_completed_only_restart_keeps_receipts_but_blocks_balance_mismatch(evidence):
+    """No resubmit is established; this observed balance error is NOT healthy recovery."""
+    run = evidence / "completed-retry"
+    if not run.exists():
+        pytest.skip("historical bounded run did not execute completed-only restart")
+    launch = read(run, "launch.json")
+    assert launch["attach_exit"] == launch["inspection"]["State"]["ExitCode"] == 0
+    assert launch["cleanup"]["exit"] == 0 and not launch.get("timed_out")
+    result = read(run, "retry-result.json")
+    original = read(evidence / "origin", "completed-checkpoint.json")
+    assert result["before"]["runtime"]["runtime_id"] != original["runtime"]["runtime_id"]
+    assert result["before"]["native_orders"] == result["after"]["native_orders"] == []
+    for key in ("bindings", "attempts", "fills", "outbox", "pending"):
+        assert result["before"][key] == original[key] == result["after"][key]
+    assert len(result["after"]["fills"]) == len(result["after"]["attempts"]) == 1
+    assert all(row["state"] == "filled" for row in result["retries"])
+    assert (
+        "venue cash/holdings do not reconcile to durable accounting"
+        in (run / "console.log").read_text()
+    )

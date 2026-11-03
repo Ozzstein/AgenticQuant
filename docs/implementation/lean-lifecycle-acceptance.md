@@ -167,3 +167,16 @@ execution, trailing, Binance references and signal bridge tests. Sockets were
 disabled, with only Unix sockets allowed. The earlier full selection's five DAY
 mock failures remain explicitly unresolved. Ruff lint/format and `git diff
 --check` also pass for owned Python files and the narrow runtime change.
+
+## Coordinator integration
+
+Integrated the actual cancellation checkpoint and recovery fixtures on master.
+Updated only the existing DAY fake `LimitOrder` signature to include the real
+asynchronous boolean and assert it is true. The combined nine-file suite passed
+**135 tests in 5.25s**, sockets disabled/Unix only, including all DAY cases and
+five assertions over the retained actual recovery evidence. This supersedes the
+five integration mock failures above, without changing their historical record.
+The coordinator independently re-read the final cancellation result, matched
+inspection image/container identity, and reopened its ledger: PASS/lean-paper,
+exit0/cleanup0. This is retained-evidence verification, not an additional engine
+run. Ruff and diff checks passed.

@@ -65,7 +65,8 @@ def port_fixture(instrument, now, close, *, brokerage="PaperBrokerage", zone="Am
     )
     ticket = NS(OrderId=1, Quantity=D(10), QuantityFilled=D(0), Status="Submitted", OrderEvents=[])
 
-    def submit(symbol, quantity, price, tag, props):
+    def submit(symbol, quantity, price, asynchronous, tag, props):
+        assert asynchronous is True
         properties.append(props)
         return ticket
 
