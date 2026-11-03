@@ -353,7 +353,12 @@ class LeanAlgorithmPort:
             ticket = self.algorithm.MarketOrder(symbol, quantity, True, client_id, properties)
         elif intent.order_type == "limit":
             ticket = self.algorithm.LimitOrder(
-                symbol, quantity, self._native_decimal(intent.limit_price), client_id, properties
+                symbol,
+                quantity,
+                self._native_decimal(intent.limit_price),
+                True,
+                client_id,
+                properties,
             )
         elif intent.order_type == "trailing_stop":
             percentage = intent.trail_percent is not None

@@ -1,0 +1,402 @@
+{
+  "scope": "synthetic offline actual LEAN paper cancellation",
+  "snapshots": {
+    "prepared": {
+      "state": {
+        "account": "paper:lean-offline-smoke",
+        "intent": "lifecycle-limit",
+        "venue": "lean",
+        "client_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "venue_id": null,
+        "state": "prepared",
+        "rules": "{\"schema_version\":\"1.0\",\"venue\":\"lean\",\"instrument\":{\"schema_version\":\"1.0\",\"instrument_id\":\"smoke:BTCUSD\",\"symbol\":\"BTC/USD\",\"asset_class\":\"crypto\",\"quote_currency\":\"USD\",\"venue\":null},\"symbol\":\"BTCUSD\",\"available_at\":\"2026-11-03T12:38:50.460411Z\",\"quantity_step\":\"1E-8\",\"price_tick\":\"0.01\",\"minimum_quantity\":\"1E-8\",\"minimum_notional\":\"1\",\"maximum_quantity\":null,\"order_types\":[\"market\",\"limit\"],\"time_in_force\":[\"GTC\"],\"market_type\":\"spot\",\"active\":true}",
+        "cumulative": "0",
+        "detail": null
+      },
+      "reserved": "101.891749146984376",
+      "remaining": "1",
+      "available_cash": "99898.108250853015624",
+      "ticket": null,
+      "capture": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:02.058924+00:00",
+        "account_currency": "USD",
+        "cash_book": {
+          "USD": "100000",
+          "BTC": "0"
+        },
+        "unsettled_cash": {
+          "USD": "0",
+          "BTC": "0"
+        },
+        "margin_remaining": "100000",
+        "quantities": {},
+        "marks": [
+          {
+            "instrument_id": "smoke:BTCUSD",
+            "price": "105.93633660433359480",
+            "as_of": "2026-11-03T13:09:02+00:00",
+            "data_type": "QuantConnect.Data.Market.QuoteBar",
+            "data": "BTCUSD: Bid: O: 95.65627 Bid: H: 95.84716 Bid: L: 95.65627 Bid: C: 95.84716 Ask: O: 105.7253 Ask: H: 105.9363 Ask: L: 105.7253 Ask: C: 105.9363 "
+          }
+        ],
+        "open_client_order_ids": [],
+        "open_orders": []
+      },
+      "fills": []
+    },
+    "resting": {
+      "state": {
+        "account": "paper:lean-offline-smoke",
+        "intent": "lifecycle-limit",
+        "venue": "lean",
+        "client_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "venue_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc:1",
+        "state": "new",
+        "rules": "{\"schema_version\":\"1.0\",\"venue\":\"lean\",\"instrument\":{\"schema_version\":\"1.0\",\"instrument_id\":\"smoke:BTCUSD\",\"symbol\":\"BTC/USD\",\"asset_class\":\"crypto\",\"quote_currency\":\"USD\",\"venue\":null},\"symbol\":\"BTCUSD\",\"available_at\":\"2026-11-03T12:38:50.460411Z\",\"quantity_step\":\"1E-8\",\"price_tick\":\"0.01\",\"minimum_quantity\":\"1E-8\",\"minimum_notional\":\"1\",\"maximum_quantity\":null,\"order_types\":[\"market\",\"limit\"],\"time_in_force\":[\"GTC\"],\"market_type\":\"spot\",\"active\":true}",
+        "cumulative": "0",
+        "detail": null
+      },
+      "reserved": "101.891749146984376",
+      "remaining": "1",
+      "available_cash": "99898.108250853015624",
+      "ticket": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:04.058483+00:00",
+        "ticket_id": 1,
+        "client_order_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "instrument_id": "smoke:BTCUSD",
+        "quantity": "1",
+        "filled_quantity": "0",
+        "status": "Submitted",
+        "order_type": "Limit",
+        "limit_price": "1.00",
+        "stop_price": null,
+        "broker_ids": [
+          "1"
+        ],
+        "events": [
+          {
+            "event_id": 1,
+            "ticket_id": 1,
+            "instrument_id": "smoke:BTCUSD",
+            "occurred_at": "2026-11-03T13:09:04.000366+00:00",
+            "status": "Submitted",
+            "fill_quantity": "0",
+            "fill_price": "0",
+            "price_currency": "USD",
+            "fee_amount": "0",
+            "fee_currency": "QCC",
+            "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+            "is_assignment": false,
+            "message": ""
+          }
+        ]
+      },
+      "capture": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:04.060534+00:00",
+        "account_currency": "USD",
+        "cash_book": {
+          "USD": "100000",
+          "BTC": "0"
+        },
+        "unsettled_cash": {
+          "USD": "0",
+          "BTC": "0"
+        },
+        "margin_remaining": "100000",
+        "quantities": {},
+        "marks": [
+          {
+            "instrument_id": "smoke:BTCUSD",
+            "price": "105.74252791308006885",
+            "as_of": "2026-11-03T13:09:04+00:00",
+            "data_type": "QuantConnect.Data.Market.QuoteBar",
+            "data": "BTCUSD: Bid: O: 95.6325 Bid: H: 95.71609 Bid: L: 95.6325 Bid: C: 95.67181 Ask: O: 105.6991 Ask: H: 105.7915 Ask: L: 105.6991 Ask: C: 105.7425 "
+          }
+        ],
+        "open_client_order_ids": [
+          "7ccd497a-72b6-5022-af17-addc956ce0ce"
+        ],
+        "open_orders": [
+          {
+            "client_order_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+            "ticket_id": 1,
+            "broker_ids": [
+              "1"
+            ]
+          }
+        ]
+      },
+      "fills": []
+    },
+    "before_cancel": {
+      "state": {
+        "account": "paper:lean-offline-smoke",
+        "intent": "lifecycle-limit",
+        "venue": "lean",
+        "client_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "venue_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc:1",
+        "state": "new",
+        "rules": "{\"schema_version\":\"1.0\",\"venue\":\"lean\",\"instrument\":{\"schema_version\":\"1.0\",\"instrument_id\":\"smoke:BTCUSD\",\"symbol\":\"BTC/USD\",\"asset_class\":\"crypto\",\"quote_currency\":\"USD\",\"venue\":null},\"symbol\":\"BTCUSD\",\"available_at\":\"2026-11-03T12:38:50.460411Z\",\"quantity_step\":\"1E-8\",\"price_tick\":\"0.01\",\"minimum_quantity\":\"1E-8\",\"minimum_notional\":\"1\",\"maximum_quantity\":null,\"order_types\":[\"market\",\"limit\"],\"time_in_force\":[\"GTC\"],\"market_type\":\"spot\",\"active\":true}",
+        "cumulative": "0",
+        "detail": null
+      },
+      "reserved": "101.891749146984376",
+      "remaining": "1",
+      "available_cash": "99898.108250853015624",
+      "ticket": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:07.021210+00:00",
+        "ticket_id": 1,
+        "client_order_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "instrument_id": "smoke:BTCUSD",
+        "quantity": "1",
+        "filled_quantity": "0",
+        "status": "Submitted",
+        "order_type": "Limit",
+        "limit_price": "1.00",
+        "stop_price": null,
+        "broker_ids": [
+          "1"
+        ],
+        "events": [
+          {
+            "event_id": 1,
+            "ticket_id": 1,
+            "instrument_id": "smoke:BTCUSD",
+            "occurred_at": "2026-11-03T13:09:04.000366+00:00",
+            "status": "Submitted",
+            "fill_quantity": "0",
+            "fill_price": "0",
+            "price_currency": "USD",
+            "fee_amount": "0",
+            "fee_currency": "QCC",
+            "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+            "is_assignment": false,
+            "message": ""
+          }
+        ]
+      },
+      "capture": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:07.021485+00:00",
+        "account_currency": "USD",
+        "cash_book": {
+          "USD": "100000",
+          "BTC": "0"
+        },
+        "unsettled_cash": {
+          "USD": "0",
+          "BTC": "0"
+        },
+        "margin_remaining": "100000",
+        "quantities": {},
+        "marks": [
+          {
+            "instrument_id": "smoke:BTCUSD",
+            "price": "105.88102707598735620",
+            "as_of": "2026-11-03T13:09:06+00:00",
+            "data_type": "QuantConnect.Data.Market.QuoteBar",
+            "data": "BTCUSD: Bid: O: 95.71661 Bid: H: 95.84865 Bid: L: 95.71661 Bid: C: 95.79712 Ask: O: 105.792 Ask: H: 105.938 Ask: L: 105.792 Ask: C: 105.881 "
+          }
+        ],
+        "open_client_order_ids": [
+          "7ccd497a-72b6-5022-af17-addc956ce0ce"
+        ],
+        "open_orders": [
+          {
+            "client_order_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+            "ticket_id": 1,
+            "broker_ids": [
+              "1"
+            ]
+          }
+        ]
+      },
+      "fills": []
+    },
+    "cancelled": {
+      "state": {
+        "account": "paper:lean-offline-smoke",
+        "intent": "lifecycle-limit",
+        "venue": "lean",
+        "client_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "venue_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc:1",
+        "state": "cancelled",
+        "rules": "{\"schema_version\":\"1.0\",\"venue\":\"lean\",\"instrument\":{\"schema_version\":\"1.0\",\"instrument_id\":\"smoke:BTCUSD\",\"symbol\":\"BTC/USD\",\"asset_class\":\"crypto\",\"quote_currency\":\"USD\",\"venue\":null},\"symbol\":\"BTCUSD\",\"available_at\":\"2026-11-03T12:38:50.460411Z\",\"quantity_step\":\"1E-8\",\"price_tick\":\"0.01\",\"minimum_quantity\":\"1E-8\",\"minimum_notional\":\"1\",\"maximum_quantity\":null,\"order_types\":[\"market\",\"limit\"],\"time_in_force\":[\"GTC\"],\"market_type\":\"spot\",\"active\":true}",
+        "cumulative": "0",
+        "detail": null
+      },
+      "reserved": "0",
+      "remaining": "1",
+      "available_cash": "100000",
+      "ticket": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:08.021484+00:00",
+        "ticket_id": 1,
+        "client_order_id": "7ccd497a-72b6-5022-af17-addc956ce0ce",
+        "instrument_id": "smoke:BTCUSD",
+        "quantity": "1",
+        "filled_quantity": "0",
+        "status": "Canceled",
+        "order_type": "Limit",
+        "limit_price": "1.00",
+        "stop_price": null,
+        "broker_ids": [
+          "1"
+        ],
+        "events": [
+          {
+            "event_id": 1,
+            "ticket_id": 1,
+            "instrument_id": "smoke:BTCUSD",
+            "occurred_at": "2026-11-03T13:09:04.000366+00:00",
+            "status": "Submitted",
+            "fill_quantity": "0",
+            "fill_price": "0",
+            "price_currency": "USD",
+            "fee_amount": "0",
+            "fee_currency": "QCC",
+            "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+            "is_assignment": false,
+            "message": ""
+          },
+          {
+            "event_id": 2,
+            "ticket_id": 1,
+            "instrument_id": "smoke:BTCUSD",
+            "occurred_at": "2026-11-03T13:09:07.001223+00:00",
+            "status": "CancelPending",
+            "fill_quantity": "0",
+            "fill_price": "0",
+            "price_currency": "USD",
+            "fee_amount": "0",
+            "fee_currency": "QCC",
+            "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+            "is_assignment": false,
+            "message": ""
+          },
+          {
+            "event_id": 3,
+            "ticket_id": 1,
+            "instrument_id": "smoke:BTCUSD",
+            "occurred_at": "2026-11-03T13:09:07.001223+00:00",
+            "status": "Canceled",
+            "fill_quantity": "0",
+            "fill_price": "0",
+            "price_currency": "USD",
+            "fee_amount": "0",
+            "fee_currency": "QCC",
+            "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+            "is_assignment": false,
+            "message": ""
+          }
+        ]
+      },
+      "capture": {
+        "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+        "observed_at": "2026-11-03T13:09:08.021761+00:00",
+        "account_currency": "USD",
+        "cash_book": {
+          "USD": "100000",
+          "BTC": "0"
+        },
+        "unsettled_cash": {
+          "USD": "0",
+          "BTC": "0"
+        },
+        "margin_remaining": "100000",
+        "quantities": {},
+        "marks": [
+          {
+            "instrument_id": "smoke:BTCUSD",
+            "price": "106.03200879362800590",
+            "as_of": "2026-11-03T13:09:08+00:00",
+            "data_type": "QuantConnect.Data.Market.QuoteBar",
+            "data": "BTCUSD: Bid: O: 95.79712 Bid: H: 95.93873 Bid: L: 95.79712 Bid: C: 95.93372 Ask: O: 105.881 Ask: H: 106.0375 Ask: L: 105.881 Ask: C: 106.032 "
+          }
+        ],
+        "open_client_order_ids": [],
+        "open_orders": []
+      },
+      "fills": []
+    }
+  },
+  "events": [
+    {
+      "event_id": 1,
+      "ticket_id": 1,
+      "instrument_id": "smoke:BTCUSD",
+      "occurred_at": "2026-11-03T13:09:04.000366+00:00",
+      "status": "Submitted",
+      "fill_quantity": "0",
+      "fill_price": "0",
+      "price_currency": "USD",
+      "fee_amount": "0",
+      "fee_currency": "QCC",
+      "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+      "is_assignment": false,
+      "message": ""
+    },
+    {
+      "event_id": 2,
+      "ticket_id": 1,
+      "instrument_id": "smoke:BTCUSD",
+      "occurred_at": "2026-11-03T13:09:07.001223+00:00",
+      "status": "CancelPending",
+      "fill_quantity": "0",
+      "fill_price": "0",
+      "price_currency": "USD",
+      "fee_amount": "0",
+      "fee_currency": "QCC",
+      "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+      "is_assignment": false,
+      "message": ""
+    },
+    {
+      "event_id": 3,
+      "ticket_id": 1,
+      "instrument_id": "smoke:BTCUSD",
+      "occurred_at": "2026-11-03T13:09:07.001223+00:00",
+      "status": "Canceled",
+      "fill_quantity": "0",
+      "fill_price": "0",
+      "price_currency": "USD",
+      "fee_amount": "0",
+      "fee_currency": "QCC",
+      "fee_type": "QuantConnect.Orders.Fees.OrderFee",
+      "is_assignment": false,
+      "message": ""
+    }
+  ],
+  "audit": {
+    "schema_version": "1.0",
+    "implementation": "execution-compliance-1",
+    "account_id": "paper:lean-offline-smoke",
+    "account_spec_hash": "4d6c4134451341ca8635ca585b7ba053aac39823b4ea8da648ce6e5956c34b90",
+    "execution_binding_hash": "cc748a825e90a27b833513ea615b18bcfe6ee9404a6932826114855cea79cc99",
+    "authority_prefix_hash": "271cceab56d9ec4e429d1b1cf0907846a469be916507c0ba3e3821a6bbd36e84",
+    "lineage": "lean-paper",
+    "status": "PASS",
+    "violations": [],
+    "unresolved_sources": [],
+    "blocking_codes": []
+  },
+  "reconciliation": {
+    "reconciled": true,
+    "cash": "100000",
+    "realized_pnl": "0",
+    "fees": "0",
+    "positions": 0
+  },
+  "runtime": {
+    "runtime_id": "8c855186-1ffd-4d57-aefc-cd5d0de490cc",
+    "deployment_hash": "fbdf4e1744b09ec24a6a54cb270ef0c01a1901c04c1366b5c187d1df4af5c746",
+    "live_mode": true,
+    "engine_version": "2.5.0.0",
+    "algorithm_id": ""
+  },
+  "fill_model": "QuantConnect.Orders.Fills.ImmediateFillModel"
+}
