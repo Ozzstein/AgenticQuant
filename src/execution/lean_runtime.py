@@ -11,9 +11,20 @@ from threading import RLock
 
 from src.domain.portfolio import PriceMark, exact_decimal_product
 from src.execution.ccxt_transport import decimal
+from src.execution.lean_decimal import NativeClockReader, NativeDecimalReader, decimal_bits
 from src.execution.lean_venue import require_trailing_support
 from src.execution.ledger import LedgerError
 from src.execution.risk_controls import evaluate_order
+
+
+def enum_name(value):
+    """Preserve .NET names; Python's enum display can use uppercase aliases."""
+    if isinstance(value, str):
+        return value
+    name = value.ToString()
+    if not isinstance(name, str) or not name:
+        raise LedgerError("LEAN enum lacks an exact native name")
+    return name
 
 
 def utc_datetime(value):
@@ -45,7 +56,7 @@ class LeanAlgorithmPort:
                 DayTimeInForce,
                 GoodTilCanceledTimeInForce,
             )
-            from System import DateTime, Decimal
+            from System import Byte, DateTime, Decimal
             from System.Globalization import CultureInfo
         except ImportError as exc:
             raise LedgerError("actual QuantConnect LEAN/.NET runtime is unavailable") from exc
@@ -71,6 +82,9 @@ class LeanAlgorithmPort:
             DayTimeInForce,
         )
         self._extensions = Extensions
+        self._clock_reader = NativeClockReader()
+        self._byte = Byte
+        self._decimal_reader = NativeDecimalReader()
         self.runtime_id = str(uuid.uuid4())
         self._identity = {
             "runtime_id": self.runtime_id,
@@ -88,7 +102,7 @@ class LeanAlgorithmPort:
             raise LedgerError("canonical mappings collapse onto one LEAN security")
         for item in deployment.instruments:
             security = algorithm.Securities[symbols[item.instrument.instrument_id]]
-            if str(security.QuoteCurrency.Symbol) != item.instrument.quote_currency or str(
+            if str(security.QuoteCurrency.Symbol) != item.instrument.quote_currency or enum_name(
                 security.Symbol.SecurityType
             ) != ("Crypto" if item.instrument.asset_class == "crypto" else "Equity"):
                 raise LedgerError("actual LEAN security/quote identity differs")
@@ -132,7 +146,13 @@ class LeanAlgorithmPort:
         return dict(self._identity)
 
     def now(self):
-        return utc_datetime(self._datetime.UtcNow)
+        return self._clock()
+
+    def _clock(self, source=None, path=None, zone=None):
+        from datetime import timedelta
+
+        ticks = self._clock_reader.read(source, path, zone)
+        return datetime(1, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=(ticks + 9) // 10)
 
     def _number(self, value):
         # C# decimals use invariant text; accepting a Python float here would
@@ -141,9 +161,13 @@ class LeanAlgorithmPort:
             raise LedgerError("LEAN monetary boundary must be actual decimal")
         return decimal(value.ToString(self._culture) if hasattr(value, "ToString") else value)
 
+    def _money(self, source, path):
+        return self._decimal_reader.read(source, path)
+
     def _native_decimal(self, value):
         original = decimal(value)
-        native = self._decimal.Parse(format(original, "f"), self._culture)
+        low, mid, high, sign, scale = decimal_bits(original)
+        native = self._decimal(low, mid, high, sign, self._byte(scale))
         if self._number(native) != original:
             raise LedgerError("quantity/price is not exactly representable by LEAN System.Decimal")
         return native
@@ -210,10 +234,10 @@ class LeanAlgorithmPort:
         data = security.GetLastData()
         if data is None:
             raise LedgerError("LEAN security has no actual observed price data")
-        at = utc_datetime(self._extensions.ConvertToUtc(data.EndTime, security.Exchange.TimeZone))
+        at = self._clock(data, "EndTime", security.Exchange.TimeZone)
         return {
             "instrument_id": key,
-            "price": str(self._number(data.Value)),
+            "price": str(self._money(data, "Value")),
             "as_of": at.isoformat(),
             "data_type": str(data.GetType().FullName),
             "data": str(data.ToString()),
@@ -221,13 +245,14 @@ class LeanAlgorithmPort:
 
     def capture(self):
         now, portfolio = self.now(), self.algorithm.Portfolio
-        cash = {str(row.Key): str(self._number(row.Value.Amount)) for row in portfolio.CashBook}
+        cash = {str(row.Key): str(self._money(row.Value, "Amount")) for row in portfolio.CashBook}
         unsettled = {
-            str(row.Key): str(self._number(row.Value.Amount)) for row in portfolio.UnsettledCashBook
+            str(row.Key): str(self._money(row.Value, "Amount"))
+            for row in portfolio.UnsettledCashBook
         }
         quantities, marks = {}, []
         for row in portfolio:
-            quantity = self._number(row.Value.Quantity)
+            quantity = self._money(row.Value, "Quantity")
             if quantity:
                 quantities[self._instrument(row.Key)] = str(quantity)
         for key in self.symbols:
@@ -245,10 +270,10 @@ class LeanAlgorithmPort:
         return {
             "runtime_id": self.runtime_id,
             "observed_at": now.isoformat(),
-            "account_currency": str(portfolio.AccountCurrency),
+            "account_currency": str(portfolio.CashBook.AccountCurrency),
             "cash_book": cash,
             "unsettled_cash": unsettled,
-            "margin_remaining": str(self._number(portfolio.MarginRemaining)),
+            "margin_remaining": str(self._money(portfolio, "MarginRemaining")),
             "quantities": quantities,
             "marks": marks,
             "open_client_order_ids": [order["client_order_id"] for order in opened],
@@ -260,13 +285,13 @@ class LeanAlgorithmPort:
         security = self.algorithm.Securities[self.symbols[key]]
         hours = security.Exchange.Hours
         local = self._extensions.ConvertFromUtc(submitted_utc, hours.TimeZone)
-        if str(security.Symbol.SecurityType) == "Crypto":
+        if enum_name(security.Symbol.SecurityType) == "Crypto":
             # LEAN's crypto DAY implementation is a calendar-day boundary.
             # Only its documented UTC calendar is supported here.
             if str(hours.TimeZone.Id) != "UTC":
                 raise LedgerError("LEAN crypto DAY requires the actual UTC calendar")
             close = local.Date.AddDays(1)
-        elif str(security.Symbol.SecurityType) == "Equity":
+        elif enum_name(security.Symbol.SecurityType) == "Equity":
             close = hours.GetLastDailyMarketClose(local, False)
         else:
             raise LedgerError("LEAN DAY security calendar is unsupported")
@@ -404,12 +429,12 @@ class LeanAlgorithmPort:
             "event_id": int(event.Id),
             "ticket_id": int(event.OrderId),
             "instrument_id": self._instrument(event.Symbol),
-            "occurred_at": utc_datetime(event.UtcTime).isoformat(),
-            "status": str(event.Status),
-            "fill_quantity": str(self._number(event.FillQuantity)),
-            "fill_price": str(self._number(event.FillPrice)),
+            "occurred_at": self._clock(event, "UtcTime").isoformat(),
+            "status": enum_name(event.Status),
+            "fill_quantity": str(self._money(event, "FillQuantity")),
+            "fill_price": str(self._money(event, "FillPrice")),
             "price_currency": str(event.FillPriceCurrency or ""),
-            "fee_amount": str(self._number(event.OrderFee.Value.Amount)),
+            "fee_amount": str(self._money(event, "OrderFee.Value.Amount")),
             "fee_currency": str(event.OrderFee.Value.Currency or ""),
             "fee_type": str(event.OrderFee.GetType().FullName),
             "is_assignment": bool(event.IsAssignment),
@@ -443,23 +468,23 @@ class LeanAlgorithmPort:
             "ticket_id": int(ticket.OrderId),
             "client_order_id": str(order.Tag),
             "instrument_id": self._instrument(order.Symbol),
-            "quantity": str(self._number(ticket.Quantity)),
-            "filled_quantity": str(self._number(ticket.QuantityFilled)),
-            "status": str(ticket.Status),
-            "order_type": str(order.Type),
+            "quantity": str(self._money(ticket, "Quantity")),
+            "filled_quantity": str(self._money(ticket, "QuantityFilled")),
+            "status": enum_name(ticket.Status),
+            "order_type": enum_name(order.Type),
             **expiry,
-            "limit_price": str(self._number(order.LimitPrice))
-            if str(order.Type) == "Limit"
+            "limit_price": str(self._money(order, "LimitPrice"))
+            if enum_name(order.Type) == "Limit"
             else None,
-            "stop_price": str(self._number(order.StopPrice))
-            if str(order.Type) in ("StopMarket", "TrailingStop")
+            "stop_price": str(self._money(order, "StopPrice"))
+            if enum_name(order.Type) in ("StopMarket", "TrailingStop")
             else None,
             **(
                 {
-                    "trailing_amount": str(self._number(order.TrailingAmount)),
+                    "trailing_amount": str(self._money(order, "TrailingAmount")),
                     "trailing_as_percentage": bool(order.TrailingAsPercentage),
                 }
-                if str(order.Type) == "TrailingStop"
+                if enum_name(order.Type) == "TrailingStop"
                 else {}
             ),
             "broker_ids": tuple(str(value) for value in order.BrokerId),

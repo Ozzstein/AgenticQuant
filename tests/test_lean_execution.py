@@ -536,7 +536,8 @@ def test_native_decimal_refuses_loss_and_cancel_keeps_original_tag():
     calls = []
     port = object.__new__(LeanAlgorithmPort)
     port._culture = None
-    port._decimal = SimpleNamespace(Parse=lambda text, culture: D(text).quantize(D(".01")))
+    port._decimal = lambda *bits: D(".12")
+    port._byte = int
     with pytest.raises(LedgerError, match="not exactly representable"):
         port._native_decimal(D(".123"))
     port.algorithm = SimpleNamespace(

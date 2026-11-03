@@ -36,7 +36,7 @@ class AIQuantStackAlgorithm(QCAlgorithm):
         allow_live = (
             os.environ.get("QAL_AUTHORIZE_LIVE_EXECUTION") == config.deployment.deployment_id
         )
-        self.port = LeanAlgorithmPort(self, config.deployment, symbols, allow_live=allow_live)
+        self._qal_port = LeanAlgorithmPort(self, config.deployment, symbols, allow_live=allow_live)
         evidence_store = None
         if config.evidence_store_path is not None:
             from src.data.evidence.store import EvidenceStore
@@ -44,12 +44,12 @@ class AIQuantStackAlgorithm(QCAlgorithm):
             if not Path(config.evidence_store_path).is_file():
                 raise ValueError("configured actual EvidenceStore does not exist")
             evidence_store = EvidenceStore(config.evidence_store_path)
-        self.execution = create_typed_lean_execution(
+        self._qal_execution = create_typed_lean_execution(
             ledger_path=config.ledger_path,
             account=config.account,
             deployment=config.deployment,
             rules=config.rules,
-            runtime=self.port,
+            runtime=self._qal_port,
             evidence_store=evidence_store,
             fill_policy=config.fill_policy,
             risk_policy=config.risk_policy,
@@ -59,7 +59,7 @@ class AIQuantStackAlgorithm(QCAlgorithm):
             self._attach_native_reader(config)
         if config.account.mode == "paper":
             self._restore_paper_state(config)
-        self.bridge = LeanOperatingBridge(self.execution)
+        self._qal_bridge = LeanOperatingBridge(self._qal_execution)
 
     def _attach_native_reader(self, config):
         from src.execution.alpaca_venue import AlpacaVenue
@@ -87,19 +87,19 @@ class AIQuantStackAlgorithm(QCAlgorithm):
         }
         if native is not AlpacaVenue:
             kwargs["markets"] = config.native_markets
-        self.execution.adapters["lean"].native_reader = native(
-            self.execution.ledger, config.account.account_id, **kwargs
+        self._qal_execution.adapters["lean"].native_reader = native(
+            self._qal_execution.ledger, config.account.account_id, **kwargs
         )
 
     def _restore_paper_state(self, config):
-        self.execution.adapters["lean"]._record(
+        self._qal_execution.adapters["lean"]._record(
             "paper-restore",
-            self.port.restore_paper_state(self.execution.ledger),
+            self._qal_port.restore_paper_state(self._qal_execution.ledger),
         )
 
     def OnData(self, data):
-        if hasattr(self, "bridge") and not self.IsWarmingUp:
-            result = self.bridge.step()
+        if hasattr(self, "_qal_bridge") and not self.IsWarmingUp:
+            result = self._qal_bridge.step()
             if result["status"] == "blocked" and result["error"] != getattr(
                 self, "_last_block", None
             ):
@@ -107,12 +107,12 @@ class AIQuantStackAlgorithm(QCAlgorithm):
             self._last_block = result["error"]
 
     def OnOrderEvent(self, event):
-        if hasattr(self, "bridge"):
-            self.bridge.on_order_event(event)
+        if hasattr(self, "_qal_bridge"):
+            self._qal_bridge.on_order_event(event)
 
     def OnEndOfAlgorithm(self):
-        if hasattr(self, "execution"):
-            reader = self.execution.adapters["lean"].native_reader
+        if hasattr(self, "_qal_execution"):
+            reader = self._qal_execution.adapters["lean"].native_reader
             if reader is not None:
                 reader.close()
-            self.execution.ledger.close()
+            self._qal_execution.ledger.close()

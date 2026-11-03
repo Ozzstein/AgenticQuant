@@ -89,6 +89,7 @@ def port_fixture(instrument, now, close, *, brokerage="PaperBrokerage", zone="Am
         lambda: native_kind("GoodTilCanceledTimeInForce"),
         lambda: native_kind("DayTimeInForce"),
     )
+    port._money = lambda source, name: D(getattr(source, name))
     port._native_decimal, port._number = D, D
     port._instrument, port.now, port.runtime_id = (
         lambda symbol: instrument.instrument_id,

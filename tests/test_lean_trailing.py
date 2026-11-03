@@ -150,6 +150,7 @@ def test_actual_port_overload_and_native_ticket_fields(side, field, value, expec
     port.algorithm = NS(
         TrailingStopOrder=submit, Transactions=NS(GetOrderById=lambda identity: native_order)
     )
+    port._money = lambda source, name: D(getattr(source, name))
     port._native_decimal, port._number, port._properties, port._gtc = D, D, NS, lambda: "gtc"
     port._instrument, port.now, port.runtime_id = (
         lambda symbol: A.instrument_id,
