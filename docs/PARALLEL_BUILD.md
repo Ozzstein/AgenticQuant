@@ -2,7 +2,9 @@
 
 Started: 2026-10-27. Coordinator thread: `67e24814-0156-42fb-8442-ebe1563b1d38`.
 
-Active isolated worktrees (base checkpoint `6844b89`):
+Historical initial lane snapshot (base checkpoint `6844b89`); this is not a current branch inventory. Current group/subgroup progress is maintained in the [evidence register](BUILD_REQUIREMENTS.md).
+
+Initial isolated worktrees:
 
 | Thread | Branch | Stable deliveries integrated by coordinator |
 |---|---|---|

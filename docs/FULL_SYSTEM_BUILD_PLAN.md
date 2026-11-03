@@ -8,6 +8,35 @@ Accepted integration selection: [MCP integration decision](MCP_INTEGRATION_DECIS
 
 Accepted decision-model direction: [Jev integration decision](JEV_INTEGRATION_DECISION.md). Implement a shared typed decision service for the agreed classification, evidence-checking, retrieval/debate support, and text-feature workflows. Existing subtask replacements and trading influence require measured acceptance evidence; qualitative macro labeling is conditional. The full agent desk and quantitative/execution capabilities remain required.
 
+## Current progress — 2026-11-03
+
+This document defines **what must be delivered**. The
+[implementation evidence register](BUILD_REQUIREMENTS.md) records **what is
+implemented, tested and still outstanding**, by group and subgroup. Its current
+checkpoint is integrated code `4d898ed`; this documentation reconciliation adds
+no new runtime acceptance. The original scope and release thresholds below are
+unchanged. Dated implementation reports are historical evidence, not competing
+roadmaps.
+
+| Group | Current position | Detailed progress and remaining work |
+|---|---|---|
+| A — Foundations | Partial; actual project Docker smoke verified | [A: environments, contracts, MCP, CLI, packaging](BUILD_REQUIREMENTS.md#a-foundations) |
+| B — Data | Partial; sufficient income authority still missing | [B: sources and B7 income evidence checklist](BUILD_REQUIREMENTS.md#b-data-and-source-authority) |
+| C — Quantitative core | Local paths tested; ensemble consumer integration and statistical acceptance open | [C: models, replay, walk-forward and validation](BUILD_REQUIREMENTS.md#c-quantitative-core-and-validation) |
+| D — Regimes/strategies | Local implementations tested; full source/prospective acceptance open | [D: HMM, strategies, selectors and sleeves](BUILD_REQUIREMENTS.md#d-regimes-strategies-and-allocation) |
+| E — Agent desk | Local authority/budget/action tests; measured provider quality open | [E: desk, veto, history and cost](BUILD_REQUIREMENTS.md#e-agent-desk) |
+| F — Execution | Selected actual LEAN paper scenarios verified; broader acceptance and features open | [F: venues, settlement/groups and F5 runtime matrix](BUILD_REQUIREMENTS.md#f-risk-accounting-and-execution) |
+| G — Research | Local registry/evaluation paths and RD offline container smoke; actual research jobs open | [G: custom research and each native RD workflow](BUILD_REQUIREMENTS.md#g-research-and-rd-agent) |
+| H — Operations | Local cycle/scheduler/interface paths; fresh complete cycle blocked | [H: cycle, scheduling, monitoring and deployment](BUILD_REQUIREMENTS.md#h-operating-cycle-and-operator-interface) |
+| I — Release | Not accepted | [I: full audit, external and prospective release checklist](BUILD_REQUIREMENTS.md#i-system-acceptance-and-release) |
+| J — Jev supplement | Shared service implemented locally; measured integrations incomplete | [J: individual accepted J1–J7 requirements](BUILD_REQUIREMENTS.md#j-jev-decision-service-cross-cutting) |
+
+No entire group is complete. Checked milestones in the register apply only to
+the named scenario; synthetic paper execution does not establish authenticated
+broker acceptance or strategy performance. Maintain the register as checkpoints
+land, preserving source pins and distinguishing implementation, offline tests,
+actual runtime tests and prospective release evidence.
+
 ## Verdict and completion contract
 
 Build the complete system on this repository. Retain useful components and replace implementations that cannot meet the specification. This is a substantial engineering project involving statistical correctness, data engineering, orchestration, execution, research automation, and operations.
@@ -257,4 +286,19 @@ The full brief uses Streamlit and a single operator. A different frontend, multi
 
 ## Next implementation action
 
-Create the requirement-to-evidence register and shared domain contracts, then repair the reproduced accounting/risk failures and establish real data-to-ledger integration as the foundation for all required workstreams. Carry implementation through A–I under this fixed completion contract.
+The register and shared contracts now exist. Continue from the
+[current ordered action list](BUILD_REQUIREMENTS.md#current-next-actions-sequence-not-replacement-scope):
+
+1. Correct and test the LEAN stop-market overload, then exercise actual DAY,
+   trailing, nonzero-fee and partial-fill scenarios with honest simulation limits.
+2. In parallel when evidence is available, establish IBKR income coverage and
+   payment/deduction linkage; preserve the source gate until sufficient authority exists.
+3. Run bounded native RD research with configured provider/model access and
+   explicit spending limits; offline help/import smoke is already verified.
+4. Complete separately reviewed ensemble consumer integration, discrepancy
+   settlement and bracket/OCO ownership.
+5. Carry every remaining A–I and accepted J requirement through source-complete
+   integration, external acceptance and the unchanged prospective release gates.
+
+This ordering is a dependency-based work queue, not a replacement or reduction
+of the full plan. The register contains subgroup IDs, evidence and open items.

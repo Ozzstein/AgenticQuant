@@ -135,9 +135,17 @@ pipeline and label-only backtest routes do not authorize execution.
 
 [Deployment instructions](docs/DEPLOYMENT.md) describe the application image,
 shared durable volumes, separate scheduler processes, recovery and native runtime
-requirements. Compose binds the dashboard only to host loopback. Docker Desktop
-WSL integration and the LEAN runtime are unavailable in the current verification
-environment; image/runtime acceptance is outstanding.
+requirements. Compose binds the dashboard only to host loopback. As of
+2026-11-03, Docker WSL integration is working: project and RD offline container
+smoke tests passed. Selected actual LEAN synthetic-paper scenarios also passed,
+including clean shutdown, market fill, limit cancellation and completed-order
+restart. Broader runtime, authenticated broker and deployment acceptance remain
+open.
+
+Use the [full build plan](docs/FULL_SYSTEM_BUILD_PLAN.md) for scope and the
+[group/subgroup progress register](docs/BUILD_REQUIREMENTS.md) for current
+milestones, evidence and remaining work. Neither container smoke nor synthetic
+paper execution establishes strategy release readiness.
 
 Implementation records include exact source pins, offline test commands and
 remaining limitations:
