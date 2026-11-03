@@ -65,6 +65,7 @@ def test_dockerfile_reuses_locked_environment():
     assert 'COPY .venv' not in text
     assert 'USER 10001:10001' in text
     assert 'offline_smoke.py' in text
+    assert 'RUN chmod -R a+rX /opt/quantagent' in text
 
 
 def test_unavailable_docker_stops_before_archive_or_build(tmp_path, monkeypatch):
