@@ -496,8 +496,11 @@ def test_paper_restart_restores_exact_cash_crypto_inventory_without_new_fills(tm
     execution.reconcile_all(as_of=runtime.at)
     before = execution.ledger.fills(order.account_id)
     applied = []
+
+    class CashBook(dict):
+        AccountCurrency = "USD"
+
     algorithm = SimpleNamespace(
-        SetCash=lambda *args: applied.append(("cash", args)),
         Securities={
             "symbol": SimpleNamespace(
                 Holdings=SimpleNamespace(
@@ -506,9 +509,17 @@ def test_paper_restart_restores_exact_cash_crypto_inventory_without_new_fills(tm
             )
         },
         Portfolio=SimpleNamespace(
-            CashBook={
-                "BTC": SimpleNamespace(SetAmount=lambda amount: applied.append(("base", amount)))
-            }
+            CashBook=CashBook(
+                {
+                    "USD": SimpleNamespace(
+                        ConversionRate=D(1),
+                        SetAmount=lambda amount: applied.append(("cash", amount)),
+                    ),
+                    "BTC": SimpleNamespace(
+                        SetAmount=lambda amount: applied.append(("base", amount))
+                    ),
+                }
+            )
         ),
     )
     port = object.__new__(LeanAlgorithmPort)
@@ -518,10 +529,11 @@ def test_paper_restart_restores_exact_cash_crypto_inventory_without_new_fills(tm
         {B.instrument_id: "symbol"},
     )
     port._native_decimal, port.now, port.runtime_id = D, runtime.now, "next-process"
+    port._money = lambda source, name: D(getattr(source, name))
     restored = port.restore_paper_state(execution.ledger)
     assert restored["cash"] == "98999"
     assert applied == [
-        ("cash", ("USD", D(98999), D(1))),
+        ("cash", D(98999)),
         ("holdings", (D("100.1"), D(10))),
         ("base", D(10)),
     ]

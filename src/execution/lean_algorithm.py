@@ -8,6 +8,7 @@ from AlgorithmImports import DataNormalizationMode, QCAlgorithm, Resolution, Tim
 from src.execution.broker import create_typed_lean_execution
 from src.execution.lean_bridge import verify_project
 from src.execution.lean_runtime import LeanAlgorithmPort, LeanOperatingBridge
+from src.execution.ledger import LedgerError
 
 
 class AIQuantStackAlgorithm(QCAlgorithm):
@@ -57,9 +58,12 @@ class AIQuantStackAlgorithm(QCAlgorithm):
         )
         if config.account.mode == "live":
             self._attach_native_reader(config)
-        if config.account.mode == "paper":
-            self._restore_paper_state(config)
-        self._qal_bridge = LeanOperatingBridge(self._qal_execution)
+        self._qal_paper_restore_pending = config.account.mode == "paper"
+        if self._qal_paper_restore_pending:
+            # Refuse unresolved original orders before brokerage setup can proceed.
+            self._qal_port.validate_paper_restore(self._qal_execution.ledger)
+        else:
+            self._qal_bridge = LeanOperatingBridge(self._qal_execution)
 
     def _attach_native_reader(self, config):
         from src.execution.alpaca_venue import AlpacaVenue
@@ -91,13 +95,23 @@ class AIQuantStackAlgorithm(QCAlgorithm):
             self._qal_execution.ledger, config.account.account_id, **kwargs
         )
 
-    def _restore_paper_state(self, config):
+    def OnWarmupFinished(self):
+        # LEAN invokes this after loading brokerage cash/holdings, including when
+        # no warmup is requested. Repeated callbacks must never reset economics.
+        if getattr(self, "_qal_paper_restore_pending", False):
+            self._restore_paper_state()
+            self._qal_bridge = LeanOperatingBridge(self._qal_execution)
+            self._qal_paper_restore_pending = False
+
+    def _restore_paper_state(self):
         self._qal_execution.adapters["lean"]._record(
             "paper-restore",
             self._qal_port.restore_paper_state(self._qal_execution.ledger),
         )
 
     def OnData(self, data):
+        if not self.IsWarmingUp and getattr(self, "_qal_paper_restore_pending", False):
+            raise LedgerError("LEAN paper initialization is not complete")
         if hasattr(self, "_qal_bridge") and not self.IsWarmingUp:
             result = self._qal_bridge.step()
             if result["status"] == "blocked" and result["error"] != getattr(

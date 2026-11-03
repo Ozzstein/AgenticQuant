@@ -172,14 +172,14 @@ class LeanAlgorithmPort:
             raise LedgerError("quantity/price is not exactly representable by LEAN System.Decimal")
         return native
 
-    def restore_paper_state(self, ledger):
-        """Seed the actual paper runtime from reconciled canonical balances.
-
-        This is runtime initialization, not a fill or a canonical cash transfer.
-        Live broker state can never be overwritten by this method.
-        """
+    def validate_paper_restore(self, ledger):
+        """Reject live accounts and unresolved original orders before initialization."""
         account = self.deployment.account_id
-        if self.deployment.mode != "paper" or ledger.spec(account).mode != "paper":
+        if (
+            self.deployment.mode != "paper"
+            or self.deployment.brokerage != "PaperBrokerage"
+            or ledger.spec(account).mode != "paper"
+        ):
             raise LedgerError("only an actual local paper runtime can restore canonical balances")
         ledger.reconcile(account)
         if ledger.db.execute(
@@ -190,10 +190,25 @@ class LeanAlgorithmPort:
             raise LedgerError(
                 "LEAN paper restart has unresolved accepted orders; original proof required"
             )
+
+    def restore_paper_state(self, ledger):
+        """Seed local paper balances once, after LEAN loads brokerage startup data.
+
+        This is initialization, never reconciliation or a broker cash transfer.
+        """
+        self.validate_paper_restore(ledger)
+        account = self.deployment.account_id
         cash = ledger._account(account)["cash"]
-        self.algorithm.SetCash(
-            ledger.spec(account).base_currency, self._native_decimal(cash), self._native_decimal(1)
-        )
+        # QCAlgorithm.SetCash is locked after setup. CashBook is the actual
+        # paper portfolio; its account-currency conversion must already be unity.
+        cash_book = self.algorithm.Portfolio.CashBook
+        currency = ledger.spec(account).base_currency
+        if (
+            str(cash_book.AccountCurrency) != currency
+            or self._money(cash_book[currency], "ConversionRate") != 1
+        ):
+            raise LedgerError("LEAN paper account currency/conversion differs")
+        cash_book[currency].SetAmount(self._native_decimal(cash))
         positions = []
         for row in ledger.db.execute(
             "SELECT instrument,quantity,basis FROM holdings WHERE account=?",

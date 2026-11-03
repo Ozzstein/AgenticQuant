@@ -93,8 +93,8 @@ def test_fresh_readonly_ledger_preserves_original_receipts(evidence):
         assert rows("origin", table) == rows("pending-restart", table)
 
 
-def test_completed_only_restart_keeps_receipts_but_blocks_balance_mismatch(evidence):
-    """No resubmit is established; this observed balance error is NOT healthy recovery."""
+def test_completed_only_restart_keeps_receipts_and_verifies_recorded_health(evidence):
+    """Distinguish original blocked evidence from the post-setup restoration run."""
     run = evidence / "completed-retry"
     if not run.exists():
         pytest.skip("historical bounded run did not execute completed-only restart")
@@ -109,7 +109,36 @@ def test_completed_only_restart_keeps_receipts_but_blocks_balance_mismatch(evide
         assert result["before"][key] == original[key] == result["after"][key]
     assert len(result["after"]["fills"]) == len(result["after"]["attempts"]) == 1
     assert all(row["state"] == "filled" for row in result["retries"])
-    assert (
-        "venue cash/holdings do not reconcile to durable accounting"
-        in (run / "console.log").read_text()
-    )
+    if (run / "restart-ready.json").exists():
+        ready = read(run, "restart-ready.json")
+        assert ready["health"]["status"] == "ready" and ready["health"]["error"] is None
+        assert ready["audit"]["status"] == "PASS"
+        assert "Canonical execution blocked" not in (run / "console.log").read_text()
+        from decimal import Decimal
+
+        from src.execution.ledger import PortfolioLedger
+
+        ledger = PortfolioLedger(run / "ledger.sqlite", read_only=True)
+        try:
+            account = ready["audit"]["account_id"]
+            assert Decimal(ready["capture"]["cash_book"]["USD"]) == Decimal(
+                ledger._account(account)["cash"]
+            )
+            holdings = {
+                row["instrument"]: Decimal(row["quantity"])
+                for row in ledger.db.execute(
+                    "SELECT instrument,quantity FROM holdings WHERE account=?", (account,)
+                )
+            }
+            assert {
+                key: Decimal(value) for key, value in ready["capture"]["quantities"].items()
+            } == holdings
+            assert ledger.execution_compliance(account).status == "PASS"
+        finally:
+            ledger.close()
+    else:
+        # Retain the original pre-fix counterexample; never label it healthy.
+        assert (
+            "venue cash/holdings do not reconcile to durable accounting"
+            in (run / "console.log").read_text()
+        )

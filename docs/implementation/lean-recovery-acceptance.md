@@ -198,3 +198,12 @@ Final combined validation after the evidence-reader extension: **136 passed in
 4.93s**, no skips, sockets disabled/Unix only. Ruff and diff checks passed.
 This count includes negative-path and retained-evidence assertions; it does not
 turn the observed restart balance failure into positive recovery acceptance.
+
+### Subsequent resolution
+
+The completed-only balance blocker above is resolved by restoring canonical local
+paper balances once after brokerage startup data is loaded, before enabling the
+bridge. A fresh three-engine run verifies ready health, exact cash/holdings,
+idempotent completed retries and unchanged accepted-pending refusal. See
+[paper initialization fix and actual evidence](lean-paper-restore-fix-2026-11-03.md).
+The pre-fix observations above remain historical evidence.

@@ -84,6 +84,20 @@ class RecoveryAlgorithm(AIQuantStackAlgorithm):
             return
         super().OnData(data)
         if self.phase == "completed-retry":
+            health = self._qal_execution.adapters["lean"].runtime_status(self._qal_port.now())
+            assert health["status"] == "ready", health
+            balances = self._qal_execution.reconcile_balances(as_of=self._qal_port.now())
+            self.save(
+                "restart-ready.json",
+                {
+                    "health": health,
+                    "balances": balances,
+                    "capture": self._qal_port.capture(),
+                    "audit": self._qal_execution.ledger.execution_compliance(
+                        self._qal_execution.account_id
+                    ).model_dump(mode="json"),
+                },
+            )
             before = self.snapshot()
             retries = [
                 self._qal_execution.dispatch("recovery-filled", as_of=self._qal_port.now())
